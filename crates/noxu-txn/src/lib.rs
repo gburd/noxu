@@ -113,3 +113,7 @@ pub use group_commit::{GroupCommit, GroupCommitMaster, GroupCommitReplica};
 
 mod txn_manager;
 pub use txn_manager::{NULL_TXN_ID, TxnManager, TxnStats};
+
+/// Non-transactional locker-id allocation (BUG-LOCKER-ID-COLLISION).
+pub mod locker_id;
+pub use locker_id::{FIRST_NON_TXN_LOCKER_ID, next_non_txn_locker_id};

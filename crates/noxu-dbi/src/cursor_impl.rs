@@ -23,7 +23,7 @@
 use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::Ordering;
 
 use bytes::{Bytes, BytesMut};
 use noxu_log::{LogEntryType, LogManager, Provisional, entry::LnLogEntry};
@@ -116,7 +116,18 @@ pub const EXACT_KEY: u32 = 0x2;
 pub const FOUND_LAST: u32 = 0x4;
 
 /// Unique cursor ID generator.
-static NEXT_CURSOR_ID: AtomicI64 = AtomicI64::new(1);
+///
+/// BUG-LOCKER-ID-COLLISION: a cursor's `id` is also its lock-manager locker
+/// id on the auto-commit path (`lm.lock(lsn, self.id, ..)`), so it MUST be
+/// disjoint from the transaction id space.  It is sourced from the shared
+/// non-txn locker allocator (`noxu_txn::next_non_txn_locker_id`), which
+/// hands out unique deeply-negative ids that can never equal a positive txn
+/// id.  The old `AtomicI64::new(1)` counted up from 1 and collided with txn
+/// ids (both allocators start at 1).
+#[inline]
+fn next_cursor_id() -> i64 {
+    noxu_txn::next_non_txn_locker_id()
+}
 
 // Test-only hook: countdown to forced cursor failure.
 //
@@ -590,7 +601,7 @@ impl CursorImpl {
     pub fn new(db_impl: Arc<RwLock<DatabaseImpl>>, locker_id: i64) -> Self {
         let throughput = db_impl.read().throughput.clone();
         CursorImpl {
-            id: NEXT_CURSOR_ID.fetch_add(1, Ordering::Relaxed),
+            id: next_cursor_id(),
             db_impl,
             locker_id,
             state: CursorState::NotInitialized,
@@ -627,7 +638,7 @@ impl CursorImpl {
     ) -> Self {
         let throughput = db_impl.read().throughput.clone();
         CursorImpl {
-            id: NEXT_CURSOR_ID.fetch_add(1, Ordering::Relaxed),
+            id: next_cursor_id(),
             db_impl,
             locker_id,
             state: CursorState::NotInitialized,
@@ -1866,6 +1877,12 @@ impl CursorImpl {
                 .lock(lsn, LockType::Write, false)
                 .map_err(DbiError::TxnError)?;
         } else if let Some(lm) = &self.lock_manager {
+            // JE takes LockMode.RMW as a WRITE lock on the CURRENT record
+            // (Cursor.java:5281).  The bare cursor's prior-record non-txn
+            // locks were already released at the MOVE that positioned here
+            // (release_non_txn_locks_on_move, the JE beginMoveCursor ->
+            // reset / beforeNonStickyOp analogue), so this just takes the
+            // current record's WRITE lock under the cursor's own id.
             lm.lock(lsn, self.id, LockType::Write, false, false)
                 .map_err(DbiError::TxnError)?;
         }
@@ -1902,6 +1919,10 @@ impl CursorImpl {
         search_mode: SearchMode,
     ) -> Result<OperationStatus, DbiError> {
         self.check_state()?;
+
+        // JE beginMoveCursor: a search is a MOVE -- release the bare cursor's
+        // non-txn locks (e.g. a prior RMW WRITE lock) BEFORE repositioning.
+        self.release_non_txn_locks_on_move();
 
         let is_dup = self.is_sorted_dup();
 
@@ -3937,6 +3958,8 @@ impl CursorImpl {
     /// * `NotFound` if the tree is empty
     pub fn get_first(&mut self) -> Result<OperationStatus, DbiError> {
         self.check_state()?;
+        // JE beginMoveCursor: getFirst is a MOVE -- release bare non-txn locks.
+        self.release_non_txn_locks_on_move();
 
         let result: Option<(
             Vec<u8>,
@@ -4117,6 +4140,9 @@ impl CursorImpl {
     /// * `NotFound` if the tree is empty
     pub fn get_last(&mut self) -> Result<OperationStatus, DbiError> {
         self.check_state()?;
+        // JE beginMoveCursor: getLast is a MOVE -- release bare non-txn locks
+        // BEFORE positioning (and before the EOF-sentinel lock below).
+        self.release_non_txn_locks_on_move();
 
         // C2/V2/F10: lock the per-database EOF sentinel BEFORE positioning,
         // unconditionally, so a concurrent transaction cannot insert a new
@@ -4527,6 +4553,12 @@ impl CursorImpl {
         mode: GetMode,
     ) -> Result<OperationStatus, DbiError> {
         self.check_state()?;
+
+        // JE beginMoveCursor: getNext/getPrev is a MOVE -- release the bare
+        // cursor's non-txn locks (e.g. a prior RMW WRITE lock) BEFORE
+        // advancing.  An uninitialized cursor holds nothing (helper is a
+        // no-op), so this is safe above the NotInitialized early-return.
+        self.release_non_txn_locks_on_move();
 
         if self.state == CursorState::NotInitialized {
             return Ok(OperationStatus::NotFound);
@@ -6758,10 +6790,61 @@ impl CursorImpl {
     /// # Returns
     ///
     ///  always (never fails).
+    /// Releases every non-transactional lock this cursor acquired on its own
+    /// behalf in the LockManager (JE `BasicLocker.releaseNonTxnLocks`,
+    /// BasicLocker.java:198, reached from `CursorImpl.close` ->
+    /// `nonTxnOperationEnd` -> `operationEnd`, CursorImpl.java:602).
+    ///
+    /// For a bare (auto-commit) cursor the locker IS the cursor: the only
+    /// cross-operation lock it can hold is the WRITE lock taken by an RMW read
+    /// (`upgrade_current_to_write_lock`), which charges the cursor's own `id`
+    /// as the owner directly in the manager.  Read locks are already acquired
+    /// and released within each operation, so this sweep retires exactly the
+    /// RMW write lock(s) the cursor still owns.
+    ///
+    /// When a transaction is attached (`txn_ref.is_some()`) the locks belong to
+    /// the `Txn`, not the cursor, and MUST survive cursor close until the txn
+    /// commits or aborts (JE: a transactional cursor retains its locks).  This
+    /// method is a no-op in that case.
+    fn release_non_txn_locks(&self) {
+        if self.txn_ref.is_some() {
+            return;
+        }
+        if let Some(lm) = &self.lock_manager {
+            lm.release_all_for_locker(self.id);
+        }
+    }
+
+    /// JE release-on-MOVE (LockMode.java:84-86; Cursor.java beginMoveCursor
+    /// -> CursorImpl.reset / beforeNonStickyOp, CursorImpl.java:547/597/602).
+    /// A non-transactional cursor releases ALL of its non-txn locks when it
+    /// MOVES to a different record -- before ANY positioning op (search,
+    /// getFirst/getLast, getNext/getPrev), regardless of whether the next op
+    /// is an RMW.  JE does this in beginMoveCursor BEFORE the new record is
+    /// positioned/read/locked, so a bare cursor holds AT MOST the lock on its
+    /// CURRENT record.  A bare cursor's read locks already release per op, so
+    /// the only cross-operation lock this retires is a prior RMW WRITE lock on
+    /// the record the cursor is moving off.  No-op under a Txn (those locks
+    /// belong to the Txn).  Called at the TOP of each reposition op; the
+    /// per-op read-lock and the new record's RMW write-lock are taken after.
+    fn release_non_txn_locks_on_move(&self) {
+        self.release_non_txn_locks();
+    }
+
     pub fn close(&mut self) -> Result<(), DbiError> {
         if self.state == CursorState::Closed {
             return Ok(());
         }
+
+        // JE close() -> locker.nonTxnOperationEnd() -> operationEnd() ->
+        // BasicLocker.releaseNonTxnLocks() (CursorImpl.java:602,
+        // BasicLocker.java:198): a bare (non-txn) cursor releases ALL locks it
+        // holds in the LockManager when it closes -- in particular the WRITE
+        // lock taken by an RMW read (upgrade_current_to_write_lock), which
+        // otherwise leaks and blocks every later writer of that record until
+        // timeout.  No-op when a Txn is attached (those locks belong to the
+        // Txn and live until commit/abort).
+        self.release_non_txn_locks();
 
         // Release BIN pin — prevents evictor from seeing a stale cursor_count.
         self.update_bin_pin(None);
@@ -6863,6 +6946,51 @@ mod tests {
             &config,
         );
         Arc::new(RwLock::new(db_impl))
+    }
+
+    /// Witness for BUG-LOCKER-ID-COLLISION (RED/GREEN gate).
+    ///
+    /// A cursor's `id` doubles as its lock-manager locker id on the
+    /// auto-commit path (`lm.lock(lsn, self.id, ..)`), so it MUST be disjoint
+    /// from the transaction id space.  `TxnManager` allocates positive txn ids
+    /// (`1, 2, 3, ...`); before the fix auto-commit cursor ids ALSO started at
+    /// `1` and counted up, so a cursor id routinely equalled a live txn id and
+    /// the lock manager (which keys solely on the `i64`) conflated them into
+    /// one owner -- an isolation violation and the proximate cause of the
+    /// originally-observed spurious `DeadlockDetected`.
+    ///
+    /// After the fix, cursor ids come from the shared non-txn locker allocator
+    /// and are deeply negative, so no cursor id can ever equal a (positive)
+    /// txn id.  RED before (ids collide / are positive), GREEN after.
+    ///
+    /// Non-vacuity: if `next_cursor_id()` is reverted to a positive counter,
+    /// the `< 0` assertion fails on the very first cursor.
+    #[test]
+    fn cursor_lock_ids_are_in_the_negative_non_txn_band() {
+        // Transaction ids are positive and start at 1.  A cursor id must never
+        // land in that space.  We check the structural invariant directly:
+        // every freshly-allocated cursor id is strictly negative (hence
+        // disjoint from every positive txn id) and in the reserved non-txn
+        // band (<= FIRST_NON_TXN_LOCKER_ID), and successive ids are unique.
+        let db = create_test_database();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1024 {
+            let c = CursorImpl::new(Arc::clone(&db), 0);
+            let id = c.get_id();
+            assert!(
+                id < 0,
+                "BUG-LOCKER-ID-COLLISION: cursor lock id {id} is not negative; \
+                 it can collide with a positive transaction id and conflate \
+                 the cursor and that txn into one lock owner"
+            );
+            assert!(
+                id <= noxu_txn::FIRST_NON_TXN_LOCKER_ID,
+                "cursor lock id {id} is outside the reserved non-txn band \
+                 (<= {})",
+                noxu_txn::FIRST_NON_TXN_LOCKER_ID
+            );
+            assert!(seen.insert(id), "duplicate cursor lock id {id}");
+        }
     }
 
     /// Read the `cursor_count` (descent pin count) directly off a BIN arc.

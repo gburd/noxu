@@ -1748,6 +1748,111 @@ mod tests {
         assert_eq!(stats.lock_waits, 0);
     }
 
+    /// SEVERITY witness for BUG-LOCKER-ID-COLLISION (deterministic, no timing).
+    ///
+    /// The lock table keys owners on the bare `i64` locker id.  If a cursor and
+    /// a transaction are ever handed the SAME id (the pre-fix overlap: cursor
+    /// ids and txn ids both counted up from 1), the lock manager treats them as
+    /// ONE owner.  This test drives the manager with a shared id to show the
+    /// two concrete isolation failures that causes:
+    ///
+    ///   (a) DIRTY READ: a Read request on a record the "transaction"
+    ///       write-locked is granted (seen as the same owner) instead of
+    ///       conflicting;
+    ///   (c) PREMATURE RELEASE: the "cursor" releasing its lock drops the
+    ///       transaction's lock, letting a genuinely-distinct writer proceed
+    ///       against the still-uncommitted record.
+    ///
+    /// This is why the allocator fix (cursor/cleaner ids disjoint from txn ids)
+    /// is required.  The companion gate
+    /// `cursor_lock_ids_are_in_the_negative_non_txn_band` (noxu-dbi) proves the
+    /// allocator never produces a colliding id post-fix.
+    #[test]
+    fn collision_shared_id_causes_dirty_read_and_premature_release() {
+        let lm = LockManager::new();
+        let shared: i64 = 4029; // one id for "a txn" and "a cursor"
+        let lsn: u64 = 0xBEEF;
+
+        // Transaction write-locks `lsn` (uncommitted write).
+        lm.lock(lsn, shared, LockType::Write, true, false)
+            .expect("txn takes the write lock");
+        assert!(lm.is_owned_write_lock(lsn, shared));
+
+        // (a) DIRTY READ: a "cursor" with the SAME id gets a Read on the
+        // write-locked record granted (conflated owner).  A DISTINCT locker
+        // would get LockNotAvailable -- that is exactly what the fix
+        // guarantees by making cursor ids disjoint from txn ids.
+        let distinct: i64 = crate::FIRST_NON_TXN_LOCKER_ID; // a real cursor-band id
+        assert!(
+            matches!(
+                lm.lock(lsn, distinct, LockType::Read, true, false),
+                Err(TxnError::LockNotAvailable { .. })
+            ),
+            "a DISTINCT reader must conflict with the txn's write lock"
+        );
+        assert!(
+            lm.lock(lsn, shared, LockType::Read, true, false).is_ok(),
+            "the SHARED-id reader was wrongly made to conflict; this witness \
+             requires the conflated lock table"
+        );
+
+        // (c) PREMATURE RELEASE: the "cursor" release drops the txn's lock.
+        lm.release(lsn, shared).expect("cursor releases its lock");
+        assert!(
+            !lm.is_owned_write_lock(lsn, shared),
+            "txn's write lock should have been dropped by the shared-id release"
+        );
+        assert!(
+            lm.lock(lsn, distinct, LockType::Write, true, false).is_ok(),
+            "a second writer should grab the prematurely-released lock"
+        );
+        let _ = lm.release(lsn, distinct);
+    }
+
+    /// Witness that the non-txn locker band is disjoint from replay-v2's
+    /// locker bands (BUG-LOCKER-ID-COLLISION, RC v2 scope).
+    ///
+    /// RC v2 adds importunate `ReplayTxn` lockers (base `i64::MIN/2`) and
+    /// ephemeral replica-LN lockers (start `i64::MIN/4`, decrementing) in
+    /// `replica_replay`.  A non-txn (cursor / cleaner) locker id must never
+    /// land in those deep-negative bands, or a replica write locker and a local
+    /// cursor would be conflated — the same class of isolation bug on the
+    /// replica side.  The shared allocator's hard floor keeps every non-txn id
+    /// strictly above `i64::MIN/4`, so the bands cannot meet.
+    #[test]
+    fn non_txn_locker_band_is_disjoint_from_replay_bands() {
+        // Mirror of replica_replay's constants (kept in sync by review; this
+        // test fails loudly if the floor is ever lowered into the replay half).
+        const REPLAY_LOCKER_BASE: i64 = i64::MIN / 2; // ReplayTxn base
+        const REPLAY_EPHEMERAL_START: i64 = REPLAY_LOCKER_BASE / 2; // i64::MIN/4
+
+        // The whole non-txn band lives in [FLOOR, FIRST], and FLOOR must stay
+        // strictly above the deepest the replay ephemeral allocator can reach
+        // from its start (it only decrements, so its shallowest id is its
+        // start, i64::MIN/4; the band it can occupy is at or below that).
+        // These three checks are over compile-time constants, so they are
+        // compile-time assertions (`const { assert!(..) }`) -- a regression in
+        // the band constants fails the BUILD, not just the test run.  (clippy
+        // flags a runtime `assert!` on a constant condition.)
+        const _: () = assert!(
+            crate::FIRST_NON_TXN_LOCKER_ID < 0,
+            "non-txn ids must be negative (disjoint from positive txn ids)"
+        );
+        const _: () = assert!(
+            crate::locker_id::NON_TXN_LOCKER_FLOOR > REPLAY_EPHEMERAL_START,
+            "non-txn floor must stay ABOVE the replay ephemeral start \
+             (i64::MIN/4) so the bands are structurally disjoint"
+        );
+        const _: () = assert!(
+            crate::locker_id::NON_TXN_LOCKER_FLOOR > REPLAY_LOCKER_BASE,
+            "non-txn floor must stay above the ReplayTxn base (i64::MIN/2)"
+        );
+        // And a freshly-allocated id obeys the band in practice.
+        let id = crate::next_non_txn_locker_id();
+        assert!(id <= crate::FIRST_NON_TXN_LOCKER_ID);
+        assert!(id >= crate::locker_id::NON_TXN_LOCKER_FLOOR);
+    }
+
     /// Regression (PHANTOM-DEADLOCK): a stale `waiter_graph` edge must not
     /// drive a false deadlock-victim decision against a locker that owns NO
     /// locks.
