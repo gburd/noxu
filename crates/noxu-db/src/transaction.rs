@@ -1101,10 +1101,20 @@ impl Transaction {
         // `has_logged_data()` for the same reason as the commit path above:
         // a prepared txn wrote a durable TxnPrepare frame that recovery would
         // otherwise resurrect, so the resolving frame must always be written.
+        //
+        // R-XAREC F1 (S2 durability): FORCE-FLUSH the TxnAbort (fsync+flush),
+        // matching JE `Txn.abort(Xid)` = `abort(true /*forceFlush*/)`
+        // (Txn.java:611-617) and the symmetric prepared-COMMIT path above
+        // (`write_txn_end(lm, true, true, true)`).  An XA rollback must be
+        // durable: without this, a crash after a reported-successful
+        // `xa_rollback` of a live prepared branch loses the TxnAbort and the
+        // next recovery re-surfaces the branch in-doubt.  (Plain non-XA
+        // `Transaction::abort` stays NO_SYNC — JE `abort()` is not forced
+        // unless durability is SYNC, Txn.java:1157.)
         if !self.read_only
             && let Some(lm) = &self.log_manager
         {
-            self.write_txn_end(lm, false /* is_commit */, false, false)?;
+            self.write_txn_end(lm, false /* is_commit */, true, true)?;
         }
 
         // Apply undo records to the B-tree to restore before-images, then

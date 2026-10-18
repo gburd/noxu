@@ -1126,6 +1126,29 @@ fn main() {
             }
         }
 
+        "xarec_rollback" => {
+            // R-XAREC FINDING F1 witness (durable recovered rollback): recovery
+            // surfaced the prepared txn and redid+relocked its LNs.  Resolve by
+            // ROLLBACK exactly as noxu-xa::xa_rollback does for a recovered
+            // branch (undo + write_txn_abort_for_recovered), then spin ->
+            // parent SIGKILLs BEFORE any checkpoint.  On reopen the branch MUST
+            // be resolved (not resurfaced) and the record absent — i.e. the
+            // resolving TxnAbort must be durable (JE Txn.abort(xid) force-flush).
+            let prepared = env.recovered_prepared_txns();
+            assert_eq!(prepared.len(), 1, "xarec_rollback: one prepared txn");
+            let txn_id = prepared[0].txn_id;
+            let lns = env.take_recovered_prepared_lns(txn_id);
+            env.undo_recovered_prepared_lns(&lns)
+                .expect("undo recovered prepared lns");
+            env.write_txn_abort_for_recovered(txn_id)
+                .expect("write txn abort for recovered");
+            env.forget_recovered_prepared_txn(txn_id);
+            flag(&dir, "firstlsn_done");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
         "xarec_recover_only" => {
             // R-XAREC witness #6a: THIRD-crash coverage — crash AFTER recovery
             // redid+relocked the prepared LNs but BEFORE resolution.  Recover,

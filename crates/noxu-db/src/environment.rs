@@ -2223,10 +2223,18 @@ impl Environment {
             Some(lm) => lm,
             None => return Ok(()),
         };
+        // R-XAREC F1 (S2 durability): an XA rollback must FORCE-FLUSH the
+        // resolving TxnAbort, exactly as JE `Txn.abort(Xid)` = `abort(true
+        // /*forceFlush*/)` (Txn.java:611-617) and `XAEnvironment.rollback`
+        // (XAEnvironment.java:284-299) which force-flush every branch,
+        // recovered or not.  Symmetric with `write_txn_commit_for_recovered`
+        // (COMMIT_SYNC).  Without this fsync+flush a crash after a reported-
+        // successful `xa_rollback` lost the TxnAbort: the next recovery
+        // re-surfaced the branch in-doubt and REDID + RE-LOCKED its LNs.
         write_txn_end_for_recovered(
             lm, txn_id, false, /* is_commit */
-            false, /* fsync */
-            false, /* flush */
+            true,  /* fsync */
+            true,  /* flush */
             0,     /* vlsn: NULL_VLSN for abort */
         )
         .map(|_| ())
