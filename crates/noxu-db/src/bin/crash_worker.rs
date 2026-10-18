@@ -101,6 +101,20 @@ fn main() {
             .with_cache_size(1024 * 1024)
             .with_run_checkpointer(false);
     }
+    // R-FIRSTLSN witness: a tiny log file so a handful of writes roll many
+    // files, and all daemons OFF so the mode drives cleaning / checkpointing
+    // explicitly WHILE the victim txn is open.  minAge=1 and a high
+    // minUtilization keep the forced-clean path simple and deterministic.
+    if mode.starts_with("firstlsn_") {
+        env_config = env_config
+            .with_log_file_max_bytes(1_000_000)
+            .with_run_cleaner(false)
+            .with_run_checkpointer(false)
+            .with_run_evictor(false)
+            .with_run_in_compressor(false)
+            .with_cleaner_min_age(1)
+            .with_cleaner_min_utilization(90);
+    }
     let env = noxu_db::Environment::open(env_config).expect("open env");
     let db_config =
         DatabaseConfig::new().with_allow_create(true).with_transactional(true);
@@ -723,6 +737,187 @@ fn main() {
             }
         }
 
+        // ----------------------------------------------------------------
+        // R-FIRSTLSN witnesses (candidate S1 data loss).
+        //
+        // TxnManager::get_first_active_lsn() is fed ONLY by CursorImpl's LN
+        // write path (update_first_lsn).  A txn whose FIRST log entry is a
+        // transactional NameLN (create/rename/remove/truncate DB inside a
+        // txn) never reports that LSN to the TxnManager, so the cleaner's
+        // first-active-txn-file clamp (cleaner.rs:949) under-reports and the
+        // log file holding the OPEN txn's provisional NameLNTxn is
+        // selectable+deletable.  relog_live_catalog only re-logs COMMITTED
+        // (name_map) catalog entries, not an open txn's pending_names entry,
+        // so nothing else protects the file.  We delete that file WHILE the
+        // txn is open, COMMIT, then the parent SIGKILLs: recovery cannot find
+        // the NameLN and the committed DB (or its data) is lost.
+        //
+        // JE: every transactional LN logs txn.addLogInfo(lsn) in
+        // LNLogEntry.postLogWork (LNLogEntry.java:~890-898) -> Txn.addLogInfo
+        // sets firstLoggedLsn (Txn.java:1443-1456) -> TxnManager.getFirstActiveLsn
+        // (:355-366) sees it, so the clamp protects the whole active-txn
+        // window including a NameLN.
+        //
+        // Shared helper flow for every firstlsn_* mode is inlined per-arm so
+        // each can vary the DDL op (create/rename/remove/truncate) and the
+        // commit/abort decision.  `db` ("test") is the filler used to roll
+        // files and generate obsolete bytes.
+        // ----------------------------------------------------------------
+        "firstlsn_create_commit" | "firstlsn_create_abort" => {
+            let commit = mode == "firstlsn_create_commit";
+            firstlsn_roll_files(&db, &env, 40);
+            // Open txn T; create the victim DB inside it (provisional
+            // NameLNTxn).  Keep T open; do NOT write a data LN through T so
+            // the TxnManager never learns T's first LSN.
+            let txn = env.begin_transaction(None).expect("begin victim txn");
+            let victim = env
+                .open_database(Some(&txn), "victim", &db_config)
+                .expect("create victim under txn");
+            // Roll files PAST the NameLNTxn file and delete it via the
+            // two-checkpoint barrier WHILE T is open.
+            firstlsn_roll_files(&db, &env, 60);
+            firstlsn_force_delete_barrier(&env);
+            victim.close().expect("close victim handle before commit");
+            if commit {
+                txn.commit().expect("commit victim create");
+            } else {
+                txn.abort().expect("abort victim create");
+            }
+            flag(&dir, "firstlsn_done");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        "firstlsn_remove_commit" | "firstlsn_remove_abort" => {
+            // Victim DB is COMMITTED first and has a durable NameLN; then an
+            // open txn T logs the NameLN-delete tombstone as its first entry.
+            // T's first LSN is unreported, so the file holding the tombstone
+            // (and, if cleaned, surrounding data) is unprotected.
+            let commit = mode == "firstlsn_remove_commit";
+            // Create + commit the victim with one record.
+            {
+                let vtxn =
+                    env.begin_transaction(None).expect("begin victim create");
+                let v = env
+                    .open_database(Some(&vtxn), "victim", &db_config)
+                    .expect("create victim");
+                v.put_in(
+                    &vtxn,
+                    DatabaseEntry::from_bytes(b"k"),
+                    DatabaseEntry::from_bytes(b"v"),
+                )
+                .expect("seed victim rec");
+                v.close().expect("close victim");
+                vtxn.commit().expect("commit victim create");
+            }
+            // Force a checkpoint so the committed victim NameLN is in name_map
+            // (relog_live_catalog will protect THAT copy; the point of the
+            // bug is the open-txn TOMBSTONE below, whose file is unprotected).
+            {
+                use noxu_db::CheckpointConfig;
+                env.checkpoint(Some(&CheckpointConfig::new().with_force(true)))
+                    .expect("ckpt after victim create");
+            }
+            firstlsn_roll_files(&db, &env, 40);
+            let txn = env.begin_transaction(None).expect("begin remove txn");
+            env.remove_database(Some(&txn), "victim")
+                .expect("remove victim under txn");
+            firstlsn_roll_files(&db, &env, 60);
+            firstlsn_force_delete_barrier(&env);
+            if commit {
+                txn.commit().expect("commit remove");
+            } else {
+                txn.abort().expect("abort remove");
+            }
+            flag(&dir, "firstlsn_done");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        "firstlsn_rename_commit" | "firstlsn_rename_abort" => {
+            let commit = mode == "firstlsn_rename_commit";
+            {
+                let vtxn =
+                    env.begin_transaction(None).expect("begin victim create");
+                let v = env
+                    .open_database(Some(&vtxn), "victim", &db_config)
+                    .expect("create victim");
+                v.put_in(
+                    &vtxn,
+                    DatabaseEntry::from_bytes(b"k"),
+                    DatabaseEntry::from_bytes(b"v"),
+                )
+                .expect("seed victim rec");
+                v.close().expect("close victim");
+                vtxn.commit().expect("commit victim create");
+            }
+            {
+                use noxu_db::CheckpointConfig;
+                env.checkpoint(Some(&CheckpointConfig::new().with_force(true)))
+                    .expect("ckpt after victim create");
+            }
+            firstlsn_roll_files(&db, &env, 40);
+            let txn = env.begin_transaction(None).expect("begin rename txn");
+            env.rename_database(Some(&txn), "victim", "victim2")
+                .expect("rename victim under txn");
+            firstlsn_roll_files(&db, &env, 60);
+            firstlsn_force_delete_barrier(&env);
+            if commit {
+                txn.commit().expect("commit rename");
+            } else {
+                txn.abort().expect("abort rename");
+            }
+            flag(&dir, "firstlsn_done");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        "firstlsn_truncate_commit" | "firstlsn_truncate_abort" => {
+            let commit = mode == "firstlsn_truncate_commit";
+            {
+                let vtxn =
+                    env.begin_transaction(None).expect("begin victim create");
+                let v = env
+                    .open_database(Some(&vtxn), "victim", &db_config)
+                    .expect("create victim");
+                for i in 0u32..20 {
+                    v.put_in(
+                        &vtxn,
+                        DatabaseEntry::from_bytes(&i.to_be_bytes()),
+                        DatabaseEntry::from_bytes(b"rec"),
+                    )
+                    .expect("seed victim rec");
+                }
+                v.close().expect("close victim");
+                vtxn.commit().expect("commit victim create");
+            }
+            {
+                use noxu_db::CheckpointConfig;
+                env.checkpoint(Some(&CheckpointConfig::new().with_force(true)))
+                    .expect("ckpt after victim create");
+            }
+            firstlsn_roll_files(&db, &env, 40);
+            let txn = env.begin_transaction(None).expect("begin truncate txn");
+            let n = env
+                .truncate_database(Some(&txn), "victim")
+                .expect("truncate victim under txn");
+            assert_eq!(n, 20, "truncate returnCount");
+            firstlsn_roll_files(&db, &env, 60);
+            firstlsn_force_delete_barrier(&env);
+            if commit {
+                txn.commit().expect("commit truncate");
+            } else {
+                txn.abort().expect("abort truncate");
+            }
+            flag(&dir, "firstlsn_done");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
         other => panic!("Unknown NOXU_CRASH_MODE: {other}"),
     }
 }
@@ -730,4 +925,44 @@ fn main() {
 fn flag(dir: &Path, name: &str) {
     fs::write(dir.join(name), b"ok")
         .unwrap_or_else(|e| panic!("write flag {name}: {e}"));
+}
+
+/// R-FIRSTLSN helper: roll several small log files with committed data,
+/// overwriting a fixed key range so earlier files accumulate obsolete bytes.
+fn firstlsn_roll_files(
+    db: &noxu_db::Database,
+    env: &noxu_db::Environment,
+    gens: u32,
+) {
+    let value = vec![0x5Au8; 4096];
+    for g in 0..gens {
+        let txn = env.begin_transaction(None).expect("begin filler txn");
+        for k in 0..40u32 {
+            db.put_in(
+                &txn,
+                DatabaseEntry::from_bytes(
+                    &(g.wrapping_mul(40) + k).to_be_bytes(),
+                ),
+                DatabaseEntry::from_bytes(&value),
+            )
+            .expect("filler put");
+        }
+        txn.commit().expect("commit filler txn");
+    }
+}
+
+/// R-FIRSTLSN helper: drive the two-checkpoint deletion barrier with forced
+/// cleaning passes.  Runs several (clean, checkpoint) rounds so BeingCleaned ->
+/// Cleaned -> Checkpointed -> safe_to_delete -> deleted.  Called WHILE the
+/// victim txn is open, so relog_live_catalog (name_map only) does not re-log
+/// the open txn's provisional NameLNTxn.
+fn firstlsn_force_delete_barrier(env: &noxu_db::Environment) {
+    use noxu_db::CheckpointConfig;
+    let force = CheckpointConfig::new().with_force(true);
+    for _ in 0..6 {
+        let _ = env.clean_log_forced().expect("forced clean");
+        env.checkpoint(Some(&force)).expect("barrier checkpoint");
+        let _ = env.clean_log_forced().expect("forced clean");
+        env.checkpoint(Some(&force)).expect("barrier checkpoint");
+    }
 }

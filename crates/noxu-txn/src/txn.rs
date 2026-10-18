@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Instant;
 
 use noxu_log::{LogEntryType, LogManager, Provisional};
+use noxu_util::dst_sync_pl::RwLock;
 use noxu_util::lsn::{Lsn, NULL_LSN};
 
 use crate::group_commit::GroupCommit;
@@ -138,6 +139,20 @@ pub struct Txn {
 
     /// The first LSN written by this txn.
     first_lsn: u64,
+
+    /// Shared handle to the owning `TxnManager`'s active-transaction
+    /// first-LSN map (`all_txns`), keyed by txn id.
+    ///
+    /// `note_log_entry` records this txn's first logged LSN here the moment it
+    /// is set, so `TxnManager::get_first_active_lsn` sees it regardless of
+    /// WHICH log write came first (user LN, NameLN DDL, XA prepare).  This is
+    /// the single chokepoint that keeps the manager's materialised copy in
+    /// lock-step with `first_lsn`, mirroring JE's `Txn.addLogInfo` ->
+    /// `firstLoggedLsn` (read directly by `TxnManager.getFirstActiveLsn`).
+    ///
+    /// `None` only for `Txn`s constructed outside a `TxnManager` (unit tests),
+    /// which have no manager map to update.
+    first_active_sink: Option<Arc<RwLock<HashMap<i64, u64>>>>,
 
     /// Number of cursors currently using this txn.
     cursor_count: AtomicI32,
@@ -321,6 +336,7 @@ impl Txn {
             write_locks: HashMap::new(),
             last_lsn: NULL_LSN.as_u64(),
             first_lsn: NULL_LSN.as_u64(),
+            first_active_sink: None,
             cursor_count: AtomicI32::new(0),
             lock_timeout_ms: 500, // default 500ms
             txn_timeout_ms: 0,    // no timeout
@@ -359,6 +375,17 @@ impl Txn {
     /// Same semantics as `with_group_commit()` but works on `&mut self`.
     pub fn set_group_commit(&mut self, gc: Arc<dyn GroupCommit>) {
         self.group_commit = Some(gc);
+    }
+
+    /// Attaches the owning `TxnManager`'s shared active-transaction first-LSN
+    /// map, so [`Self::note_log_entry`] can record this txn's first logged LSN
+    /// into it (R-FIRSTLSN).  Called by every `TxnManager::begin_*` right after
+    /// construction; left `None` for manager-less unit-test `Txn`s.
+    pub(crate) fn set_first_active_sink(
+        &mut self,
+        sink: Arc<RwLock<HashMap<i64, u64>>>,
+    ) {
+        self.first_active_sink = Some(sink);
     }
 
     /// Marks this `Txn` as owned by an external wrapper that already writes
@@ -1065,11 +1092,36 @@ impl Txn {
 
     /// Records a new log entry written by this transaction.
     ///
-    /// maintains `lastLoggedLsn` (chain of undo log entries) and
+    /// Maintains `lastLoggedLsn` (chain of undo log entries) and
     /// `firstLoggedLsn` (checkpointing). We update both here.
+    ///
+    /// This is the single chokepoint every transactional log write funnels
+    /// through — user LN (`CursorImpl`), NameLN DDL (create/remove/rename),
+    /// XA prepare — so recording the first LSN here (and propagating it to the
+    /// `TxnManager`'s shared `all_txns` sink) guarantees no write site can
+    /// leave the manager-visible first-active LSN stale.  Mirrors JE
+    /// `Txn.addLogInfo` (Txn.java:1443-1456), which sets `firstLoggedLsn` iff
+    /// NULL under the log latch after every transactional LN;
+    /// `TxnManager.getFirstActiveLsn` (TxnManager.java:355-366) reads it to
+    /// bound the recovery scan and clamp the cleaner's file selection.  The
+    /// caller holds this `Txn`'s mutex, serialising a given txn's writes, so
+    /// the first (earliest, by log order) call wins the `first_lsn` set — the
+    /// same "iff NULL" guard JE applies under the log latch (R-FIRSTLSN).
     pub fn note_log_entry(&mut self, lsn: u64) {
         if self.first_lsn == NULL_LSN.as_u64() {
             self.first_lsn = lsn;
+            // Propagate the first-logged LSN to the TxnManager's shared map so
+            // get_first_active_lsn() sees it immediately, regardless of which
+            // log entry type came first.  Guarded by "earliest wins" to match
+            // update_first_lsn and JE's firstLoggedLsn==NULL_LSN check.
+            if let Some(sink) = &self.first_active_sink {
+                let mut guard = sink.write();
+                if let Some(entry) = guard.get_mut(&self.id)
+                    && (*entry == NULL_LSN.as_u64() || lsn < *entry)
+                {
+                    *entry = lsn;
+                }
+            }
         }
         self.last_lsn = lsn;
     }

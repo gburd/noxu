@@ -3574,8 +3574,15 @@ impl EnvironmentImpl {
         // is restored from the DB's own metadata on reopen, not the NameLN.
         // Delete the old name (transactional tombstone) then create the new
         // name (transactional NameLNTxn), both under the user txn.
-        let _ = Self::log_name_ln_delete_txn(lm, old_name, txn_id)?;
-        let last = Self::log_name_ln_txn(
+        //
+        // R-FIRSTLSN: return the FIRST entry's LSN (the delete-old tombstone),
+        // not the last, so the caller's `Txn::note_log_entry` records the
+        // EARLIEST log position of this rename.  The two entries may straddle a
+        // log-file boundary; reporting the earliest makes the cleaner's
+        // first-active-txn-file clamp protect the file holding the first entry
+        // too, independent of where the file flip lands (not luck of layout).
+        let first = Self::log_name_ln_delete_txn(lm, old_name, txn_id)?;
+        let _last = Self::log_name_ln_txn(
             lm,
             new_name,
             db_id.id() as u64,
@@ -3584,7 +3591,7 @@ impl EnvironmentImpl {
             dup_id.as_deref(),
             fanout,
         )?;
-        Ok(Some(last))
+        Ok(Some(first))
     }
 
     /// Identity-guarded truncate for deferred (transactional) DDL.

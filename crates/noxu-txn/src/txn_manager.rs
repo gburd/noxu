@@ -48,8 +48,16 @@ pub struct TxnManager {
     /// `get_first_active_lsn()`).  Starts as `NULL_LSN` until the txn writes
     /// its first log entry.
     ///
-    ///
-    all_txns: RwLock<HashMap<i64, u64>>,
+    /// Wrapped in an `Arc` so each live `Txn` can hold a clone of this exact
+    /// map (its `first_active_sink`) and record its first-logged LSN from
+    /// `Txn::note_log_entry` — the single chokepoint every transactional log
+    /// write already funnels through.  This mirrors JE, where
+    /// `TxnManager.getFirstActiveLsn` reads each live `Txn.firstLoggedLsn`
+    /// (set by `Txn.addLogInfo` under the log latch after every transactional
+    /// LN); the shared handle keeps Noxu's materialised copy in lock-step with
+    /// the per-`Txn` value so no write site (NameLN DDL, XA prepare, user LN)
+    /// can leave it stale (R-FIRSTLSN).
+    all_txns: Arc<RwLock<HashMap<i64, u64>>>,
 
     /// Next local transaction ID generator (positive, incrementing).
     ///
@@ -95,7 +103,7 @@ impl TxnManager {
     /// Creates a new TxnManager.
     pub fn new(lock_manager: Arc<LockManager>) -> Self {
         TxnManager {
-            all_txns: RwLock::new(HashMap::new()),
+            all_txns: Arc::new(RwLock::new(HashMap::new())),
             next_txn_id: AtomicI64::new(1),
             last_local_txn_id: AtomicI64::new(0),
             lock_manager,
@@ -150,7 +158,9 @@ impl TxnManager {
         // Register a typed diagnostic label so deadlock and lock-timeout
         // error messages render this locker as `"txn:<id>"`.
         self.lock_manager.register_locker_label(id, "txn");
-        Txn::new(id, self.lock_manager.clone())
+        let mut txn = Txn::new(id, self.lock_manager.clone());
+        txn.set_first_active_sink(Arc::clone(&self.all_txns));
+        txn
     }
 
     /// Begins an explicit transaction with a `LogManager` attached.
@@ -177,6 +187,7 @@ impl TxnManager {
         self.lock_manager.register_locker_label(id, "txn");
         let mut txn =
             Txn::with_log_manager(id, self.lock_manager.clone(), log_manager);
+        txn.set_first_active_sink(Arc::clone(&self.all_txns));
         // The only production caller of this method
         // (`EnvironmentImpl::begin_txn`) is always wrapped by an outer
         // `noxu_db::Transaction`, which already writes its own
@@ -224,12 +235,14 @@ impl TxnManager {
         // this auto-commit op are rendered as `"auto-txn:<id>"` rather than
         // an opaque integer.
         self.lock_manager.register_locker_label(id, "auto-txn");
-        match log_manager {
+        let mut txn = match log_manager {
             Some(lm) => {
                 Txn::with_log_manager_auto(id, self.lock_manager.clone(), lm)
             }
             None => Txn::new_auto(id, self.lock_manager.clone()),
-        }
+        };
+        txn.set_first_active_sink(Arc::clone(&self.all_txns));
+        txn
     }
 
     /// Records that a transaction has committed.
@@ -252,20 +265,23 @@ impl TxnManager {
 
     /// Updates the first-logged LSN for an active transaction.
     ///
-    /// Called when a `Txn` writes its first log entry (via `CursorImpl`
-    /// after `Txn::note_log_entry`), so that [`Self::get_first_active_lsn`]
-    /// returns the oldest active-transaction LSN.
+    /// Historically this was the ONLY path that recorded a txn's first LSN,
+    /// and `CursorImpl` was its sole caller — so a transaction whose first
+    /// log entry was NOT a user LN (a NameLN DDL write, an XA prepare) never
+    /// reported its first LSN here, under-reporting
+    /// [`Self::get_first_active_lsn`] and defeating the cleaner's
+    /// first-active-txn-file clamp (R-FIRSTLSN).  The authoritative path is
+    /// now [`crate::Txn::note_log_entry`], which every transactional log write
+    /// funnels through and which records the first LSN into the shared
+    /// `all_txns` sink directly — mirroring JE, where `Txn.addLogInfo` sets
+    /// `firstLoggedLsn` under the log latch after every transactional LN.
+    /// This method is retained (and still called by `CursorImpl`) as an
+    /// idempotent, defence-in-depth update: it writes the same value
+    /// `note_log_entry` already recorded, under the same "earliest wins"
+    /// guard, so it can neither regress nor race the per-`Txn` value.
     ///
-    /// **Wired since Stage 2** (branch `fix/checkpoint-user-bins`).
-    /// `CursorImpl::with_txn_manager` passes this manager to every
-    /// transactional cursor; the first transactional LN write calls this
-    /// method.  The checkpointer uses [`Self::get_first_active_lsn`] to set
+    /// The checkpointer uses [`Self::get_first_active_lsn`] to set
     /// `CkptEnd.first_active_lsn` (T-F3), which bounds the recovery scan.
-    ///
-    /// Safe since Stage 1 ensures ALL user-database BINs are checkpointed.
-    /// Before Stage 1, bounding the scan would have silently dropped
-    /// committed LNs not captured in any BIN (the St-H6 Site 2 data-loss
-    /// class).
     pub fn update_first_lsn(&self, txn_id: i64, first_lsn: u64) {
         let mut guard = self.all_txns.write();
         // Only update to an earlier LSN (preserve the first-ever entry).
