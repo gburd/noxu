@@ -918,6 +918,99 @@ fn main() {
             }
         }
 
+        // ----------------------------------------------------------------
+        // R-RELOG-PENDING-DDL witnesses (candidate S1 data loss).
+        //
+        // While a remove/rename txn T is OPEN, the victim's COMMITTED NameLN is
+        // still in `name_map` (the physical removal is deferred to T's commit
+        // callback).  relog_live_catalog runs at the START OF EVERY checkpoint
+        // and would re-log a fresh NON-TRANSACTIONAL live NameLN for the victim
+        // AFTER T's delete tombstone.  Recovery's latest-NameLN-per-name rule
+        // then clears the pending delete and RESURRECTS the removed / renamed-
+        // away name after commit + crash.  Distinct from R-FIRSTLSN: the clamp
+        // fix does not touch relog ordering.
+        //
+        // JE never re-logs a NameLN for relocation; its cleaner migrates a live
+        // NameLN under a non-blocking READ lock on the record
+        // (FileProcessor.processFoundLN, FileProcessor.java:1354), and a NameLN
+        // write-locked by the pending DDL txn is DENIED (:1358) and deferred to
+        // the pending-LN queue (file retained), so the relocation respects the
+        // DDL txn.  Noxu's fix skips a pending-DDL name in relog and keeps a
+        // pre-tombstone live copy alive via the first-active clamp.
+        //
+        // The rename mode writes DATA into the victim before the rename and
+        // asserts (post-crash) the NEW name carries that data.
+        // ----------------------------------------------------------------
+        "relog_remove_commit" => {
+            {
+                let vtxn =
+                    env.begin_transaction(None).expect("begin victim create");
+                let v = env
+                    .open_database(Some(&vtxn), "victim", &db_config)
+                    .expect("create victim");
+                v.put_in(
+                    &vtxn,
+                    DatabaseEntry::from_bytes(b"k"),
+                    DatabaseEntry::from_bytes(b"v"),
+                )
+                .expect("seed victim rec");
+                v.close().expect("close victim");
+                vtxn.commit().expect("commit victim create");
+            }
+            {
+                use noxu_db::CheckpointConfig;
+                env.checkpoint(Some(&CheckpointConfig::new().with_force(true)))
+                    .expect("ckpt after victim create");
+            }
+            firstlsn_roll_files(&db, &env, 40);
+            let txn = env.begin_transaction(None).expect("begin remove txn");
+            env.remove_database(Some(&txn), "victim")
+                .expect("remove victim under txn");
+            firstlsn_roll_files(&db, &env, 60);
+            firstlsn_force_delete_barrier(&env);
+            txn.commit().expect("commit remove");
+            flag(&dir, "firstlsn_done");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        "relog_rename_commit" => {
+            {
+                let vtxn =
+                    env.begin_transaction(None).expect("begin victim create");
+                let v = env
+                    .open_database(Some(&vtxn), "victim", &db_config)
+                    .expect("create victim");
+                for i in 0u32..8 {
+                    v.put_in(
+                        &vtxn,
+                        DatabaseEntry::from_bytes(&i.to_be_bytes()),
+                        DatabaseEntry::from_bytes(b"payload"),
+                    )
+                    .expect("seed victim rec");
+                }
+                v.close().expect("close victim");
+                vtxn.commit().expect("commit victim create");
+            }
+            {
+                use noxu_db::CheckpointConfig;
+                env.checkpoint(Some(&CheckpointConfig::new().with_force(true)))
+                    .expect("ckpt after victim create");
+            }
+            firstlsn_roll_files(&db, &env, 40);
+            let txn = env.begin_transaction(None).expect("begin rename txn");
+            env.rename_database(Some(&txn), "victim", "victim2")
+                .expect("rename victim under txn");
+            firstlsn_roll_files(&db, &env, 60);
+            firstlsn_force_delete_barrier(&env);
+            txn.commit().expect("commit rename");
+            flag(&dir, "firstlsn_done");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
         other => panic!("Unknown NOXU_CRASH_MODE: {other}"),
     }
 }

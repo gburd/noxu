@@ -218,6 +218,32 @@ pub struct EnvironmentImpl {
     /// committed databases (C-4 / JE 1-I / 1-J fix).
     pending_names: RwLock<hashbrown::HashMap<String, DatabaseId>>,
 
+    /// R-RELOG (S1): names whose COMMITTED `name_map` entry has a pending
+    /// transactional **remove** or **rename-away** by an active transaction.
+    ///
+    /// A transactional remove/rename logs the NameLN-delete tombstone at
+    /// operation time but defers the in-memory `name_map` mutation to the
+    /// commit callback (JE `Txn.deletedDatabases`,
+    /// `apply_deferred_remove_database`/`apply_deferred_rename_database`).  So
+    /// the victim is still in `name_map` while the txn is open, and
+    /// `relog_live_catalog` -- which iterates `name_map` at the start of every
+    /// checkpoint -- would otherwise re-log a fresh **non-transactional** live
+    /// NameLN at an LSN *after* the tombstone.  Recovery's latest-NameLN-per-
+    /// name rule then clears the pending delete and resurrects the removed /
+    /// renamed-away name after a commit + crash.
+    ///
+    /// Mirrors JE, where the cleaner takes a non-blocking read lock on the
+    /// NameLN record before migrating it (`FileProcessor.processFoundLN`,
+    /// `FileProcessor.java:1354`); a NameLN write-locked by a pending DDL txn
+    /// is DENIED (`:1358`) and deferred to the pending-LN queue, so the
+    /// relocation respects the DDL txn and never writes a live copy past the
+    /// tombstone.  Noxu has no NameLN record lock (the DDL op only logs the
+    /// tombstone), so this set is the lock-free equivalent: `relog_live_
+    /// catalog` skips a name present here, exactly as JE's cleaner skips a
+    /// write-locked NameLN.  Populated at DDL operation time, cleared on
+    /// commit **and** abort of the DDL txn.
+    pending_ddl_names: Arc<RwLock<hashbrown::HashMap<String, DatabaseId>>>,
+
     /// DBEVICT-1 (root-cause fix): serializes the "database absent from
     /// db_map, must be created or reconstructed" slow path of
     /// `open_database_inner` so two threads racing to open the SAME name
@@ -1755,6 +1781,12 @@ impl EnvironmentImpl {
         > = Arc::new(RwLock::new(recovered_comparators));
         let recovered_fanouts: Arc<RwLock<HashMap<String, i32>>> =
             Arc::new(RwLock::new(recovered_fanouts));
+        // R-RELOG (S1): shared set of names with a pending transactional
+        // remove/rename-away by an active txn, so the checkpointer's relog
+        // callback can skip them (see the `pending_ddl_names` field docs).
+        let pending_ddl_names: Arc<
+            RwLock<hashbrown::HashMap<String, DatabaseId>>,
+        > = Arc::new(RwLock::new(hashbrown::HashMap::new()));
 
         // REC-CAT: wire the checkpointer's catalog-relog callback.  At the
         // start of every checkpoint the checkpointer re-logs a fresh NameLN
@@ -1770,6 +1802,7 @@ impl EnvironmentImpl {
             let db_map_for_relog = Arc::clone(&db_map);
             let comparators_for_relog = Arc::clone(&recovered_comparators);
             let fanouts_for_relog = Arc::clone(&recovered_fanouts);
+            let pending_ddl_for_relog = Arc::clone(&pending_ddl_names);
             ckpt.set_catalog_relog_fn(Arc::new(move || {
                 relog_live_catalog_impl(
                     &lm_for_relog,
@@ -1777,6 +1810,7 @@ impl EnvironmentImpl {
                     &db_map_for_relog,
                     &comparators_for_relog,
                     &fanouts_for_relog,
+                    &pending_ddl_for_relog,
                 );
             }));
         }
@@ -1951,6 +1985,7 @@ impl EnvironmentImpl {
             recovered_fanouts,
             evicted_db_state: Arc::new(RwLock::new(HashMap::new())),
             pending_names: RwLock::new(hashbrown::HashMap::new()),
+            pending_ddl_names: Arc::clone(&pending_ddl_names),
             open_reconstruct_lock: Mutex::new(()),
             is_invalid,
             replica_write_screen: Arc::new(AtomicBool::new(false)),
@@ -2690,6 +2725,23 @@ impl EnvironmentImpl {
         self.db_map.write().remove(&db_id);
     }
 
+    /// R-RELOG (S1): mark `name` as having a pending transactional remove or
+    /// rename-away by an active txn, so `relog_live_catalog` will not re-log a
+    /// fresh live NameLN for it past the already-logged tombstone.  Called at
+    /// DDL operation time; cleared by [`Self::clear_pending_ddl`] on commit
+    /// **and** abort.  See the `pending_ddl_names` field docs for the JE
+    /// mechanism this mirrors (`FileProcessor.processFoundLN` nonBlockingLock
+    /// DENIED -> pending LN).
+    pub fn mark_pending_ddl(&self, name: &str, db_id: DatabaseId) {
+        self.pending_ddl_names.write().insert(name.to_string(), db_id);
+    }
+
+    /// R-RELOG (S1): clear the pending-DDL marker for `name` (commit or abort
+    /// of the DDL txn).  Idempotent.
+    pub fn clear_pending_ddl(&self, name: &str) {
+        self.pending_ddl_names.write().remove(name);
+    }
+
     /// Write a transactional NameLNTxn entry to the WAL mapping `name` → `db_id`.
     ///
     /// Written **inside** the creating transaction with `Provisional::Yes`
@@ -2763,7 +2815,7 @@ impl EnvironmentImpl {
         btree_comparator_id: Option<&str>,
         dup_comparator_id: Option<&str>,
         fanout: Option<i32>,
-    ) -> Result<(), DbiError> {
+    ) -> Result<noxu_util::Lsn, DbiError> {
         let key = name.as_bytes().to_vec();
         let mut data = db_id.to_le_bytes().to_vec();
         // DBI-14 + NEW-5: append the persisted comparator identities and the
@@ -2797,7 +2849,6 @@ impl EnvironmentImpl {
             false, // flush: lazy
             false, // fsync: lazy
         )
-        .map(|_| ())
         .map_err(DbiError::from)
     }
 
@@ -2842,7 +2893,72 @@ impl EnvironmentImpl {
             &self.db_map,
             &self.recovered_comparators,
             &self.recovered_fanouts,
+            &self.pending_ddl_names,
         );
+    }
+
+    /// R-RELOG (S1): re-log the committed NameLN for `name` ONE time as a live
+    /// NameLN and return its LSN.
+    ///
+    /// A transactional remove/rename calls this at operation time, BEFORE
+    /// logging the delete tombstone, so a known-LSN LIVE copy of the victim's
+    /// NameLN exists just before the tombstone.  The caller records that LSN
+    /// on the DDL transaction (`Txn::note_log_entry`), anchoring the cleaner's
+    /// first-active-txn-file clamp (earliest-wins) at that copy's file; the
+    /// clamp then keeps that file alive while the DDL txn is open.  Combined
+    /// with `relog_live_catalog` SKIPPING the pending-DDL name (so no live copy
+    /// lands *after* the tombstone), recovery honours the DDL txn:
+    /// - on COMMIT the tombstone is the latest NameLN -> name absent;
+    /// - on ABORT the pre-tombstone live copy is the latest live NameLN ->
+    ///   name present.
+    ///
+    /// This mirrors JE, where the cleaner keeps the file holding a NameLN that
+    /// is write-locked by a pending DDL txn (`FileProcessor.processFoundLN`
+    /// nonBlockingLock DENIED -> addPendingLN -> file retained until the txn
+    /// resolves, `FileProcessor.java:1354-1369`).  Resolves comparator / fanout
+    /// metadata the same way as `relog_live_catalog_impl`.  Returns `None` for
+    /// a read-only env (no LogManager) or an unknown name.
+    pub fn relog_name_ln_once(
+        &self,
+        name: &str,
+    ) -> Result<Option<noxu_util::Lsn>, DbiError> {
+        let lm = match &self.log_manager {
+            Some(lm) => lm,
+            None => return Ok(None),
+        };
+        let db_id = match self.name_map.read().get(name).copied() {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        let (btree_id, dup_id): (Option<String>, Option<String>) =
+            if let Some(db) = self.db_map.read().get(&db_id) {
+                let g = db.read();
+                (
+                    g.btree_comparator_id().map(|s| s.to_string()),
+                    g.duplicate_comparator_id().map(|s| s.to_string()),
+                )
+            } else if let Some(ids) =
+                self.recovered_comparators.read().get(name)
+            {
+                ids.clone()
+            } else {
+                (None, None)
+            };
+        let fanout: Option<i32> =
+            if let Some(db) = self.db_map.read().get(&db_id) {
+                Some(db.read().max_tree_entries_per_node())
+            } else {
+                self.recovered_fanouts.read().get(name).copied()
+            };
+        let lsn = Self::log_name_ln(
+            lm,
+            name,
+            db_id.id() as u64,
+            btree_id.as_deref(),
+            dup_id.as_deref(),
+            fanout,
+        )?;
+        Ok(Some(lsn))
     }
 
     /// Returns the `Arc<RwLock<DatabaseImpl>>` for `db_id`, or `None` if not found.
@@ -4590,6 +4706,7 @@ fn relog_live_catalog_impl(
         RwLock<HashMap<String, (Option<String>, Option<String>)>>,
     >,
     recovered_fanouts: &Arc<RwLock<HashMap<String, i32>>>,
+    pending_ddl_names: &Arc<RwLock<hashbrown::HashMap<String, DatabaseId>>>,
 ) {
     // Snapshot (name, id) pairs so we do not hold the name_map lock across
     // WAL writes (which can block on the log write latch).
@@ -4601,6 +4718,24 @@ fn relog_live_catalog_impl(
     }
 
     for (name, db_id) in &names {
+        // R-RELOG (S1): a name with a pending transactional remove/rename-away
+        // by an active txn is still in `name_map` (the physical removal is
+        // deferred to the commit callback), but its NameLN-delete tombstone is
+        // already in the log.  Re-logging a fresh LIVE NameLN here would land
+        // AFTER the tombstone; recovery's latest-NameLN-per-name rule then
+        // clears the pending delete and resurrects the removed/renamed-away
+        // name after a commit + crash.  Skip it — exactly as JE's cleaner
+        // skips a NameLN write-locked by the pending DDL txn
+        // (`FileProcessor.processFoundLN` nonBlockingLock DENIED ->
+        // addPendingLN -> not migrated, retried later; `FileProcessor.java:
+        // 1354-1369`).  The committed tombstone is the DDL txn's first log
+        // entry and is protected by the first-active-txn clamp (R-FIRSTLSN)
+        // while the txn is open, so recovery honours it; the stale pre-DDL
+        // live NameLN copy is never needed on commit, and on abort the DDL
+        // txn's own undo restores the name.
+        if pending_ddl_names.read().contains_key(name) {
+            continue;
+        }
         // Comparator identities: prefer the open DatabaseImpl (authoritative
         // for databases created in this session), else the identities
         // recovered from the prior NameLN.  Both empty for the common
