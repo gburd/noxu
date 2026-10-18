@@ -1599,6 +1599,19 @@ impl ReplicatedEnvironment {
 
         *self.env_impl.lock().unwrap() = Some(Arc::clone(&env));
 
+        // GAP-REPLAY-3 / BUG-REP-SCREEN-RACE: hand the env's shared
+        // replica-write screen to the state machine, which from now on flips
+        // it as a pure function of the role (armed iff not Master), INSIDE the
+        // single state write lock, so the (role, screen) pair is always
+        // consistent.  Seeding under the state lock also arms the screen
+        // immediately if this node is ALREADY a Replica at wire-time.  This
+        // replaces the former out-of-lock `set_replica_write_screen` calls in
+        // `become_master` / `become_replica`, which raced each other across
+        // the election-driver / master-transfer / application threads and
+        // could leave a Replica unscreened (S2).  Mirrors JE deriving the
+        // write-allow decision from `isMaster()` at locker creation
+        // (`RepImpl.createRepUserTxn`), not from a free-floating flag.
+        self.node_state.set_write_screen(env.replica_write_screen_handle());
         // B6/V15/F2: wire the cleaner's shared FileProtector so the master can
         // translate the global CBVLSN into a file-protection bound. When the
         // env has a running cleaner, every ack thereafter pins the log files a
@@ -2845,12 +2858,16 @@ impl ReplicatedEnvironment {
             self.node_state.transition_via_unknown(NodeState::Master)?;
         self.master_tracker.set_master(self.config.node_name.as_str(), term);
 
-        // GAP-REPLAY-3: this node is now the MASTER — local user writes are
-        // allowed again (clear the replica-write screen).  JE: the master
-        // issues ordinary writable txns, not ReadonlyTxns.
-        if let Some(env) = self.env_impl.lock().unwrap().clone() {
-            env.set_replica_write_screen(false);
-        }
+        // GAP-REPLAY-3 / BUG-REP-SCREEN-RACE: this node is now the MASTER, so
+        // local user writes are allowed again (the replica-write screen is
+        // CLEARED).  The screen is no longer stored here out of band: it is
+        // flipped as a pure function of the role INSIDE the single state write
+        // lock of `transition_via_unknown` above (see
+        // `NodeStateMachine::apply_transition_locked`), so a concurrent
+        // `become_replica` on another thread can never re-arm it after we
+        // reach Master, nor can our clear leak onto a node that ends up
+        // Replica.  JE: the master issues ordinary writable `MasterTxn`s, a
+        // decision `RepImpl.createRepUserTxn` makes from `isMaster()`.
 
         // --- F9: spawn Feeder trackers for each known replica -------------
         //
@@ -3008,18 +3025,20 @@ impl ReplicatedEnvironment {
         // below handles: a second `become_replica` naming a NEW master must
         // update the master and let the running thread re-sync, not error on
         // a REPLICA -> REPLICA self-transition.
-        // GAP-REPLAY-3 (merge-prep): arm the replica-write screen BEFORE the
-        // state transition to Replica, so there is never a window in which the
-        // node already reports `Replica` but still accepts local user writes
-        // (which would silently diverge it from the master).  Arming early is
-        // conservative: a stray write in the brief pre-transition window is
-        // refused with `ReplicaWrite`, never wrongly accepted.  (become_master
-        // clears the screen AFTER its transition for the symmetric reason — a
-        // write in that window gets a transient, safe `ReplicaWrite`.)
-        if let Some(env) = self.env_impl.lock().unwrap().clone() {
-            env.set_replica_write_screen(true);
-        }
-
+        // GAP-REPLAY-3 / BUG-REP-SCREEN-RACE: the replica-write screen is
+        // ARMED as a pure function of the role, atomically with the state
+        // transition below.  `transition_via_unknown` flips the screen to
+        // `armed` the instant it stores `Replica` (and to `cleared` the
+        // instant it stores `Master`), all under its single state write lock
+        // (see `NodeStateMachine::apply_transition_locked`).  There is
+        // therefore NO window in which the node reports `Replica` with the
+        // screen cleared -- the exact S2 silent-divergence hole, and the
+        // `gap_replay_3_write_screen_test` flake, that the former out-of-lock
+        // `set_replica_write_screen(true)` here left open against a concurrent
+        // `become_master` (election-driver / master-transfer / app thread).
+        // Mirrors JE, which derives the write-allow decision from
+        // `isMaster()` at locker-creation time (`RepImpl.createRepUserTxn`),
+        // never from a separately-mutable flag.
         let old_state =
             self.node_state.transition_via_unknown(NodeState::Replica)?;
         self.master_tracker.set_master(master_name, 0);
@@ -4794,6 +4813,30 @@ impl ReplicatedEnvironment {
 //
 // Closes finding F1 of the 2026 review.
 impl ReplicaAckCoordinator for ReplicatedEnvironment {
+    /// R-REPUSER (`BUG-REP-USER-WRITES-NOT-REPLICATED`, S1): fail closed.
+    ///
+    /// A `ReplicatedEnvironment` installed as a data env's replica-ack
+    /// coordinator cannot actually replicate ordinary user writes in 7.11.x --
+    /// the user commit path logs `TxnCommit` with `NULL_VLSN`, so the feeder
+    /// (which ships only VLSN-tagged entries) skips every user commit and the
+    /// write is NEVER streamed to any replica.  Report that so
+    /// `Transaction::commit_with_durability` refuses a data-logging commit
+    /// (before the local commit record) instead of silently accept-and-dropping
+    /// it or blocking the full ack timeout with a misleading
+    /// `InsufficientReplicas`.  The complete JE-faithful fix lands in v8.0.0;
+    /// elections, group membership, master transfer, and the feeder/ack
+    /// machinery (exercised directly by the rep-layer tests) are unaffected.
+    fn refuse_user_write_commit(&self) -> Option<&'static str> {
+        Some(
+            "replication of ordinary user writes is not functional in 7.11.x \
+             (R-REPUSER / BUG-REP-USER-WRITES-NOT-REPLICATED); a committed \
+             write would not be streamed to any replica. Use a single node or \
+             wait for the v8.0.0 fix. See \
+             docs/src/operations/known-limitations.md and the replication \
+             chapter.",
+        )
+    }
+
     fn await_replica_acks(
         &self,
         policy: ReplicaAckPolicyKind,

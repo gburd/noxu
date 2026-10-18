@@ -314,7 +314,8 @@ pub trait ExceptionListener: Send + Sync {
 /// - Operation-failure variants are retryable after abort
 ///   ([`NoxuError::is_retryable`]).
 /// - HA / replication variants ([`NoxuError::InsufficientReplicas`],
-///   [`NoxuError::ReplicaWrite`], [`NoxuError::RollbackRequired`]).
+///   [`NoxuError::ReplicaWrite`], [`NoxuError::RollbackRequired`],
+///   [`NoxuError::ReplicationNotSupported`]).
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum NoxuError {
@@ -581,6 +582,32 @@ pub enum NoxuError {
 
     #[error("rollback required: {0}")]
     RollbackRequired(String),
+
+    /// Replication of ordinary user writes is not supported in this release.
+    ///
+    /// Returned (fail-closed) when a data-logging commit is attempted on an
+    /// `Environment` that has a `ReplicatedEnvironment` installed as its
+    /// replica-ack coordinator.  In 7.11.x the user commit path never assigns
+    /// a VLSN, so the write is never streamed to any replica; rather than
+    /// silently accept-and-drop the write (or block the full ack timeout and
+    /// return a misleading `InsufficientReplicas`), the commit is refused
+    /// BEFORE the `TxnCommit` frame is written, so the local write is rolled
+    /// back when the caller aborts the transaction and no application is
+    /// misled into believing its write was replicated.
+    ///
+    /// This closes R-REPUSER (`BUG-REP-USER-WRITES-NOT-REPLICATED`, S1).  The
+    /// complete JE-faithful fix (one write path, a `ReplicationContext` on
+    /// every log call, per-txn commit VLSN, DDL replay) lands in v8.0.0.  See
+    /// `docs/src/operations/known-limitations.md` and the replication chapter
+    /// banners.
+    #[error(
+        "replication of user writes is not supported in this release: {reason}"
+    )]
+    ReplicationNotSupported {
+        /// Human-readable detail (why the commit was refused and where to
+        /// read more).
+        reason: String,
+    },
 
     // ── Log / I/O ──────────────────────────────────────────────────────────
     /// A log checksum mismatch was detected (potential corruption).
@@ -868,6 +895,9 @@ impl From<noxu_dbi::DbiError> for NoxuError {
             DbiError::LockConflict(s) => NoxuError::LockConflict(s),
             DbiError::DiskLimitExceeded { used, limit } => {
                 NoxuError::DiskLimitExceeded { used, limit }
+            }
+            DbiError::ReplicationNotSupported { reason } => {
+                NoxuError::ReplicationNotSupported { reason }
             }
             DbiError::IoError(io) => NoxuError::IoError(io),
             DbiError::TxnError(txn_err) => NoxuError::from(txn_err),

@@ -19,14 +19,18 @@ listed in [References](#references).
 ## [7.11.1] - unreleased (release candidate)
 
 v7.11.1 is a **patch release** from v7.11.0: bug fixes only, with no on-disk
-format change (`LOG_VERSION` stays 3), no new log entry type, and no *breaking*
-public API change in the nine Stable / Stable-foundational crates (`noxu`,
-`noxu-db`, `noxu-bind`, `noxu-collections`, `noxu-persist`, `noxu-xa`,
-`noxu-rep`, `noxu-util`, `noxu-config`).  One **additive** change is included: a
-new `NoxuError::InsufficientAcks` variant (see *API (additive)* below), which is
-patch-safe because `NoxuError` is `#[non_exhaustive]` (SemVer policy
-§"not breaking": *adding a non-exhaustive enum variant*).  See the SemVer policy
-in `docs/src/contributing/semver-policy.md`.
+format change (`LOG_VERSION` stays 3), no new log entry type, and no
+*breaking* public API change in the nine Stable / Stable-foundational crates
+(`noxu`, `noxu-db`, `noxu-bind`, `noxu-collections`, `noxu-persist`, `noxu-xa`,
+`noxu-rep`, `noxu-util`, `noxu-config`). Two **additive, patch-safe** surface
+changes are included: (1) a new `NoxuError::InsufficientAcks` variant
+(FID-DUR-1; see *API (additive)* below), and (2) the R-REPUSER fail-closed path
+(see *Changed*) — a new `NoxuError::ReplicationNotSupported` variant plus a new
+`#[doc(hidden)]`, defaulted `ReplicaAckCoordinator` method. Both new variants are
+patch-safe because `NoxuError` is `#[non_exhaustive]`, and a defaulted trait
+method is non-breaking (SemVer policy §"not breaking";
+`cargo-semver-checks`: 9/9 "no semver update required" vs v7.11.0). See
+`docs/src/contributing/semver-policy.md`.
 
 **Upgrade strongly recommended.** This release closes several silent
 data-loss holes reachable with default settings on small or cache-pressured
@@ -430,6 +434,44 @@ recorded here for completeness.
   the full description. Previously replica reads were lock-free and local
   replica writes were silently accepted. Enabled by default.
 
+### Changed
+
+- **Replication now fails closed on EVERY user write it cannot replicate
+  (R-REPUSER / `BUG-REP-USER-WRITES-NOT-REPLICATED`, S1).** When a
+  `noxu-db::Environment` has a `noxu_rep::ReplicatedEnvironment` installed as
+  its replica-ack coordinator, every public user-write path — auto-commit
+  `Database::put`/`put_no_overwrite`/`delete`, an explicit transaction's
+  `put_in`/`delete_in`, auto-commit cursor `put`/`delete`, non-transactional
+  writes, DDL (`open_database` create / `remove_database` / `rename_database` /
+  `truncate_database`), sequences (`Database::open_sequence` create /
+  `Sequence::get` persist), the DPL and collections layers (`StoredMap` /
+  `StoredList` / `StoredSortedMap`, `run_in_auto_commit`, `TransactionRunner`),
+  and the XA layer (a `put` under an XA branch, and committing a recovered
+  prepared branch via `write_txn_commit_for_recovered`) — is now **refused at
+  the write operation, before any log record is written**, with the new
+  `NoxuError::ReplicationNotSupported` error. Previously only an
+  explicit transaction's `commit` was gated, so the most common write (a plain
+  auto-commit `db.put`) **silently "succeeded" and was never streamed to any
+  replica** (ack policy `None`), or an explicit commit blocked the full ack
+  timeout and returned a misleading `InsufficientReplicas` (ack policy
+  `SimpleMajority`/`All`). Refusing at the operation means **nothing is logged
+  and nothing is durable** — the write never reaches a commit — so no
+  application is silently misled into believing its write was replicated
+  (JE refuses at the operation via `Cursor.checkUpdatesAllowed` /
+  `RepImpl.checkIfMaster`-style preflights, not at commit). **Elections, group
+  membership, master transfer, empty/read-only commits, standalone
+  (non-replicated) environments, and the existing internal replication tests
+  are unaffected.** This is an additive, patch-safe change: `NoxuError` is
+  `#[non_exhaustive]` (new variant is non-breaking) and the fail-closed signal
+  rides a new **`#[doc(hidden)]`, defaulted**
+  `ReplicaAckCoordinator::refuse_user_write_commit` method (adding a defaulted
+  trait method is non-breaking); the predicate is carried on `EnvironmentImpl`
+  (internal-tier). No on-disk format change, no new log entry type, no
+  `RepError` variant. The complete JE-faithful fix (one write path, a
+  replication context on every log call, per-txn commit VLSN, and DDL replay)
+  is scheduled for v8.0.0; see *Known issues* below and
+  `docs/src/operations/known-limitations.md`.
+
 ### Fixed — internal crates (no stability guarantee)
 
 The internal-tier crates (`noxu-cleaner`, `noxu-dbi`, `noxu-engine`,
@@ -445,6 +487,21 @@ Stable-foundational crates are unchanged at the public-API level
 
 ### Known issues / deferred to v8.0.0
 
+- **R-REPUSER (`BUG-REP-USER-WRITES-NOT-REPLICATED`, S1) — replication does not
+  replicate ordinary user writes.** Through the public API, a committed
+  `db.put`/`delete`/`update` on a replicated master is **never streamed to any
+  replica**: the user commit path logs `TxnCommit` with `NULL_VLSN` and never
+  routes through the VLSN-assigning path, so the feeder (which ships only
+  VLSN-tagged entries) skips every user commit. The defect has existed since
+  replication was first written (not a regression). **7.11.1 mitigates it by
+  failing closed** (see *Changed* above): the engine refuses such a commit
+  with `NoxuError::ReplicationNotSupported` instead of silently dropping it, so
+  there is no silent data divergence — but replication still cannot carry
+  application data in 7.11.x. Use a single node, or wait for the complete
+  JE-faithful fix (one write path, a replication context on every log call,
+  per-txn commit VLSN, DDL replay) in **v8.0.0**. Elections, group membership,
+  and master transfer work. See `docs/src/operations/known-limitations.md` and
+  the replication-chapter banners.
 - **A17** sec→primary ABBA avoidance (feature; a progress guard shipped).
 - **A20** trigger lifecycle — needs `FEAT-TRIGGER-LIFECYCLE` (new public API).
 - **A22** reject an unregistered comparator at open — needs
@@ -481,7 +538,23 @@ Stable-foundational crates are unchanged at the public-API level
   v8.0.0. A ready `#[ignore]`d witness is committed
   (`tests/fid_elect_learner_stall.rs`).
 
-<!-- R-REPUSER: pending owner decision #9 -->
+### Known issues / deferred to v8.0.0 (R-REPUSER)
+
+- **R-REPUSER (`BUG-REP-USER-WRITES-NOT-REPLICATED`, S1) — replication does not
+  replicate ordinary user writes.** Through the public API, a committed
+  `db.put`/`delete`/`update` (and DDL, sequences, DPL, collections, XA) on a
+  replicated master is **never streamed to any replica**: the user write path
+  logs with `NULL_VLSN` and the feeder ships only VLSN-tagged entries. The
+  defect has existed since replication was first written. **7.11.1 fails
+  closed** (see *Changed*): every public user write on a master-wired data env
+  is refused at the operation with `NoxuError::ReplicationNotSupported` rather
+  than silently dropped, so there is no silent data divergence — but
+  replication still cannot carry application data in 7.11.x. Use a single node,
+  or wait for the complete JE-faithful fix (one write path, a replication
+  context on every log call, per-txn commit VLSN, DDL replay) in **v8.0.0**.
+  Elections, group membership, and master transfer work. See
+  `docs/src/operations/known-limitations.md` and the replication-chapter
+  banners.
 
 
 ## [7.11.0] - 2026-09-28

@@ -140,6 +140,25 @@ pub struct EnvironmentImpl {
     /// config value.
     is_replicated: std::sync::atomic::AtomicBool,
 
+    /// R-REPUSER (`BUG-REP-USER-WRITES-NOT-REPLICATED`, S1): fail-closed guard.
+    ///
+    /// Set to `true` by `noxu-db::Environment::set_replica_coordinator` when
+    /// the installed `ReplicaAckCoordinator` reports it cannot replicate
+    /// ordinary user writes in this release (`refuse_user_write_commit()` ->
+    /// `Some`).  Every public user-write pre-flight (`Database::check_writable`,
+    /// `Environment::check_writable`, the DDL/create path, and the `CursorImpl`
+    /// write path via the cached clone handed out by
+    /// [`Self::refuse_user_writes_flag`]) consults it and refuses the write
+    /// BEFORE any LN is logged, so a master-wired data env cannot silently
+    /// accept-and-drop a write that will never be streamed.  Stored as
+    /// `Arc<AtomicBool>` so `CursorImpl` can cache a cheap clone (same pattern
+    /// as [`Self::is_invalid`] / `env_invalid`).  `false` for every standalone
+    /// (non-replicated) environment, so their behaviour is unchanged.
+    refuse_user_writes: Arc<AtomicBool>,
+    /// The human-readable reason the write was refused (set once, alongside
+    /// `refuse_user_writes`).  Read only on the refusal path.
+    refuse_user_writes_reason: std::sync::OnceLock<&'static str>,
+
     /// Node ID and transient LSN generator.
     ///
     /// `Arc`-shared so the checkpointer can read the current max node-id at
@@ -1941,6 +1960,8 @@ impl EnvironmentImpl {
             is_read_only: read_only,
             is_transactional: transactional,
             is_replicated: std::sync::atomic::AtomicBool::new(false),
+            refuse_user_writes: Arc::new(AtomicBool::new(false)),
+            refuse_user_writes_reason: std::sync::OnceLock::new(),
             node_sequence: Arc::clone(&node_sequence),
             next_db_id: Arc::clone(&next_db_id),
             lock_manager,
@@ -2109,6 +2130,47 @@ impl EnvironmentImpl {
     /// writable txns.
     pub fn set_replica_write_screen(&self, screened: bool) {
         self.replica_write_screen.store(screened, Ordering::Relaxed);
+    }
+
+    /// R-REPUSER: records that ordinary user writes must be refused on this
+    /// environment, with the reason to surface.  Called once by
+    /// `noxu-db::Environment::set_replica_coordinator` when the installed
+    /// coordinator reports it cannot replicate user writes
+    /// (`ReplicaAckCoordinator::refuse_user_write_commit()` -> `Some`).
+    /// Idempotent: the reason is set once; re-arming just re-asserts the flag.
+    pub fn set_refuse_user_writes(&self, reason: &'static str) {
+        let _ = self.refuse_user_writes_reason.set(reason);
+        self.refuse_user_writes.store(true, Ordering::Relaxed);
+    }
+
+    /// R-REPUSER: clears the user-write refusal (called by
+    /// `clear_replica_coordinator`).  The reason string stays interned (it is
+    /// `&'static`); only the live flag is cleared, so subsequent writes are
+    /// allowed again.
+    pub fn clear_refuse_user_writes(&self) {
+        self.refuse_user_writes.store(false, Ordering::Relaxed);
+    }
+
+    /// R-REPUSER: `Some(reason)` when ordinary user writes must be refused on
+    /// this environment; `None` otherwise.  The common env-level predicate the
+    /// public write pre-flights consult.  A single relaxed atomic load on the
+    /// fast (allowed) path.
+    pub fn refuse_user_writes_reason(&self) -> Option<&'static str> {
+        if self.refuse_user_writes.load(Ordering::Relaxed) {
+            Some(self.refuse_user_writes_reason.get().copied().unwrap_or(
+                "replication of ordinary user writes is not supported in \
+                     this release (R-REPUSER)",
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// R-REPUSER: a cheap `Arc<AtomicBool>` clone of the refusal flag, cached
+    /// into `CursorImpl` at open (same pattern as [`Self::is_invalid_flag`]) so
+    /// a cursor write can refuse before logging without locking the env.
+    pub fn refuse_user_writes_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.refuse_user_writes)
     }
     pub fn get_creation_time(&self) -> u64 {
         self.creation_time_ms

@@ -200,36 +200,34 @@ fn f1_acks_within_timeout_succeed() {
     let _ = env.close();
 }
 
-/// End-to-end: install the rep coordinator on a real `noxu_db::Environment`
-/// and verify that `Transaction::commit_with_durability` actually
-/// blocks on replica acks. Without F1 the commit returned `Ok(())`
-/// silently; with F1 it blocks and, on an ack timeout, returns
-/// `NoxuError::InsufficientAcks` -- the txn IS committed+durable at the master
-/// but too few replicas acknowledged (FID-DUR-1; JE InsufficientAcksException).
+/// End-to-end: install a real `ReplicatedEnvironment` as the rep coordinator on
+/// a real `noxu_db::Environment` and verify that a user write is REFUSED
+/// fail-closed (R-REPUSER / BUG-REP-USER-WRITES-NOT-REPLICATED, S1).
 ///
-// JE: ReplicatedTransactionTest.testReplicaCommitDurability — a replicated
-// commit blocks until the durability (ack) policy is satisfied and fails
-// cleanly when it cannot be, rather than returning success without the
-// required acks.  Because the ack wait runs AFTER the local TxnCommit fsync,
-// the failure is the POST-commit InsufficientAcksException (committed at the
-// master), not the pre-commit InsufficientReplicasException (FID-DUR-1).
-//
-// JE: ReplicatedTransactionTest.testTxnCommitException — commit(SYNC_SYNC_ALL)
-// with a replica missing. This end-to-end test is exactly that: commit with
-// ReplicaAckPolicy::All and non-acking peers returns NoxuError::InsufficientAcks
-// (Noxu's InsufficientAcksException): the write is committed+durable at the
-// master but too few replicas acknowledged.
+/// HISTORY: this test previously asserted the commit blocked the full ack
+/// timeout and returned `NoxuError::InsufficientReplicas` — pinning the BROKEN
+/// behaviour as "correct". That was the S1 defect: the user commit path logs
+/// `TxnCommit` with `NULL_VLSN`, the write is never streamed, and the commit
+/// blocks pointlessly then returns a misleading `InsufficientReplicas` (and
+/// under ack `None` would silently "succeed" and drop the write). 7.11.x fails
+/// closed AT THE WRITE OP: a user write on a data env with a
+/// `ReplicatedEnvironment` coordinator installed is refused — before any LN is
+/// logged — with `NoxuError::ReplicationNotSupported`, so nothing durable is
+/// produced and no application is silently misled. The complete JE-faithful
+/// fix (one write path, per-txn commit VLSN, DDL replay) lands in v8.0.0.
 ///
-/// This test now writes data (a `put`) before committing so the txn is a
-/// real ack-requiring commit.  An EMPTY / read-only txn correctly returns
-/// `Ok(())` WITHOUT waiting for acks (JE-faithful: a txn that logged no
-/// entry assigns no commit VLSN and has nothing to replicate — see
-/// `Txn.commit` which invokes the commit hooks only when
-/// `updateLoggedForTxn()`, and
-/// `f1_empty_commit_returns_ok_without_acks` below which pins that).
+/// COMPOSITION (R-REPUSER + FID-DUR-1): on a MASTER-wired data env R-REPUSER
+/// refuses the write at the OPERATION, before any LN, so the commit never
+/// happens and FID-DUR-1's post-commit `InsufficientAcks` path is UNREACHABLE
+/// here.  FID-DUR-1's committed-at-master ack-timeout semantics are witnessed
+/// separately by `fid_dur_1_ack_timeout_probe.rs` (a test-double coordinator
+/// that is NOT refused), so no DUR-1 coverage is lost.
+///
+/// An EMPTY / read-only txn never touches the coordinator at all (JE-faithful:
+/// a txn that logged no entry has nothing to replicate — see
+/// `f1_empty_commit_returns_ok_without_acks`).
 #[test]
 fn f1_commit_blocks_on_replica_acks() {
-    use noxu_db::durability::{Durability, ReplicaAckPolicy, SyncPolicy};
     use noxu_db::error::NoxuError;
     use noxu_db::{DatabaseConfig, Environment, EnvironmentConfig};
     use std::path::PathBuf;
@@ -261,17 +259,15 @@ fn f1_commit_blocks_on_replica_acks() {
     env.set_replica_ack_timeout(Duration::from_millis(200));
 
     let txn = env.begin_transaction(None).unwrap();
-    // Write a record so this is a data-logging commit that actually
-    // requires replica acks.  Without the put the txn logs nothing and
-    // correctly commits Ok without waiting (see the empty-txn test below).
-    db.put_in(&txn, b"k", b"v").unwrap();
-    let durability = Durability::new(
-        SyncPolicy::Sync,
-        SyncPolicy::Sync,
-        ReplicaAckPolicy::All,
-    );
+    // R-REPUSER: a user write on a data env wired to a (refusing)
+    // ReplicatedEnvironment coordinator is refused fail-closed AT THE WRITE OP,
+    // before any LN is logged — not blocked-then-InsufficientReplicas (the old
+    // broken assertion that pinned the S1 defect as "correct") and not a silent
+    // Ok. The complete JE-faithful fix (one write path, per-txn commit VLSN,
+    // DDL replay) is v8.0.0. See `rep_user_write_probe.rs` /
+    // `rep_user_write_paths_probe.rs`.
     let started = Instant::now();
-    let res = txn.commit_with_durability(durability);
+    let res = db.put_in(&txn, b"k", b"v");
     let elapsed = started.elapsed();
 
     // FID-DUR-1: the ack wait runs AFTER the local TxnCommit fsync, so the
@@ -282,29 +278,24 @@ fn f1_commit_blocks_on_replica_acks() {
     // happened).  GREEN after: NoxuError::InsufficientAcks, and
     // is_committed_at_master() == true so the caller knows the write is durable.
     match res {
-        Err(ref e @ NoxuError::InsufficientAcks { required, available }) => {
-            assert!(required >= 1, "required acks must be > 0");
-            assert_eq!(available, 0);
-            assert!(
-                e.is_committed_at_master(),
-                "InsufficientAcks must report the txn committed at the master"
-            );
-            assert!(
-                !e.is_retryable(),
-                "a committed-at-master txn must not be auto-retryable"
-            );
+        Err(NoxuError::ReplicationNotSupported { reason }) => {
+            assert!(!reason.is_empty(), "the refusal must carry a reason");
         }
         other => panic!(
-            "expected InsufficientAcks (committed at master), got {:?} after {:?}",
+            "expected ReplicationNotSupported (R-REPUSER fail-closed), got              {:?} after {:?}",
             other, elapsed
         ),
     }
+    // Immediate — the refusal is at the write op, before the ack wait, so the
+    // 200ms ack timeout must never be reached.
     assert!(
-        elapsed >= Duration::from_millis(150),
-        "commit must wait for the configured timeout; waited {:?}",
+        elapsed < Duration::from_millis(150),
+        "R-REPUSER refusal must be immediate; waited {:?}",
         elapsed
     );
 
+    // The refused write is not durable; roll back the txn.
+    let _ = txn.abort();
     let _ = db.close();
     let _ = env.close();
     let _ = rep_env.close();

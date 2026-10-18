@@ -171,6 +171,10 @@ fn map_cursor_err(e: DbiError) -> NoxuError {
         DbiError::EnvironmentFailure { .. }
         | DbiError::LnFetchFailure { .. }
         | DbiError::TxnError(_)
+        // R-REPUSER: a cursor-level user write refused on a master-wired env
+        // must surface the TYPED `ReplicationNotSupported`, not a stringy
+        // OperationFailed, so callers can match on it.
+        | DbiError::ReplicationNotSupported { .. }
         | DbiError::LockConflict(_) => NoxuError::from(e),
         // NEW-DBI-DUPPUTCUR: surface a rejected putCurrent (moving a dup to
         // a new sort position) as the typed DuplicateDataException so

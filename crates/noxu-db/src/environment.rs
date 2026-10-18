@@ -820,6 +820,30 @@ impl Environment {
             ));
         }
 
+        // R-REPUSER (BUG-REP-USER-WRITES-NOT-REPLICATED, S1): refuse DDL that
+        // CREATES a new database on a master-wired env.  A create logs a
+        // NameLN/MapLN that is NOT shipped to replicas in 7.11.x (DDL replay is
+        // missing), so creating a database here would silently diverge the
+        // group.  Scope the refusal to an actual create (allow_create AND the
+        // name is not already a committed database) so re-OPENING an existing
+        // database (a read) still works -- tests open databases BEFORE wiring
+        // the coordinator; only a create AFTER wiring is refused.  JE screens
+        // the NameLN write at the operation (`DbTree.doCreateDb` ->
+        // `checkReplicaWrite`).
+        if config.allow_create {
+            let env_impl = self.env_impl.lock();
+            if let Some(reason) = env_impl.refuse_user_writes_reason() {
+                let already =
+                    env_impl.get_database_names().iter().any(|n| n == name);
+                drop(env_impl);
+                if !already {
+                    return Err(NoxuError::ReplicationNotSupported {
+                        reason: reason.to_string(),
+                    });
+                }
+            }
+        }
+
         // NEW-TXN-1: reject a closed / non-open transaction, mirroring the
         // data path.  JE rejects ANY operation on a closed Locker/Transaction
         // (TxnEndTest.testClose: `env.openDatabase(closedTxn, ...)` throws).
@@ -1637,11 +1661,39 @@ impl Environment {
     /// rep_env.with_environment(env_impl);
     /// ```
     ///
+    /// **R-REPUSER (v7.11.x): fail-closed.** Installing a
+    /// `noxu_rep::ReplicatedEnvironment` here does NOT make ordinary user
+    /// writes replicate — the user write path never assigns a VLSN, so the
+    /// feeder skips every user write (`BUG-REP-USER-WRITES-NOT-REPLICATED`,
+    /// S1). To avoid silently misleading an application, EVERY subsequent
+    /// public user write on this environment — auto-commit `put`/`delete`, an
+    /// explicit transaction's `put_in`, cursor writes, non-transactional
+    /// writes, and DDL (create/remove/rename/truncate) — is **refused at the
+    /// operation, before anything is logged**, with
+    /// [`NoxuError::ReplicationNotSupported`]. Elections, group membership,
+    /// and master transfer still work on the `ReplicatedEnvironment` itself;
+    /// only the shipping of user writes does not. The complete fix lands in
+    /// v8.0.0. See `docs/src/operations/known-limitations.md`.
+    ///
     /// Closes finding F1 of the 2026 review.
     pub fn set_replica_coordinator(
         &self,
         coord: noxu_dbi::SharedReplicaAckCoordinator,
     ) {
+        // R-REPUSER (BUG-REP-USER-WRITES-NOT-REPLICATED, S1): if the installed
+        // coordinator reports it CANNOT replicate ordinary user writes in this
+        // release (the real `noxu_rep::ReplicatedEnvironment` does in 7.11.x),
+        // arm the env-level fail-closed flag so EVERY public user-write path --
+        // explicit-txn commit, auto-commit `db.put`/`delete`, cursor writes,
+        // non-transactional writes, DDL, sequences, DPL, collections, XA --
+        // refuses the write BEFORE any LN is logged, not just the explicit-txn
+        // commit path.  A test-double / honest coordinator returns `None` and
+        // nothing is armed.  See `EnvironmentImpl::refuse_user_writes_reason`.
+        if let Some(reason) = coord.refuse_user_write_commit() {
+            self.env_impl.lock().set_refuse_user_writes(reason);
+        } else {
+            self.env_impl.lock().clear_refuse_user_writes();
+        }
         *self.replica_coordinator.lock() = Some(coord);
     }
 
@@ -1650,6 +1702,9 @@ impl Environment {
     /// Subsequent `commit_with_durability` calls revert to local-only
     /// durability semantics.
     pub fn clear_replica_coordinator(&self) {
+        // R-REPUSER: dropping the coordinator also disarms the fail-closed
+        // user-write refusal (back to local-only durability).
+        self.env_impl.lock().clear_refuse_user_writes();
         *self.replica_coordinator.lock() = None;
     }
 
@@ -2012,11 +2067,42 @@ impl Environment {
     /// [`Self::take_recovered_prepared_lns`] and applied them.
     ///
     /// See `noxu_xa` for XA two-phase commit.
+    /// R-REPUSER: `Some(reason)` when ordinary user writes (and recovered-XA
+    /// commits) must be refused on this environment because the installed
+    /// replica-ack coordinator cannot replicate user writes in this release;
+    /// `None` otherwise.  The public view of
+    /// `EnvironmentImpl::refuse_user_writes_reason`, so a higher layer (XA)
+    /// can consult the SAME env-level gate BEFORE it applies recovered LNs,
+    /// rather than only at the final durable `TxnCommit` write.
+    ///
+    /// `#[doc(hidden)]`: internal cross-crate wiring for `noxu-xa`, not part of
+    /// the stable surface.
+    #[doc(hidden)]
+    pub fn user_writes_refused(&self) -> Option<String> {
+        self.env_impl.lock().refuse_user_writes_reason().map(|r| r.to_string())
+    }
+
     pub fn write_txn_commit_for_recovered(&self, txn_id: u64) -> Result<()> {
         let lm = match &self.log_manager {
             Some(lm) => lm,
             None => return Ok(()), // Non-transactional env (shouldn't happen).
         };
+        // R-REPUSER (BUG-REP-USER-WRITES-NOT-REPLICATED, S1): committing a
+        // recovered prepared (XA) branch writes a `TxnCommit` WAL frame that,
+        // in a working replicated system, is itself a REPLICATED commit (JE
+        // routes a recovered prepared txn through `Txn.commit` ->
+        // `preLogCommitHook` -> the master ack hook, so it ships and waits for
+        // acks like any other master commit; XAEnvironment.commit ->
+        // Txn.commit(xid), Txn.java:730-765).  Noxu cannot ship it in 7.11.x,
+        // so refuse fail-closed on a master-wired env rather than silently
+        // committing a prepared branch whose resolution would never reach a
+        // replica.  A standalone (non-wired) env resolves it normally.  This is
+        // the same env-level predicate every other user-write path consults.
+        if let Some(reason) = self.env_impl.lock().refuse_user_writes_reason() {
+            return Err(NoxuError::ReplicationNotSupported {
+                reason: reason.to_string(),
+            });
+        }
         // R-3: pre-allocate the VLSN BEFORE writing the WAL entry so the
         // TxnCommit record carries it.  On a second crash, the X-14 VLSN
         // rebuild scans TxnCommit records with non-NULL dtvlsn and includes
@@ -2557,20 +2643,20 @@ impl Environment {
                 "{what}: environment is read-only",
             )));
         }
-        // GAP-REPLAY-3: a DDL write (remove/truncate/rename a database) is a
-        // NameLN write.  JE screens it on a replica via `DbTree.lockNameLN` ->
-        // `checkReplicaWrite(locker, dbImpl.getOperationRepContext(op))`,
-        // whose `mustGenerateVLSN()` is true iff the TARGET DB `isReplicated()`
-        // (DbTree.java:907-931).  Equivalently, `ReadonlyTxn.preLogWithoutLock`
-        // screens only when `!database.allowReplicaWrite()` =
-        // `isReplicated() && dbType != NAME` (ReadonlyTxn.java:93-99,
-        // DatabaseImpl.java:785).  So a DDL op on a NON-replicated (local) DB
-        // is permitted on a replica -- the screen is gated on the target DB's
-        // `allow_replica_write`, matching JE exactly, NOT unconditional.
-        // Resolve both facts under a SINGLE lock acquisition: `env_impl` is a
-        // non-reentrant `noxu_sync::Mutex`, so taking it twice in one `&&`
-        // expression would risk holding the first guard across the second
-        // `lock()`.  One guard, both reads.
+        // R-REPUSER (BUG-REP-USER-WRITES-NOT-REPLICATED, S1): on a MASTER-wired
+        // env, DDL (remove / truncate / rename) logs a NameLN / MapLN that is
+        // NOT shipped to replicas in 7.11.x (DDL replay is missing), so refuse
+        // it fail-closed FIRST, same as data writes.
+        if let Some(reason) = self.env_impl.lock().refuse_user_writes_reason() {
+            return Err(NoxuError::ReplicationNotSupported {
+                reason: reason.to_string(),
+            });
+        }
+        // GAP-REPLAY-3: a DDL write is a NameLN write.  JE screens it on a
+        // replica via `DbTree.lockNameLN` -> `checkReplicaWrite`, gated on the
+        // TARGET DB's `allow_replica_write` (`isReplicated() && dbType != NAME`),
+        // so a DDL op on a NON-replicated (local) DB is permitted on a replica.
+        // One guard, both reads (`env_impl` is a non-reentrant Mutex).
         {
             let ei = self.env_impl.lock();
             if ei.is_replica_write_screened()
@@ -3998,6 +4084,155 @@ mod tests {
         drop(db);
         drop(localdb);
         env.close().unwrap();
+    }
+
+    /// BUG-REP-SCREEN-RACE (in-flight write across a demotion): a transaction
+    /// that logged its writes while this node was the MASTER, and only reaches
+    /// `commit()` AFTER the node stepped down (the replica-write screen armed),
+    /// must be REFUSED at commit with `ReplicaWrite` and leave nothing durable.
+    ///
+    /// The op-level screen (`check_writable`) runs when each write op executes;
+    /// here the `put_in` runs while the screen is clear (Master), so it is
+    /// correctly allowed. Only the commit-time re-check catches the demotion.
+    /// JE re-checks at exactly this point: `MasterTxn.preLogCommitHook` ->
+    /// `RepImpl.preLogCommitHook` (RepImpl.java:1257) -> `checkIfMaster`
+    /// (RepImpl.java:1076-1098), which throws before logging the commit entry;
+    /// `MasterTxn.lockInternal` (MasterTxn.java:261-287) likewise re-reads the
+    /// role on every post-begin lock. The armed screen stands in for the
+    /// non-Master role; the refused commit aborts the txn with nothing durable.
+    ///
+    /// RED before this commit (the commit path only checked the R-REPUSER
+    /// refuse-flag, not the screen, so the stepped-down write committed
+    /// durably); GREEN after.
+    #[test]
+    fn gap_replay_3_in_flight_write_refused_at_commit_after_demotion() {
+        let (tmp, env) = replicated_env();
+        let cfg = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
+        let db = env.open_database(None, "repdb", &cfg).unwrap();
+
+        // Begin a txn and write WHILE MASTER (screen clear): the op is allowed.
+        let txn = env.begin_transaction(None).unwrap();
+        db.put_in(&txn, b"inflight", b"v").unwrap();
+
+        // The node steps down to a non-Master role between the write and the
+        // commit: `become_replica` / loss-of-master arms the screen.
+        env.env_impl_arc_for_test().lock().set_replica_write_screen(true);
+
+        // Commit must be refused BEFORE the TxnCommit frame (JE checkIfMaster).
+        let c = txn.commit();
+        assert!(
+            matches!(c, Err(NoxuError::ReplicaWrite)),
+            "an in-flight write committed after demotion must be refused with \
+             ReplicaWrite (JE RepImpl.preLogCommitHook -> checkIfMaster), got \
+             {c:?}"
+        );
+        // A refused commit leaves the txn for the caller to abort (JE's
+        // throwPreCommitException runs the abort path); abort releases the
+        // write lock and rolls back the buffered write.
+        txn.abort().expect("abort after refused commit");
+
+        // Nothing durable: the key is absent now, and absent after reopen.
+        env.env_impl_arc_for_test().lock().set_replica_write_screen(false);
+        assert_eq!(
+            db.get(b"inflight").unwrap(),
+            None,
+            "the refused in-flight commit must not be visible"
+        );
+        drop(db);
+        env.close().unwrap();
+
+        let reopen_cfg = EnvironmentConfig::new(tmp.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true);
+        let env2 = Environment::open(reopen_cfg).unwrap();
+        let db2 = env2.open_database(None, "repdb", &cfg).unwrap();
+        assert_eq!(
+            db2.get(b"inflight").unwrap(),
+            None,
+            "the refused in-flight commit must not be durable after reopen"
+        );
+        drop(db2);
+        env2.close().unwrap();
+    }
+
+    /// BUG-REP-SCREEN-RACE (per-lock re-check fidelity): JE re-reads the role
+    /// on EVERY post-begin write-lock acquisition, not just at commit --
+    /// `MasterTxn.lockInternal` (MasterTxn.java:261-287) reads
+    /// `((RepImpl)envImpl).getState()` and `throwNotMaster` (ReplicaWrite /
+    /// UnknownMaster) if the node is no longer the Master, and
+    /// `preLogWithoutLock` (MasterTxn.java:293-302) does the same for the
+    /// log-before-lock case.  A long transaction that keeps WRITING after the
+    /// node is demoted must therefore be refused at the NEXT write op, not
+    /// deferred to commit.
+    ///
+    /// In Noxu the per-op write pre-flight is the dual of JE's per-lock gate:
+    /// every user write op re-reads the replica-write screen
+    /// (`Database::check_writable` / `CursorImpl::check_local_write_allowed`),
+    /// taken as part of the write op exactly as JE acquires the write lock as
+    /// part of the op.  This witness pins that equivalence so a future refactor
+    /// cannot silently drop the per-op re-check and leave only the commit-time
+    /// guard (`gap_replay_3_in_flight_write_refused_at_commit_after_demotion`),
+    /// which would reintroduce the JE-divergence the coordinator asked about: a
+    /// write issued after demotion that is only caught at commit.
+    ///
+    /// Scenario: write #1 while Master (op allowed); demote (screen armed);
+    /// write #2 on the SAME open txn -> refused AT THE OP with `ReplicaWrite`
+    /// (JE `MasterTxn.lockInternal` -> `throwNotMaster`); the txn then aborts
+    /// with nothing durable (neither key present after abort + reopen).
+    ///
+    /// RED if the per-op screen is removed from the write path (write #2 would
+    /// be accepted and only the commit guard would fire); GREEN with the per-op
+    /// screen in place.
+    #[test]
+    fn gap_replay_3_write_after_demotion_refused_at_op_not_deferred_to_commit()
+    {
+        let (tmp, env) = replicated_env();
+        let cfg = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
+        let db = env.open_database(None, "repdb", &cfg).unwrap();
+
+        let txn = env.begin_transaction(None).unwrap();
+        // Write #1 WHILE MASTER (screen clear): the op is allowed.
+        db.put_in(&txn, b"first", b"1").unwrap();
+
+        // The node steps down between write #1 and write #2 (screen armed).
+        env.env_impl_arc_for_test().lock().set_replica_write_screen(true);
+
+        // Write #2 on the SAME open txn, AFTER demotion, must be refused AT THE
+        // OP -- JE `MasterTxn.lockInternal` re-checks the role on this lock and
+        // throws before the LN is logged; it is NOT deferred to commit.
+        let r = db.put_in(&txn, b"second", b"2");
+        assert!(
+            matches!(r, Err(NoxuError::ReplicaWrite)),
+            "a write issued AFTER demotion must be refused at the OP (JE \
+             MasterTxn.lockInternal -> throwNotMaster), not deferred to \
+             commit, got {r:?}"
+        );
+
+        // The txn aborts; nothing durable from either write.
+        txn.abort().expect("abort after refused op");
+        env.env_impl_arc_for_test().lock().set_replica_write_screen(false);
+        assert_eq!(db.get(b"first").unwrap(), None, "write #1 rolled back");
+        assert_eq!(db.get(b"second").unwrap(), None, "write #2 never applied");
+        drop(db);
+        env.close().unwrap();
+
+        let reopen_cfg = EnvironmentConfig::new(tmp.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true);
+        let env2 = Environment::open(reopen_cfg).unwrap();
+        let db2 = env2.open_database(None, "repdb", &cfg).unwrap();
+        assert_eq!(
+            db2.get(b"first").unwrap(),
+            None,
+            "the aborted txn must leave nothing durable after reopen"
+        );
+        assert_eq!(db2.get(b"second").unwrap(), None);
+        drop(db2);
+        env2.close().unwrap();
     }
 
     /// GAP-REPLAY-3 WITNESS: the screen is driven by the screen FLAG (armed

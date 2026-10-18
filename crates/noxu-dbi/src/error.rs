@@ -138,6 +138,19 @@ pub enum DbiError {
         limit: u64,
     },
 
+    /// R-REPUSER (`BUG-REP-USER-WRITES-NOT-REPLICATED`, S1): a user write was
+    /// attempted on a data env wired to a coordinator that cannot replicate
+    /// user writes in this release.  Refused at the operation (before any LN
+    /// is logged), mirroring JE `Cursor.checkUpdatesAllowed`.  Mapped by
+    /// `noxu-db` to `NoxuError::ReplicationNotSupported`.
+    #[error(
+        "replication of user writes is not supported in this release: {reason}"
+    )]
+    ReplicationNotSupported {
+        /// Human-readable detail (why the write was refused).
+        reason: String,
+    },
+
     /// Transaction error.
     #[error("transaction error: {0}")]
     TxnError(#[from] noxu_txn::TxnError),
