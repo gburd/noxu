@@ -1356,21 +1356,31 @@ impl ReplicatedEnvironment {
                 term,
                 channels.len(),
             );
-            let outcome = crate::elections::paxos::run_election_with_phi_dtvlsn(
-                self_node_id,
-                &self.config.node_name,
-                &group,
-                &channels,
-                our_vlsn,
-                /* priority: JE NODE_PRIORITY, read live so an operator can
-                 * steer mastership via set_node_priority (C5/V14). */
-                self.node_priority(),
-                term,
-                /* own_dtvlsn (D2 major ranking key) */
-                self.get_dtvlsn(),
-                None,
-                std::time::Duration::from_millis(500),
-            );
+            let outcome =
+                crate::elections::paxos::run_election_with_phi_dtvlsn_self(
+                    self_node_id,
+                    &self.config.node_name,
+                    &group,
+                    &channels,
+                    our_vlsn,
+                    /* priority: JE NODE_PRIORITY, read live so an operator can
+                     * steer mastership via set_node_priority (C5/V14). */
+                    self.node_priority(),
+                    term,
+                    /* own_dtvlsn (D2 major ranking key) */
+                    self.get_dtvlsn(),
+                    None,
+                    std::time::Duration::from_millis(500),
+                    /* self_acceptor: FID-ELECT-1 split-brain fix.  JE's
+                     * proposer broadcasts to getAllAcceptorSockets(), which
+                     * includes self (RepGroupImpl.java:1296); route our own
+                     * vote through the SAME PersistentAcceptorState the
+                     * ELECTION service uses so a concurrent higher proposal
+                     * that bumped our promise denies our self-vote (the
+                     * per-acceptor value guard cannot protect our own acceptor
+                     * from a value we never routed through it). */
+                    Some(&self.election_state.persistent),
+                );
 
             // The round is over — won, lost, or no quorum.  Thaw before acting
             // on the outcome so the replay path is never blocked by a resolved

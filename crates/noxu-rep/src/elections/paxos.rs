@@ -353,6 +353,62 @@ pub fn run_election_with_phi_dtvlsn(
     phi_detector: Option<&PhiAccrualDetector>,
     fallback_timeout: Duration,
 ) -> Option<NodeId> {
+    // Public (unchanged signature) entry: no self-acceptor is supplied, so the
+    // proposer's own vote is the trivial self-vote.  The production election
+    // driver calls `run_election_with_phi_dtvlsn_self` with the node's own
+    // acceptor state so the self-vote is gated by it (FID-ELECT-1 split brain).
+    run_election_with_phi_dtvlsn_self(
+        node_id,
+        node_name,
+        group,
+        channels,
+        proposed_vlsn,
+        priority,
+        term,
+        own_dtvlsn,
+        phi_detector,
+        fallback_timeout,
+        None,
+    )
+}
+
+/// Like [`run_election_with_phi_dtvlsn`], but routes the proposer's OWN vote
+/// through its own acceptor state when `self_acceptor` is `Some`.
+///
+/// FID-ELECT-1 split-brain fix (patch-safe, `#[doc(hidden)] pub` — not part
+/// of the documented public API; no public API /
+/// wire / on-disk change): JE's proposer broadcasts the Propose/Accept to
+/// `getAllAcceptorSockets()`, which INCLUDES this node
+/// (`RepGroupImpl.getAllMemberSockets(ELECTABLE_PREDICATE)` does not exclude
+/// self, RepGroupImpl.java:1296-1297), so the proposer's own vote is a REAL
+/// promise/accept through its own `Acceptor` and is counted only when that
+/// acceptor grants it (`Proposer.tallyPhase2Results` counts
+/// `result.accepts.size()`, no synthetic `+1`).  The per-acceptor value guard
+/// cannot protect a node's own acceptor from a value the node never routed
+/// through it, so a FREE self-vote lets two proposers at one term both reach a
+/// phase-2 quorum for different masters even with the guard present (3-node
+/// {A,B,C}: C accepts (1,A); A's acceptor accepts (1,B); A wins free-self+C,
+/// B wins free-self+A).  Routing the self-vote through `self_acceptor`
+/// (`try_promise_proposal` / `try_accept_proposal(term, node_name, winner)`)
+/// restores JE's interlock: a concurrent higher proposal that bumped this
+/// node's own promise denies its self-vote.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn run_election_with_phi_dtvlsn_self(
+    node_id: NodeId,
+    node_name: &str,
+    group: &RepGroup,
+    channels: &[Arc<dyn Channel>],
+    proposed_vlsn: u64,
+    priority: u32,
+    term: u64,
+    own_dtvlsn: u64,
+    phi_detector: Option<&PhiAccrualDetector>,
+    fallback_timeout: Duration,
+    self_acceptor: Option<
+        &crate::elections::acceptor_state::PersistentAcceptorState,
+    >,
+) -> Option<NodeId> {
     // ---------------------------------------------------------------
     // F22 guard: a node that cannot be master (Arbiter, Monitor,
     // Secondary) must NOT propose itself as master, nor count a
@@ -410,8 +466,16 @@ pub fn run_election_with_phi_dtvlsn(
         .map(|p| p.suggested_phase_timeout(3.0, fallback_timeout))
         .unwrap_or(fallback_timeout);
 
-    // We always count ourselves as one vote in both phases.
-    let self_needed = 1usize;
+    // FID-ELECT-1 split-brain fix: the proposer's own vote is NOT a free +1.
+    // JE routes it through this node's own acceptor (self is in
+    // getAllAcceptorSockets, RepGroupImpl.java:1296); the rc2 acceptor keys on
+    // the `(term, proposer)` number, so the self-vote uses this node's own name
+    // as the proposer.  When `self_acceptor` is `None` (public entry / legacy
+    // unit tests with no modelled self-acceptor) the trivial self-vote is kept.
+    let self_phase1_vote: usize = match self_acceptor {
+        Some(state) => usize::from(state.try_promise_proposal(term, node_name)),
+        None => 1,
+    };
 
     // -------------------------------------------------------------------------
     // Phase 1: Prepare / Promise
@@ -509,8 +573,8 @@ pub fn run_election_with_phi_dtvlsn(
         }
     }
 
-    // Count self-vote: we always vote for our own proposal in phase 1.
-    let total_promises = promises.len() + self_needed;
+    // Count our own (gated) phase-1 self-vote.
+    let total_promises = promises.len() + self_phase1_vote;
     if total_promises < phase1_quorum {
         return None;
     }
@@ -552,8 +616,19 @@ pub fn run_election_with_phi_dtvlsn(
         }
     }
 
-    // Count self-accept.
-    accepts += self_needed;
+    // Count our own (gated) phase-2 self-accept.  JE: the proposer's own
+    // Acceptor grants only iff its promise still equals this round's number
+    // (Acceptor.java:209-215); if a concurrent higher proposal bumped our
+    // promise since phase 1, our own Accept is rejected and the self-vote is
+    // lost — the interlock that keeps at most one master per term.
+    let self_phase2_vote: usize = match self_acceptor {
+        Some(state) if self_phase1_vote == 1 => usize::from(
+            state.try_accept_proposal(term, node_name, &winner_name),
+        ),
+        Some(_) => 0,
+        None => 1,
+    };
+    accepts += self_phase2_vote;
 
     if accepts >= phase2_quorum {
         // Resolve winner name to node_id by looking up in the group.
