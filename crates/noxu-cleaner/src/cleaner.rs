@@ -41,6 +41,12 @@ impl From<String> for FileCleaningError {
     }
 }
 
+/// R-UNOPENED-RECLAIM (D-ADDITIVE-SAFETY): oracle answering "is this db_id a
+/// LIVE (non-deleted) database in the environment catalog?", regardless of
+/// whether a handle is open.  Wired from `EnvironmentImpl`; see
+/// `SharedTreeLookup::live_db_oracle`.
+pub type LiveDbOracle = Arc<dyn Fn(i64) -> bool + Send + Sync>;
+
 /// Bundled context for calling `process_pending` from within the
 /// `FileProcessor` periodic hook (CLN-12).
 ///
@@ -57,6 +63,8 @@ struct ProcessPendingCtx {
     stats: Arc<CleanerStats>,
     shutdown: Arc<AtomicBool>,
     env_invalid: Arc<AtomicBool>,
+    /// R-UNOPENED-RECLAIM: live-db oracle (see `LiveDbOracle`).
+    live_db_oracle: Option<LiveDbOracle>,
 }
 
 impl ProcessPendingCtx {
@@ -83,6 +91,12 @@ impl ProcessPendingCtx {
             )
         }
         .with_env_invalid(Arc::clone(&self.env_invalid));
+        // R-UNOPENED-RECLAIM: carry the live-db oracle so pending-LN
+        // reprocessing honours the same retain-unopened-db verdict.
+        let tree_lookup = match &self.live_db_oracle {
+            Some(o) => tree_lookup.with_live_db_oracle(Arc::clone(o)),
+            None => tree_lookup,
+        };
 
         let processor = FileProcessor::new(
             Arc::clone(&self.stats),
@@ -118,6 +132,17 @@ impl ProcessPendingCtx {
                 // `env_invalid` check breaks out next iteration, retaining the
                 // file.  JE IN.fetchTarget throws LOG_FILE_NOT_FOUND here.
                 BinLookupResult::FetchFailed => {
+                    self.stats
+                        .pending_lns_locked
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                // R-UNOPENED-RECLAIM (D-ADDITIVE-SAFETY): the pending LN's db
+                // is live but unregistered (recovered, unopened).  Keep it
+                // pending (do NOT remove it, which would let its file be
+                // reclaimed) and do NOT mark it Dead.  It resolves once the db
+                // is opened; no env invalidation (unlike FetchFailed).
+                BinLookupResult::LiveUnresolved => {
                     self.stats
                         .pending_lns_locked
                         .fetch_add(1, Ordering::Relaxed);
@@ -368,6 +393,9 @@ pub struct Cleaner {
     /// `with_env_invalid` wires the env's).  Set by an env-invalidating LN
     /// fetch failure; once set the cleaner neither cleans nor deletes files.
     env_invalid: Arc<AtomicBool>,
+    /// R-UNOPENED-RECLAIM (D-ADDITIVE-SAFETY): live-db oracle; when wired the
+    /// cleaner never reclaims the file of a recovered-but-unopened database.
+    live_db_oracle: Option<LiveDbOracle>,
 }
 
 /// Result of a cleaning operation.
@@ -426,6 +454,7 @@ impl Cleaner {
             ),
             utilization_tracker: None,
             env_invalid: Arc::new(AtomicBool::new(false)),
+            live_db_oracle: None,
         }
     }
 
@@ -473,6 +502,7 @@ impl Cleaner {
             ),
             utilization_tracker: None,
             env_invalid: Arc::new(AtomicBool::new(false)),
+            live_db_oracle: None,
         }
     }
 
@@ -530,6 +560,7 @@ impl Cleaner {
             ),
             utilization_tracker: None,
             env_invalid: Arc::new(AtomicBool::new(false)),
+            live_db_oracle: None,
         }
     }
 
@@ -582,6 +613,7 @@ impl Cleaner {
             ),
             utilization_tracker: None,
             env_invalid: Arc::new(AtomicBool::new(false)),
+            live_db_oracle: None,
         }
     }
 
@@ -637,6 +669,14 @@ impl Cleaner {
     /// Wires the environment's invalidation flag (D1 / F-3).
     pub fn with_env_invalid(mut self, flag: Arc<AtomicBool>) -> Self {
         self.env_invalid = flag;
+        self
+    }
+
+    /// R-UNOPENED-RECLAIM (D-ADDITIVE-SAFETY): wire the live-db oracle so the
+    /// cleaner retains (never reclaims) the file of a recovered-but-unopened
+    /// database.  See `LiveDbOracle` / `SharedTreeLookup::live_db_oracle`.
+    pub fn with_live_db_oracle(mut self, oracle: LiveDbOracle) -> Self {
+        self.live_db_oracle = Some(oracle);
         self
     }
 
@@ -1410,6 +1450,7 @@ impl Cleaner {
                     stats: Arc::clone(&self.stats),
                     shutdown: Arc::clone(&self.shutdown),
                     env_invalid: Arc::clone(&self.env_invalid),
+                    live_db_oracle: self.live_db_oracle.clone(),
                 });
                 Some(Arc::new(move || ctx.call()))
             } else {
@@ -1478,6 +1519,12 @@ impl Cleaner {
                     )
             }
             .with_env_invalid(Arc::clone(&self.env_invalid));
+            // R-UNOPENED-RECLAIM: thread the live-db oracle so the main file
+            // scan retains (never reclaims) a recovered-but-unopened db's file.
+            let tree_lookup = match &self.live_db_oracle {
+                Some(o) => tree_lookup.with_live_db_oracle(Arc::clone(o)),
+                None => tree_lookup,
+            };
             return processor
                 .process_file(
                     file_number,
@@ -1889,6 +1936,7 @@ impl Cleaner {
                 stats: Arc::clone(&self.stats),
                 shutdown: Arc::clone(&self.shutdown),
                 env_invalid: Arc::clone(&self.env_invalid),
+                live_db_oracle: self.live_db_oracle.clone(),
             };
             ctx.call();
         }

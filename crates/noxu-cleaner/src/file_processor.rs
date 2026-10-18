@@ -231,6 +231,19 @@ pub enum BinLookupResult {
     /// throwing LOG_FILE_NOT_FOUND (IN.java:2825-2834).  No new NoxuError
     /// variant is introduced; the existing env-invalidation flag carries it.
     FetchFailed,
+
+    /// R-UNOPENED-RECLAIM (D-ADDITIVE-SAFETY): the LN belongs to a database
+    /// the environment catalog reports LIVE (recovered, not deleted) but that
+    /// has NO registered tree because no handle has been opened since restart.
+    /// 7.11.x cannot fault the db's tree with the correct comparator (only a
+    /// comparator *identity* is persisted, not the closure), so liveness is
+    /// UNDECIDABLE in the safe direction: the LN is treated as LIVE and its
+    /// file is RETAINED (never reclaimed), WITHOUT invalidating the env (unlike
+    /// `FetchFailed`, this is an expected steady state, not an I/O failure).
+    /// The LN is kept pending; a later pass reclaims normally once the db is
+    /// opened and its tree registered.  JE instead faults the db via
+    /// `DbTree.getDb` and checks its real tree (FileProcessor.java:856,1114).
+    LiveUnresolved,
 }
 
 /// Outcome of a migration attempt for a single LN slot.
@@ -778,12 +791,41 @@ pub struct SharedTreeLookup {
     /// D1 / F-3: the environment's invalidation flag, set when an LN fetch
     /// fails with an env-invalidating reason.
     env_invalid: Option<Arc<AtomicBool>>,
+    /// R-UNOPENED-RECLAIM (D-ADDITIVE-SAFETY): oracle answering "does this
+    /// db_id exist as a LIVE (non-deleted) database in the environment's
+    /// catalog?", independent of whether a user handle is open.  This is the
+    /// Noxu analog of JE `DbTree.getDb(dbId) != null && !db.isDeleted()`
+    /// (FileProcessor.java:856,864,1114,1117; DbTree.java:1609-1670 faults the
+    /// DatabaseImpl from the id-DB catalog even with no open handle).
+    ///
+    /// When wired (production, via `EnvironmentImpl`), an LN/IN whose `db_id`
+    /// is NOT registered in `extra_trees` but which the oracle reports LIVE is
+    /// treated as a LIVE-but-unresolvable node: its file is RETAINED (never
+    /// reclaimed), because 7.11.x cannot fault the db's tree with the right
+    /// comparator (Noxu persists only a comparator *identity*, not the
+    /// closure, so an unopened custom-comparator db cannot be searched
+    /// correctly).  A `db_id` the oracle reports NOT live (deleted/absent in
+    /// the catalog) stays OBSOLETE, exactly as JE declares a `null`/deleted db
+    /// obsolete.  When absent (tests / non-env paths), behaviour is unchanged:
+    /// a miss falls back to `self.tree` as before.
+    live_db_oracle: Option<Arc<dyn Fn(i64) -> bool + Send + Sync>>,
 }
 
 impl SharedTreeLookup {
     /// Wires the environment's invalidation flag (D1 / F-3).
     pub fn with_env_invalid(mut self, flag: Arc<AtomicBool>) -> Self {
         self.env_invalid = Some(flag);
+        self
+    }
+
+    /// R-UNOPENED-RECLAIM (D-ADDITIVE-SAFETY): wire the live-db oracle (see the
+    /// `live_db_oracle` field).  Production code wires this so the cleaner
+    /// never reclaims the file of a recovered-but-unopened database.
+    pub fn with_live_db_oracle(
+        mut self,
+        oracle: Arc<dyn Fn(i64) -> bool + Send + Sync>,
+    ) -> Self {
+        self.live_db_oracle = Some(oracle);
         self
     }
 
@@ -803,6 +845,7 @@ impl SharedTreeLookup {
             lock_manager,
             extra_trees: HashMap::new(),
             env_invalid: None,
+            live_db_oracle: None,
         }
     }
 
@@ -821,6 +864,7 @@ impl SharedTreeLookup {
             lock_manager,
             extra_trees: HashMap::new(),
             env_invalid: None,
+            live_db_oracle: None,
         }
     }
 
@@ -839,10 +883,57 @@ impl SharedTreeLookup {
     }
 
     /// Resolve the correct tree for `db_id`: use the extra tree if registered,
-    /// otherwise fall back to the primary tree.
+    /// otherwise fall back to the primary (placeholder) tree.
+    ///
+    /// This getter is used only AFTER `resolve_verdict` has decided the db_id
+    /// is `Registered` (or when no oracle is wired); it never on its own
+    /// decides liveness.  R-UNOPENED-RECLAIM: the placeholder `self.tree` must
+    /// never be the basis of a liveness verdict for an unregistered db_id --
+    /// see `resolve_verdict`.
     fn resolve_tree(&self, db_id: i64) -> &Arc<RwLock<noxu_tree::Tree>> {
         self.extra_trees.get(&db_id).unwrap_or(&self.tree)
     }
+
+    /// R-UNOPENED-RECLAIM (D-ADDITIVE-SAFETY): decide how to treat `db_id`.
+    ///
+    /// * `Registered(tree)` -- a tree is registered for this exact `db_id` in
+    ///   `extra_trees`; use it for the real liveness check (the normal path,
+    ///   incl. a real user db 1 which is registered at open just like any
+    ///   other db).  The id=1 PLACEHOLDER `self.tree` is NEVER returned here.
+    /// * `LiveUnresolved` -- no tree is registered but the oracle reports the
+    ///   db LIVE (recovered-but-unopened): the node's file must be RETAINED,
+    ///   never reclaimed (JE would fault the db's real tree; 7.11.x cannot do
+    ///   so for a custom-comparator db, so we conservatively keep the file).
+    /// * `Obsolete` -- no tree is registered and the oracle reports the db NOT
+    ///   live (deleted/absent in the catalog), so the node is genuinely dead
+    ///   (JE: `getDb == null || isDeleted` -> obsolete).  When no oracle is
+    ///   wired (tests / non-env paths) a miss also yields `Obsolete`, so the
+    ///   caller falls back to `resolve_tree` (the placeholder) exactly as
+    ///   before -- historical behaviour is unchanged where no oracle exists.
+    fn resolve_verdict(&self, db_id: i64) -> TreeVerdict<'_> {
+        if let Some(tree) = self.extra_trees.get(&db_id) {
+            return TreeVerdict::Registered(tree);
+        }
+        match &self.live_db_oracle {
+            Some(oracle) if oracle(db_id) => TreeVerdict::LiveUnresolved,
+            // Oracle wired and reports not-live: genuinely obsolete.
+            Some(_) => TreeVerdict::Obsolete,
+            // No oracle wired: preserve legacy placeholder-search behaviour.
+            None => TreeVerdict::Obsolete,
+        }
+    }
+}
+
+/// R-UNOPENED-RECLAIM: the resolution of a `db_id` to a liveness strategy.
+/// See `SharedTreeLookup::resolve_verdict`.
+enum TreeVerdict<'a> {
+    /// A tree is registered for this db_id; search it normally.
+    Registered(&'a Arc<RwLock<noxu_tree::Tree>>),
+    /// The db exists and is live but has no registered tree (unopened):
+    /// RETAIN the file, never reclaim.
+    LiveUnresolved,
+    /// The db is deleted/absent (or no oracle wired): the node is obsolete.
+    Obsolete,
 }
 
 impl TreeLookup for SharedTreeLookup {
@@ -856,8 +947,18 @@ impl TreeLookup for SharedTreeLookup {
         key: &[u8],
         _log_lsn: Lsn,
     ) -> BinLookupResult {
-        // X-7: dispatch to the correct tree for this db_id.
-        let tree_arc = self.resolve_tree(db_id);
+        // R-UNOPENED-RECLAIM (D-ADDITIVE-SAFETY): resolve the db_id to a
+        // verdict first.  A registered tree is searched normally; a
+        // live-but-unregistered db (recovered, unopened) RETAINS its file; a
+        // deleted/absent db (or no oracle wired) falls back to the placeholder
+        // search (historical behaviour) and will read NotFound -> obsolete.
+        let tree_arc = match self.resolve_verdict(db_id) {
+            TreeVerdict::Registered(t) => t,
+            TreeVerdict::LiveUnresolved => {
+                return BinLookupResult::LiveUnresolved;
+            }
+            TreeVerdict::Obsolete => &self.tree,
+        };
         let tree = match tree_arc.read() {
             Ok(g) => g,
             Err(_) => return BinLookupResult::NotFound,
@@ -903,8 +1004,16 @@ impl TreeLookup for SharedTreeLookup {
         log_lsn: Lsn,
         tree_lsn: Lsn,
     ) -> MigrationOutcome {
-        // X-7: dispatch to the correct tree for this db_id.
-        let tree_arc = Arc::clone(self.resolve_tree(db_id));
+        // R-UNOPENED-RECLAIM (D-ADDITIVE-SAFETY): never migrate an LN whose db
+        // has no registered tree.  A live-but-unregistered db cannot be
+        // searched/migrated correctly (no comparator); treat as Locked so the
+        // LN stays pending and its file is retained.  (migrate_ln_slot is
+        // normally reached only after a `Found` verdict, so this is a guard.)
+        let tree_arc = match self.resolve_verdict(db_id) {
+            TreeVerdict::Registered(t) => Arc::clone(t),
+            TreeVerdict::LiveUnresolved => return MigrationOutcome::Locked,
+            TreeVerdict::Obsolete => Arc::clone(&self.tree),
+        };
         // H-4: non-blocking lock on tree_lsn before migrating.
         let locker_id = next_cleaner_locker_id();
         let lock_lsn = tree_lsn.as_u64();
@@ -1111,10 +1220,19 @@ impl TreeLookup for SharedTreeLookup {
         // primary tree classifies every live USER-database BIN and BIN-delta
         // dead, so the cleaner deletes a file holding a live BIN image and a
         // reader faulting that BIN reads committed keys as Ok(None).
-        let delegate = RealTreeLookup::new(
-            Arc::clone(self.resolve_tree(db_id)),
-            Arc::clone(&self.lock_manager),
-        );
+        //
+        // R-UNOPENED-RECLAIM (D-ADDITIVE-SAFETY), requirement (2): an IN/BIN of
+        // a live-but-unregistered db (recovered, unopened) is UNDECIDABLE in
+        // the safe direction -> `Unknown`, which makes `process_in` DEFER the
+        // whole file (retain, never count obsolete).  A deleted/absent db (or
+        // no oracle) falls back to the placeholder search (historical).
+        let tree_arc = match self.resolve_verdict(db_id) {
+            TreeVerdict::Registered(t) => Arc::clone(t),
+            TreeVerdict::LiveUnresolved => return InLookupResult::Unknown,
+            TreeVerdict::Obsolete => Arc::clone(&self.tree),
+        };
+        let delegate =
+            RealTreeLookup::new(tree_arc, Arc::clone(&self.lock_manager));
         delegate.lookup_in(db_id, node_id, log_lsn)
     }
 }
@@ -1491,6 +1609,15 @@ pub struct FileProcessResult {
 
     /// Whether processing completed successfully (not interrupted by shutdown).
     pub completed: bool,
+
+    /// R-UNOPENED-RECLAIM (D-ADDITIVE-SAFETY): set when this file holds a node
+    /// (LN/IN) whose database is LIVE but unresolvable (recovered, unopened).
+    /// Such a file must be RETAINED (kept out of the deletion barrier) WITHOUT
+    /// invalidating the env and WITHOUT enqueuing a global pending LN (which
+    /// would block the barrier for every other file -- starvation).  When set,
+    /// `process_file` leaves `completed = false` so the file is put back for a
+    /// later pass (it reclaims normally once the db is opened + registered).
+    pub retain_file: bool,
 }
 
 impl FileProcessor {
@@ -1725,7 +1852,10 @@ impl FileProcessor {
             );
         }
 
-        result.completed = true;
+        // R-UNOPENED-RECLAIM: a file holding a live-but-unresolvable node is
+        // NOT complete -- leaving `completed = false` keeps it out of the
+        // deletion barrier (retained) while other files proceed normally.
+        result.completed = !result.retain_file;
         Ok(result)
     }
 
@@ -1830,6 +1960,25 @@ impl FileProcessor {
                 result.lns_locked += 1;
                 self.stats.lns_locked.fetch_add(1, Ordering::Relaxed);
                 result.locked_lns.push((log_lsn, info));
+            }
+
+            // R-UNOPENED-RECLAIM (D-ADDITIVE-SAFETY): the LN belongs to a
+            // live-but-unregistered db (recovered, unopened).  Treat it as
+            // LIVE and RETAIN this file -- but do NOT enqueue it as a pending
+            // LN.  A pending LN sets `any_pending_during_checkpoint`, which
+            // blocks the two-checkpoint deletion barrier for EVERY cleaned
+            // file; since an unopened db never drains, that would starve the
+            // reclamation of all other files (coordinator requirement 3).
+            // Instead mark this file UNCLEANED (`completed = false`), exactly
+            // like the `InLookupResult::Unknown` IN path: the file stays out
+            // of the deletion barrier (retained) while OTHER files proceed and
+            // are deleted normally.  Counted in `lns_locked` (the "retained,
+            // not dead" bucket).  Resolves on its own once the db is opened and
+            // registered (a later pass cleans the file normally).
+            BinLookupResult::LiveUnresolved => {
+                result.lns_locked += 1;
+                self.stats.lns_locked.fetch_add(1, Ordering::Relaxed);
+                result.retain_file = true;
             }
 
             // Step 3b — slot is known-deleted → LN is obsolete.
@@ -1978,6 +2127,13 @@ impl FileProcessor {
                 );
                 self.stats.ins_undecided.fetch_add(1, Ordering::Relaxed);
                 result.completed = false;
+                // R-UNOPENED-RECLAIM: also flag retain_file so the end-of-file
+                // `completed = !retain_file` keeps this file out of the
+                // deletion barrier even for the (non-invalidating)
+                // live-unresolved-db IN case, where `lookup_in` returned
+                // `Unknown` without setting the env-invalid flag.  Harmless for
+                // the fetch-failure case (the env is invalidated regardless).
+                result.retain_file = true;
             }
         }
     }
@@ -2046,6 +2202,7 @@ impl FileProcessResult {
         self.bin_deltas_migrated += other.bin_deltas_migrated;
         self.bin_deltas_obsolete += other.bin_deltas_obsolete;
         self.completed = self.completed && other.completed;
+        self.retain_file = self.retain_file || other.retain_file;
     }
 }
 
@@ -2448,6 +2605,7 @@ mod tests {
             bin_deltas_migrated: 13,
             bin_deltas_obsolete: 14,
             completed: true,
+            retain_file: false,
             locked_lns: vec![],
         };
         assert_eq!(result.lns_cleaned, 2);
@@ -3254,6 +3412,7 @@ mod tests {
             bin_deltas_migrated: 12,
             bin_deltas_obsolete: 13,
             completed: true,
+            retain_file: false,
             locked_lns: vec![],
         };
 
@@ -3273,6 +3432,7 @@ mod tests {
             bin_deltas_migrated: 1,
             bin_deltas_obsolete: 1,
             completed: true,
+            retain_file: false,
             locked_lns: vec![],
         };
 
