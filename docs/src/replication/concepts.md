@@ -422,8 +422,11 @@ heartbeats.
   the shared `PeerLogScanner` queue (populated by `replicate_entry`).  The
   master also serves this service from its OWN WAL via an
   `EnvironmentLogScanner` (registered in `become_master`), so a pulling
-  replica receives the master's committed VLSN-tagged entries even when they
-  were never pushed into the in-memory queue.
+  replica receives the master's **VLSN-tagged** entries even when they were
+  never pushed into the in-memory queue. **In 7.11.x a real `db.put` + commit
+  logs `TxnCommit` with `NULL_VLSN` and is therefore NOT served on this path
+  either** (R-REPUSER); only hand-tagged (`replicate_entry` / `log_txn_commit`)
+  entries carry a VLSN. See the R-REPUSER caveat above.
 - **Chained / cascading feeders (opt-in, `cascade_feeding`)**: A mid-tier
   replica can feed a downstream replica from its OWN WAL instead of routing
   every replica through the master.  Enable it on the builder:

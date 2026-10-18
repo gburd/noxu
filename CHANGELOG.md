@@ -117,6 +117,64 @@ user-facing scope, symptoms, and preconditions.
   rollback revert, and a recovery scanner that distinguishes an empty
   non-deleted LN from a deletion.
 
+- **A recovered-but-unopened database's files could be reclaimed, losing the
+  whole database** (`R-UNOPENED-RECLAIM`): if an environment was reopened after
+  a clean shutdown or crash and the log cleaner ran (the background cleaner, or
+  an explicit `clean_log()` / `clean_log_forced()` followed by two checkpoints)
+  **before** the application opened a database that existed in that environment,
+  the cleaner could permanently delete the log file(s) holding that database's
+  records and B-tree. The database had to have been created in a previous
+  session and not yet reopened in the current one; databases opened before
+  cleaning were unaffected. Fixed so the cleaner treats an LN/IN/BIN whose
+  `db_id` is live in the catalog but has no registered tree (a recovered,
+  not-yet-opened database) as **live** and retains its file until the database
+  is opened; a `db_id` the catalog reports deleted/absent stays obsolete,
+  exactly as JE declares a `null`/deleted db obsolete. Owner-approved
+  `D-ADDITIVE-SAFETY` (7.11.x only); see *Known issues* for the
+  reclamation-latency ceiling. Replaced in v8.0.0 by the mapping-tree `get_db`
+  fault path plus an env-level comparator registry.
+
+- **A long-running or DDL transaction's earliest still-needed log file could be
+  reclaimed** (`R-FIRSTLSN`): the cleaner's first-active-LSN clamp did not cover
+  every transactional log write, so a file holding a transaction's earliest
+  still-needed record could be cleaned out from under it. Fixed by recording the
+  first-active LSN for every transactional log write and clamping the cleaner to
+  it (JE first-active-LSN protection), so no file an open transaction still
+  needs is reclaimed.
+
+- **A committed database `remove`/`rename` could be resurrected by catalog
+  relog + crash** (`R-RELOG-PENDING-DDL`): a transactional `remove`/`rename`
+  logs the NameLN-delete tombstone at operation time but defers the in-memory
+  `name_map` mutation to the commit callback (JE `Txn.deletedDatabases`). While
+  the txn was open the victim was still in `name_map`, so the catalog relog that
+  runs at every checkpoint re-logged a fresh live NameLN **past** the tombstone,
+  and recovery's latest-NameLN-per-name rule resurrected the name after
+  commit + crash. Fixed by skipping a pending-DDL name in the relog and
+  re-logging one pre-tombstone live copy whose file the R-FIRSTLSN first-active
+  clamp keeps alive across the two-checkpoint deletion barrier (so an *abort*
+  still finds the name). The `pending_ddl_names` marker is set at the top of the
+  DDL op's lock scope — before the relog-once / tombstone — to close a narrow
+  TOCTOU window against a background checkpoint's relog. Owner-approved
+  `D-ADDITIVE-SAFETY` (7.11.x only; the pre-tombstone copy has no JE analog —
+  JE keeps the file via the cleaner's pending-LN deferral); replaced in v8.0.0
+  by the mapping-tree path that makes NameLNs real tree slots taking the record
+  lock.
+
+- **A committed prepared XA branch could be lost after a cleaner barrier plus a
+  second crash** (`R-XARECOVERED`): a prepared XA transaction that survived a
+  crash was recovered in-doubt, but recovery never redid its LNs into the tree,
+  so while in-doubt its slots lived in no checkpointed BIN. If a cleaner
+  deletion barrier (two checkpoints) then advanced the checkpoint-start past the
+  prepared LNs' file and a second crash hit before any checkpoint flushed the
+  `xa_commit`-installed slot, the final recovery saw each prepared LN as
+  committed-but-before-checkpoint-start and the redo gate **skipped** it,
+  silently dropping the committed branch (8/8 → 0/8). Fixed to redo **and**
+  re-lock a recovered prepared txn's LNs during the first recovery (JE
+  `RecoveryManager` `redoLNs`/`eligibleForRedo`/`redoOneLN`/`relock`; a
+  `PreparedTxn` is always redo-eligible, independent of checkpoint start), so
+  the branch's slots are materialised and lock-protected until it is resolved.
+  See *Behaviour changes* for the reader-blocking semantics this introduces.
+
 ### Fixed — durability
 
 - **Deferred-write `sync()` was not durable** (`BUG-DW-SYNC-1` /
@@ -242,6 +300,25 @@ user-facing scope, symptoms, and preconditions.
   `NoxuError::is_committed_at_master()` and that it must not be auto-retried
   (`is_retryable() == false`). JE `InsufficientAcksException.java:21-35`.
 
+- **A non-transactional cursor could share a lock owner with a transaction**
+  (`BUG-LOCKER-ID-COLLISION`): non-transactional (bare-cursor) lockers drew
+  their ids from the same namespace as transactions, so a cursor read or write
+  without a transaction could collide with a live transaction's locker id and
+  share its lock ownership — a dirty read, a lost update, a lock released early,
+  or a spurious `DeadlockDetected`. Fixed by giving non-transactional lockers a
+  disjoint id namespace so a bare cursor can never be mistaken for (or share
+  locks with) a transaction.
+
+- **A non-transactional cursor's read-modify-write write lock leaked forever**
+  (`BUG-BARE-RMW-LOCK-LEAK`): a cursor without a transaction that took a write
+  lock for a read-modify-write never released it — even after the cursor was
+  closed — so later writers of that record timed out, across threads, for the
+  life of the environment. Fixed to release a bare cursor's non-transactional
+  locks on close and on cursor move (the JE-faithful part: the lock is dropped at
+  the MOVE, not deferred to the RMW upgrade), narrowing the lock to the cursor's
+  positioned lifetime. See *Behaviour changes* and *Known issues*
+  (`FID-THREADLOCKER-SHARE`).
+
 ### Fixed — during this release cycle (not present in v7.11.0)
 
 Defects that were introduced and fixed *within* the v7.11.1 development cycle;
@@ -349,6 +426,17 @@ recorded here for completeness.
   promise/accept and allow two masters; fixed by fsyncing the parent directory
   after the rename.
 
+- **A proposer's self-vote bypassed its own acceptor, admitting split brain**
+  (`FID-ELECT-1`, S1): the Paxos proposer counted its own vote without routing
+  it through its own acceptor, so the proposer's acceptor state (its latest
+  promised/accepted round) did not constrain the proposer the way JE's does.
+  Under a partition/rejoin race this could let two nodes each conclude they had
+  won and both become master. Fixed by routing the proposer's self-vote through
+  its own acceptor (JE handles the self like any other acceptor), so a
+  proposer's own prior promise/accept correctly bounds its proposal — preserving
+  "at most one master" across partition and rejoin. Split-brain witness added
+  (`fid_elect_1_split_brain_witness`).
+
 - **Election value ranking dropped a non-JE `term` tiebreak** (`FID-ELECT-1`
   follow-up): the `Proposal` ordering that selects the Phase-2 election value
   (`choose_phase2_value`, JE `RankingProposer.choosePhase2Value`) ranked
@@ -434,8 +522,6 @@ recorded here for completeness.
   the full description. Previously replica reads were lock-free and local
   replica writes were silently accepted. Enabled by default.
 
-### Changed
-
 - **Replication now fails closed on EVERY user write it cannot replicate
   (R-REPUSER / `BUG-REP-USER-WRITES-NOT-REPLICATED`, S1).** When a
   `noxu-db::Environment` has a `noxu_rep::ReplicatedEnvironment` installed as
@@ -471,6 +557,41 @@ recorded here for completeness.
   replication context on every log call, per-txn commit VLSN, and DDL replay)
   is scheduled for v8.0.0; see *Known issues* below and
   `docs/src/operations/known-limitations.md`.
+
+### Behaviour changes
+
+These are deliberate, user-visible behaviour changes in v7.11.1 (no public-API
+break; `cargo-semver-checks`: 9/9 "no semver update required" vs v7.11.0):
+
+- **User writes on a replicated environment are refused** (R-REPUSER, owner
+  decision #9). A data-logging write/commit on an `Environment` that has a
+  `ReplicatedEnvironment` installed as its replica-ack coordinator is refused at
+  the operation — before any log record — with
+  `NoxuError::ReplicationNotSupported`. Previously the most common write (an
+  auto-commit `db.put`) silently "succeeded" and was never replicated. Workaround
+  for 7.11.x: run a single node, or wait for v8.0.0. Standalone (non-replicated)
+  environments are unaffected. See *Changed* above.
+
+- **Readers block on recovered in-doubt XA records until the branch is
+  resolved** (R-XARECOVERED, owner decision #19). Because a recovered prepared
+  XA branch's LNs are now redone **and re-locked** during recovery, a read of a
+  record held by an unresolved in-doubt branch blocks on that branch's write
+  lock until it is committed or rolled back, exactly as JE blocks behind a
+  recovered `PreparedTxn`. Read paths now surface **typed** lock errors on this
+  path — `NoxuError::LockTimeout` (the wait exceeded the lock timeout) and
+  `NoxuError::LockConflict` — rather than a wrong/empty result; this is JE
+  parity (JE blocks the reader behind the in-doubt lock and surfaces a
+  `LockConflictException`/`LockTimeoutException`). Previously such a record
+  could read back as if absent.
+
+- **A non-transactional cursor's locks are released on move and on close**
+  (`BUG-BARE-RMW-LOCK-LEAK`). A bare (no-transaction) cursor's record locks —
+  including a write lock taken for a read-modify-write — are now released when
+  the cursor moves off the record or is closed, instead of leaking for the life
+  of the environment. Code that relied (even accidentally) on a bare cursor's
+  RMW lock persisting past the cursor's position or close must take an explicit
+  transaction to hold the lock. See *Known issues* (`FID-THREADLOCKER-SHARE`)
+  for the related same-thread non-sharing limitation.
 
 ### Fixed — internal crates (no stability guarantee)
 
@@ -537,24 +658,34 @@ Stable-foundational crates are unchanged at the public-API level
   patch-safe (a new protocol message), so the Learner protocol lands in
   v8.0.0. A ready `#[ignore]`d witness is committed
   (`tests/fid_elect_learner_stall.rs`).
-
-### Known issues / deferred to v8.0.0 (R-REPUSER)
-
-- **R-REPUSER (`BUG-REP-USER-WRITES-NOT-REPLICATED`, S1) — replication does not
-  replicate ordinary user writes.** Through the public API, a committed
-  `db.put`/`delete`/`update` (and DDL, sequences, DPL, collections, XA) on a
-  replicated master is **never streamed to any replica**: the user write path
-  logs with `NULL_VLSN` and the feeder ships only VLSN-tagged entries. The
-  defect has existed since replication was first written. **7.11.1 fails
-  closed** (see *Changed*): every public user write on a master-wired data env
-  is refused at the operation with `NoxuError::ReplicationNotSupported` rather
-  than silently dropped, so there is no silent data divergence — but
-  replication still cannot carry application data in 7.11.x. Use a single node,
-  or wait for the complete JE-faithful fix (one write path, a replication
-  context on every log call, per-txn commit VLSN, DDL replay) in **v8.0.0**.
-  Elections, group membership, and master transfer work. See
-  `docs/src/operations/known-limitations.md` and the replication-chapter
-  banners.
+- **FID-THREADLOCKER-SHARE (S3) — two non-transactional cursors / lockers on
+  the same thread do not share locks.** BDB-JE's `ThreadLocker` lets every
+  non-transactional locker on one thread co-own a record lock
+  (`ThreadLocker.sharesLocksWith` = same thread). Noxu's non-transactional
+  (bare-cursor) lockers do not share by thread, so two non-txn cursors on the
+  same thread that touch the same record (e.g. one holding an RMW write lock
+  while the other reads it, or a positioned non-txn secondary cursor plus a
+  same-thread non-txn write of its primary) can self-conflict and surface a
+  typed `LockTimeout`. This pre-exists on v7.11.0 in a strictly worse form (the
+  bare RMW lock leaked indefinitely, blocking even after close and across
+  threads); the `BUG-BARE-RMW-LOCK-LEAK` fix narrows it to the cursor's
+  positioned lifetime. Fixed in v8.0.0 (thread-local lock sharing for
+  non-transactional lockers).
+- **R-UNOPENED-RECLAIM space-reclamation ceiling.** With the R-UNOPENED fix, a
+  database that was recovered from the log but has not yet been opened in the
+  current session has its log file(s) **retained** (not reclaimed) until it is
+  opened. This is a reclamation-latency / space cost only — never a correctness,
+  durability, or data-loss cost — and it does not starve the cleaning of other
+  files. Fixed properly in v8.0.0, where the mapping-tree `get_db` fault path
+  plus an env-level comparator registry let the cleaner fault a correct tree for
+  an unopened database and reclaim its file normally.
+- **R-RELOG-PENDING-DDL space-reclamation ceiling.** With the R-RELOG fix, a
+  transactional `remove`/`rename` re-logs one pre-tombstone live NameLN copy and
+  anchors it on the DDL txn's first-active LSN, so the file holding it is kept
+  alive across the two-checkpoint deletion barrier until the txn resolves — a
+  small, bounded reclamation-latency cost on DDL, never a correctness cost.
+  Fixed properly in v8.0.0, where NameLNs become real mapping-tree slots that
+  take the record lock and no pre-tombstone copy is needed.
 
 
 ## [7.11.0] - 2026-09-28
