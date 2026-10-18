@@ -199,7 +199,9 @@ fn xa_recovered_commit_refused_on_master_wired_env() {
         match db.get(key) {
             Err(NoxuError::LockTimeout { .. }) => {}
             other => panic!(
-                "an in-doubt recovered-prepared record must block the reader                  with a typed LockTimeout (R-XARECOVERED, owner #19), got {other:?}"
+                "an in-doubt recovered-prepared record must block the reader \
+                 with a typed LockTimeout (R-XARECOVERED, owner #19), got \
+                 {other:?}"
             ),
         }
         // Resolve it now (standalone) so the write lock is released; the branch
@@ -208,7 +210,8 @@ fn xa_recovered_commit_refused_on_master_wired_env() {
         xa.xa_rollback(&xid, XaFlags::NOFLAGS).unwrap();
         assert!(
             db.get(key).unwrap().is_none(),
-            "the recovered-commit was refused and the branch rolled back, so the              data must NOT be durable"
+            "the recovered-commit was refused and the branch rolled back, \
+             so the data must NOT be durable"
         );
         let _ = db.close();
         let _ = xa.inner().close();
