@@ -882,17 +882,6 @@ impl SharedTreeLookup {
         self
     }
 
-    /// Resolve the correct tree for `db_id`: use the extra tree if registered,
-    /// otherwise fall back to the primary (placeholder) tree.
-    ///
-    /// This getter is used only AFTER `resolve_verdict` has decided the db_id
-    /// is `Registered` (or when no oracle is wired); it never on its own
-    /// decides liveness.  R-UNOPENED-RECLAIM: the placeholder `self.tree` must
-    /// never be the basis of a liveness verdict for an unregistered db_id --
-    /// see `resolve_verdict`.
-    fn resolve_tree(&self, db_id: i64) -> &Arc<RwLock<noxu_tree::Tree>> {
-        self.extra_trees.get(&db_id).unwrap_or(&self.tree)
-    }
 
     /// R-UNOPENED-RECLAIM (D-ADDITIVE-SAFETY): decide how to treat `db_id`.
     ///
@@ -908,8 +897,8 @@ impl SharedTreeLookup {
     ///   live (deleted/absent in the catalog), so the node is genuinely dead
     ///   (JE: `getDb == null || isDeleted` -> obsolete).  When no oracle is
     ///   wired (tests / non-env paths) a miss also yields `Obsolete`, so the
-    ///   caller falls back to `resolve_tree` (the placeholder) exactly as
-    ///   before -- historical behaviour is unchanged where no oracle exists.
+    ///   caller falls back to the placeholder `self.tree` exactly as before
+    ///   -- historical behaviour is unchanged where no oracle exists.
     fn resolve_verdict(&self, db_id: i64) -> TreeVerdict<'_> {
         if let Some(tree) = self.extra_trees.get(&db_id) {
             return TreeVerdict::Registered(tree);
