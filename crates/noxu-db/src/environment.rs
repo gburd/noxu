@@ -1147,6 +1147,22 @@ impl Environment {
                 // identity, DbTree.java:1214 / Txn.java:1481).
                 {
                     let env_impl = self.env_impl.lock();
+                    // R-RELOG (S1): re-log a known-LSN LIVE copy of the victim's
+                    // committed NameLN BEFORE the tombstone, and anchor the
+                    // first-active clamp there (note_log_entry, earliest-wins)
+                    // so the file holding that live copy is kept while the txn
+                    // is open.  On abort it is the latest live NameLN (name
+                    // survives); on commit the tombstone below supersedes it.
+                    if let Some(lsn) = env_impl
+                        .relog_name_ln_once(name)
+                        .map_err(map_dbi_err(name))?
+                        && let Some(inner) = txn.get_inner_txn()
+                    {
+                        inner
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .note_log_entry(lsn.as_u64());
+                    }
                     if let Some(lsn) = env_impl
                         .log_remove_name_ln_txn(name, txn.id())
                         .map_err(map_dbi_err(name))?
@@ -1157,15 +1173,29 @@ impl Environment {
                             .unwrap_or_else(|p| p.into_inner())
                             .note_log_entry(lsn.as_u64());
                     }
+                    // R-RELOG (S1): the committed NameLN is still in `name_map`
+                    // (physical removal is deferred to the commit callback), but
+                    // its delete tombstone is now logged.  Mark the name so the
+                    // checkpointer's relog callback does not re-log a fresh live
+                    // NameLN past the tombstone while this txn is open.
+                    env_impl.mark_pending_ddl(name, db_id);
                 }
                 let env_impl_arc = Arc::clone(&self.env_impl);
                 let databases_arc = Arc::clone(&self.databases);
                 let name_owned = name.to_string();
+                // R-RELOG (S1): clear the pending-DDL marker on BOTH commit and
+                // abort so relog resumes once the txn resolves.
+                let env_impl_abort = Arc::clone(&self.env_impl);
+                let name_abort = name.to_string();
+                txn.register_abort_callback(move || {
+                    env_impl_abort.lock().clear_pending_ddl(&name_abort);
+                });
                 txn.register_commit_callback(move || {
                     let mut databases = databases_arc.lock();
-                    if let Ok(true) = env_impl_arc
-                        .lock()
-                        .remove_database_if_id(&name_owned, db_id)
+                    let env = env_impl_arc.lock();
+                    env.clear_pending_ddl(&name_owned);
+                    if let Ok(true) =
+                        env.remove_database_if_id(&name_owned, db_id)
                     {
                         databases.remove(&name_owned);
                     }
@@ -1326,6 +1356,23 @@ impl Environment {
                 // place and recovery's mapping-tree undo pass restores it.
                 {
                     let env_impl = self.env_impl.lock();
+                    // R-RELOG (S1): re-log a known-LSN LIVE copy of the OLD
+                    // name's committed NameLN BEFORE the rename tombstone, and
+                    // anchor the first-active clamp there, so the file holding
+                    // that live copy is kept while the txn is open.  On abort it
+                    // is the latest live NameLN for the old name (which thus
+                    // survives); on commit the delete-old tombstone below
+                    // supersedes it.
+                    if let Some(lsn) = env_impl
+                        .relog_name_ln_once(old_name)
+                        .map_err(map_rename_err(old_name, new_name))?
+                        && let Some(inner) = txn.get_inner_txn()
+                    {
+                        inner
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .note_log_entry(lsn.as_u64());
+                    }
                     if let Some(lsn) = env_impl
                         .log_rename_name_ln_txn(old_name, new_name, txn.id())
                         .map_err(map_rename_err(old_name, new_name))?
@@ -1336,17 +1383,32 @@ impl Environment {
                             .unwrap_or_else(|p| p.into_inner())
                             .note_log_entry(lsn.as_u64());
                     }
+                    // R-RELOG (S1): the OLD name is still in `name_map` (the
+                    // swap is deferred to the commit callback) but its delete
+                    // tombstone is now logged.  Mark the old name so the relog
+                    // callback does not re-log a fresh live NameLN for it past
+                    // the tombstone while the txn is open.  (The NEW name is
+                    // not yet in `name_map`, so relog never touches it.)
+                    env_impl.mark_pending_ddl(old_name, db_id);
                 }
                 let env_impl_arc = Arc::clone(&self.env_impl);
                 let databases_arc = Arc::clone(&self.databases);
                 let old_owned = old_name.to_string();
                 let new_owned = new_name.to_string();
+                // R-RELOG (S1): clear the pending-DDL marker on BOTH commit and
+                // abort of the rename txn.
+                let env_impl_abort = Arc::clone(&self.env_impl);
+                let old_abort = old_name.to_string();
+                txn.register_abort_callback(move || {
+                    env_impl_abort.lock().clear_pending_ddl(&old_abort);
+                });
                 txn.register_commit_callback(move || {
                     let mut databases = databases_arc.lock();
+                    let env = env_impl_arc.lock();
+                    env.clear_pending_ddl(&old_owned);
                     // F-DDL-1: bind to the validated source identity.
-                    if let Ok(true) = env_impl_arc
-                        .lock()
-                        .rename_database_if_id(&old_owned, &new_owned, db_id)
+                    if let Ok(true) =
+                        env.rename_database_if_id(&old_owned, &new_owned, db_id)
                         && let Some(handle) = databases.remove(&old_owned)
                     {
                         databases.insert(new_owned.clone(), handle);
