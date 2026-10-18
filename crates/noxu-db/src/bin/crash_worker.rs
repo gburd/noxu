@@ -105,7 +105,7 @@ fn main() {
     // files, and all daemons OFF so the mode drives cleaning / checkpointing
     // explicitly WHILE the victim txn is open.  minAge=1 and a high
     // minUtilization keep the forced-clean path simple and deterministic.
-    if mode.starts_with("firstlsn_") {
+    if mode.starts_with("firstlsn_") || mode.starts_with("xarec_") {
         env_config = env_config
             .with_log_file_max_bytes(1_000_000)
             .with_run_cleaner(false)
@@ -1011,6 +1011,142 @@ fn main() {
             }
         }
 
+        // ----------------------------------------------------------------
+        // XA-RECOVERED (candidate S1): a recovered prepared XA txn is resolved
+        // via write_txn_commit_for_recovered / apply_recovered_prepared_lns,
+        // which are NOT routed through the TxnManager (not in all_txns), so the
+        // cleaner's first-active-txn clamp does NOT protect the prepared LNs'
+        // file, and the prepared LNs were never redone into a tree slot
+        // (slot-liveness does not protect them either).  If a cleaner pass
+        // reclaims that file between env-open and xa_commit, the slot installed
+        // by apply_recovered_prepared_lns points at ln.original_lsn in a
+        // CLEANED file; a SECOND crash before a checkpoint flushes the BIN
+        // leaves recovery unable to rebuild the slot -> data loss.
+        //
+        // Two-phase subprocess harness (engine-level, mirrors noxu-xa xa_commit
+        // without the Xid layer, which noxu-db cannot depend on):
+        //   xarec_prepare : seed+commit, begin txn, put keys, prepare(), roll
+        //                   files so the prepared LNs sit in an OLD file;
+        //                   signal, spin -> parent SIGKILLs (first crash).
+        //   xarec_commit  : reopen (recovery surfaces the prepared txn), run the
+        //                   two-checkpoint deletion barrier (reclaim the prepared
+        //                   LNs' file), then resolve exactly as xa_commit does
+        //                   (take+apply recovered LNs, write_txn_commit_for_
+        //                   recovered); signal, spin -> parent SIGKILLs BEFORE
+        //                   any checkpoint (second crash).
+        // ----------------------------------------------------------------
+        "xarec_prepare" => {
+            // Seed + commit so the DB and some filler files exist.
+            {
+                let t = env.begin_transaction(None).expect("begin seed");
+                db.put_in(
+                    &t,
+                    DatabaseEntry::from_bytes(b"seed"),
+                    DatabaseEntry::from_bytes(b"seed"),
+                )
+                .expect("seed put");
+                t.commit().expect("commit seed");
+            }
+            firstlsn_roll_files(&db, &env, 20);
+            // The prepared txn: put XA keys, then prepare (durable TxnPrepare).
+            let txn = env.begin_transaction(None).expect("begin xa txn");
+            // XA keys live in a DISTINCT range (100_000..) from the filler
+            // keys (0..1600 written by firstlsn_roll_files), so the filler
+            // never lock-conflicts with the prepared txn's WRITE locks and
+            // the final read-back reads the SAME range it wrote.
+            for i in 0u32..8 {
+                db.put_in(
+                    &txn,
+                    DatabaseEntry::from_bytes(&(100_000u32 + i).to_be_bytes()),
+                    DatabaseEntry::from_bytes(&xarec_payload(i)),
+                )
+                .expect("xa put");
+            }
+            txn.prepare(1, b"xarec_gtrid", b"br1").expect("prepare xa txn");
+            // Roll MORE files AFTER prepare so the prepared LNs' file becomes an
+            // older, cleanable file once the txn is in-doubt across restart.
+            firstlsn_roll_files(&db, &env, 40);
+            // Leak the prepared txn (never drop): we spin until SIGKILL so the
+            // in-doubt TxnPrepare frame is the on-disk tail for this txn.
+            std::mem::forget(txn);
+            flag(&dir, "firstlsn_done");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        "xarec_commit" => {
+            // Recovery (at env open above) surfaced the prepared txn.
+            let prepared = env.recovered_prepared_txns();
+            assert_eq!(
+                prepared.len(),
+                1,
+                "xarec_commit: expected exactly one recovered prepared txn"
+            );
+            let txn_id = prepared[0].txn_id;
+            // Reclaim the prepared LNs' file: drive the two-checkpoint deletion
+            // barrier WHILE the prepared txn is in-doubt (unprotected by the
+            // clamp, LNs not redone into a slot).
+            firstlsn_force_delete_barrier(&env);
+            // Resolve exactly as noxu-xa::xa_commit does for a recovered branch.
+            let lns = env.take_recovered_prepared_lns(txn_id);
+            env.apply_recovered_prepared_lns(&lns)
+                .expect("apply recovered prepared lns");
+            env.write_txn_commit_for_recovered(txn_id)
+                .expect("write txn commit for recovered");
+            env.forget_recovered_prepared_txn(txn_id);
+            // Signal and spin: parent SIGKILLs BEFORE any checkpoint flushes the
+            // installed slot, so recovery must rebuild it from the log.
+            flag(&dir, "firstlsn_done");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        "xarec_commit_noclean" => {
+            // CONTROL: identical to xarec_commit but WITHOUT the cleaner
+            // barrier.  If keys SURVIVE here but are LOST in xarec_commit, the
+            // loss is caused by the cleaner reclaiming the prepared LNs' file
+            // (the dangling-LSN bug), not by the resolve path itself.
+            let prepared = env.recovered_prepared_txns();
+            assert_eq!(
+                prepared.len(),
+                1,
+                "xarec_commit_noclean: one prepared txn"
+            );
+            let txn_id = prepared[0].txn_id;
+            let lns = env.take_recovered_prepared_lns(txn_id);
+            env.apply_recovered_prepared_lns(&lns)
+                .expect("apply recovered lns");
+            env.write_txn_commit_for_recovered(txn_id).expect("write commit");
+            env.forget_recovered_prepared_txn(txn_id);
+            flag(&dir, "firstlsn_done");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        "xarec_recover_only" => {
+            // R-XAREC witness #6a: THIRD-crash coverage — crash AFTER recovery
+            // redid+relocked the prepared LNs but BEFORE resolution.  Recover,
+            // drive the deletion barrier (several checkpoints) WHILE the branch
+            // is in-doubt, then spin -> SIGKILL.  The redone slots must have
+            // been checkpointed and protected by the clamp so a subsequent
+            // reopen still surfaces the prepared txn and its data.
+            let prepared = env.recovered_prepared_txns();
+            assert_eq!(
+                prepared.len(),
+                1,
+                "xarec_recover_only: one prepared txn"
+            );
+            firstlsn_force_delete_barrier(&env);
+            // Do NOT resolve: leave the branch in-doubt and crash.
+            flag(&dir, "firstlsn_done");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
         other => panic!("Unknown NOXU_CRASH_MODE: {other}"),
     }
 }
@@ -1018,6 +1154,13 @@ fn main() {
 fn flag(dir: &Path, name: &str) {
     fs::write(dir.join(name), b"ok")
         .unwrap_or_else(|e| panic!("write flag {name}: {e}"));
+}
+
+/// R-XAREC: deterministic per-key payload for the prepared XA keys so a
+/// witness can validate not just presence but the CORRECT committed value
+/// (and detect a wrong-value / stale before-image).
+fn xarec_payload(i: u32) -> Vec<u8> {
+    format!("xa_payload_{i}").into_bytes()
 }
 
 /// R-FIRSTLSN helper: roll several small log files with committed data,

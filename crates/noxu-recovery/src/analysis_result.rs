@@ -45,6 +45,22 @@ pub struct PreparedLnReplay {
     pub key: Vec<u8>,
     /// LN value (`None` for deletes).
     pub data: Option<Vec<u8>>,
+    /// R-XAREC (S1): before-image LSN to revert to on `xa_rollback`
+    /// (`NULL_LSN` = this was a first write, so rollback deletes the slot).
+    /// Mirrors JE's `relock` -> `result.setAbortInfo(abortLsn, ...)`
+    /// (RecoveryManager.java:2354): the recovered prepared txn carries the
+    /// before-image so a later `xa_rollback` undoes the resurrected,
+    /// now-redone LN through the normal undo path.
+    pub abort_lsn: Lsn,
+    /// Whether the slot was known-deleted before this operation (so rollback
+    /// of a first write / insert over an absent key deletes the slot).
+    pub abort_known_deleted: bool,
+    /// Embedded before-image value, when the log entry carried it
+    /// (`None` => read it from `abort_lsn`, or the before-image was "deleted").
+    pub abort_data: Option<Vec<u8>>,
+    /// Before-image key, when a key-updating op gave the before-image a
+    /// different key (`None` => same as `key`).
+    pub abort_key: Option<Vec<u8>>,
 }
 
 /// LN operation type for a prepared-txn replay record.

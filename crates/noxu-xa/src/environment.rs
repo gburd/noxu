@@ -539,14 +539,23 @@ impl XaResource for XaEnvironment {
         self.resolving_xids.lock().unwrap().insert(xid.clone());
         drop(recovered);
 
-        // Discard the prepared LN replay list — nothing to apply.
-        let _ = self.env.take_recovered_prepared_lns(recovered_branch.txn_id);
+        // R-XAREC (S1): the prepared txn's LNs were REDONE into the tree
+        // during recovery, so `xa_rollback` must UNDO them (restore each
+        // slot's before-image) — not merely discard the list.  JE aborts the
+        // resurrected `PreparedTxn`, whose relocked write set carries the
+        // before-images captured by `relock` -> `setAbortInfo`.
+        let lns = self.env.take_recovered_prepared_lns(recovered_branch.txn_id);
+        let undo_result =
+            self.env.undo_recovered_prepared_lns(&lns).map_err(XaError::Db);
 
         // Write the durable TxnAbort WAL frame.
-        let abort_result = self
-            .env
-            .write_txn_abort_for_recovered(recovered_branch.txn_id)
-            .map_err(XaError::Db);
+        let abort_result = if undo_result.is_ok() {
+            self.env
+                .write_txn_abort_for_recovered(recovered_branch.txn_id)
+                .map_err(XaError::Db)
+        } else {
+            undo_result
+        };
 
         self.env.forget_recovered_prepared_txn(recovered_branch.txn_id);
         if let Some(ref log) = self.prepared_log {
@@ -665,11 +674,12 @@ impl XaResource for XaEnvironment {
         if let Some(rec) = self.recovered_branches.lock().unwrap().remove(xid) {
             // The XA TM has decided to forget this in-doubt branch
             // without resolving it.  Treat it as an implicit rollback
-            // for durability: write a TxnAbort frame so a subsequent
-            // recovery does not surface the XID again.  The data was
-            // never applied (prepared LNs are not redone), so there is
-            // nothing to undo in the tree.
-            let _ = self.env.take_recovered_prepared_lns(rec.txn_id);
+            // for durability: UNDO the redone LNs, then write a TxnAbort
+            // frame so a subsequent recovery does not surface the XID again.
+            // R-XAREC (S1): the prepared LNs ARE now redone into the tree
+            // during recovery, so the implicit rollback must undo them.
+            let lns = self.env.take_recovered_prepared_lns(rec.txn_id);
+            self.env.undo_recovered_prepared_lns(&lns).map_err(XaError::Db)?;
             self.env
                 .write_txn_abort_for_recovered(rec.txn_id)
                 .map_err(XaError::Db)?;

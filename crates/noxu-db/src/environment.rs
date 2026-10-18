@@ -2144,21 +2144,55 @@ impl Environment {
         .map(|_| ())
     }
 
-    /// Replays a recovered prepared transaction’s LNs into the in-memory
-    /// tree at `xa_commit` resolution time.
+    /// Resolves a recovered prepared transaction's LNs at `xa_commit` time.
     ///
-    /// Iterates the LN list (already removed from the recovered map by
-    /// the caller) and applies each insert/update/delete to the
-    /// matching `DatabaseImpl`'s tree.  This makes the prepared writes
-    /// observable to subsequent reads in the same process — without
-    /// this step, a recovered+committed XA branch's writes would only
-    /// become visible after a second recovery on the next reopen.
+    /// R-XAREC (S1): the prepared txn's LNs were already **redone into the
+    /// tree** during the FIRST recovery and the recovered prepared txn holds
+    /// the WRITE record locks on those slots (JE routes a `PreparedTxn`
+    /// through `redoOneLN` -> `relock` -> `redo`, RecoveryManager.java:2208).
+    /// So the committed values are already present and durable in a redoable
+    /// log position; `xa_commit` only has to write the durable `TxnCommit`
+    /// frame (the caller does that next) and release the relocks (done by
+    /// `forget_recovered_prepared_txn` -> `resolve_recovered_prepared`).
+    ///
+    /// This method is therefore now a **no-op** over the LN list — kept for
+    /// API compatibility with the XA layer (which still calls it before
+    /// `write_txn_commit_for_recovered`).  Before this fix it re-applied the
+    /// LNs from owned bytes at commit time, which left the slots out of every
+    /// checkpointed BIN and lost them to the redo gate after a second crash.
     pub fn apply_recovered_prepared_lns(
+        &self,
+        _lns: &[noxu_recovery::PreparedLnReplay],
+    ) -> Result<()> {
+        // Slots are already live (redone during recovery); nothing to apply.
+        Ok(())
+    }
+
+    /// Undoes a recovered prepared transaction's redone LNs at `xa_rollback`
+    /// time, restoring each slot's before-image.
+    ///
+    /// R-XAREC (S1): because the prepared txn's LNs are now redone into the
+    /// tree during recovery (so they survive checkpoints and a second crash),
+    /// `xa_rollback` must UNDO them — exactly as JE aborts the resurrected
+    /// `PreparedTxn`, whose write-lock set carries the before-image captured
+    /// by `relock` -> `setAbortInfo` (RecoveryManager.java:2354).  For each LN,
+    /// in reverse log order:
+    ///   * `abort_known_deleted` or no before-image => the slot was a first
+    ///     write / insert over an absent key: DELETE the slot.
+    ///   * otherwise => restore the embedded before-image value at
+    ///     `abort_lsn` (an update's or delete's prior committed value).
+    ///
+    /// The caller writes the durable `TxnAbort` frame next and releases the
+    /// relocks via `forget_recovered_prepared_txn`.
+    pub fn undo_recovered_prepared_lns(
         &self,
         lns: &[noxu_recovery::PreparedLnReplay],
     ) -> Result<()> {
         let env_impl = self.env_impl.lock();
-        for ln in lns {
+        // Reverse log order so a key written more than once by the prepared
+        // txn is reverted to its earliest before-image (JE undoes newest
+        // first; the oldest before-image is the pre-txn committed value).
+        for ln in lns.iter().rev() {
             let db_id = noxu_dbi::DatabaseId::new(ln.db_id as i64);
             let Some(db_arc) = env_impl.get_database_by_id(db_id) else {
                 continue;
@@ -2167,21 +2201,47 @@ impl Environment {
             let Some(tree) = db_guard.get_real_tree() else {
                 continue;
             };
-            match ln.operation {
-                noxu_recovery::PreparedLnOperation::Insert
-                | noxu_recovery::PreparedLnOperation::Update => {
-                    if let Some(data) = &ln.data {
-                        let _ = tree.insert(
-                            ln.key.clone(),
-                            data.clone(),
-                            ln.original_lsn,
-                        );
-                    }
+            let had_slot = tree.slot_lsn_any(&ln.key).is_some();
+            if ln.abort_known_deleted
+                || (ln.abort_lsn == noxu_util::NULL_LSN
+                    && ln.abort_data.is_none())
+            {
+                // First write / insert over an absent key: delete the slot.
+                if tree.delete(&ln.key) && had_slot {
+                    db_guard.decrement_entry_count();
                 }
-                noxu_recovery::PreparedLnOperation::Delete => {
-                    if tree.delete(&ln.key) {
-                        db_guard.decrement_entry_count();
-                    }
+            } else if let Some(before) = &ln.abort_data {
+                // Restore the embedded before-image value at abort_lsn.
+                let key =
+                    ln.abort_key.clone().unwrap_or_else(|| ln.key.clone());
+                let was_present = had_slot;
+                if let Err(e) = tree.insert(key, before.clone(), ln.abort_lsn) {
+                    log::error!(
+                        "R-XAREC: xa_rollback undo (before-image) failed for \
+                         db={} abort_lsn={:?}: {e:?}",
+                        ln.db_id,
+                        ln.abort_lsn,
+                    );
+                } else if !was_present {
+                    // Re-inserting a before-image for a prepared DELETE of an
+                    // existing key brings the record back.
+                    db_guard.increment_entry_count();
+                }
+            } else {
+                // Non-embedded before-image (rare in modern logs, which embed
+                // the abort value).  Delete the in-memory slot now; the
+                // durable `TxnAbort` the caller writes next means the NEXT
+                // recovery's normal undo pass restores the exact before-image
+                // from `abort_lsn` via the log scanner's `read_at_lsn`.
+                log::warn!(
+                    "R-XAREC: xa_rollback of a non-embedded before-image \
+                     (db={} abort_lsn={:?}); the in-memory slot is dropped and \
+                     restored exactly on the next recovery via the undo path",
+                    ln.db_id,
+                    ln.abort_lsn,
+                );
+                if tree.delete(&ln.key) && had_slot {
+                    db_guard.decrement_entry_count();
                 }
             }
         }
@@ -2292,6 +2352,17 @@ impl Environment {
         &self,
     ) -> Arc<Mutex<noxu_dbi::EnvironmentImpl>> {
         Arc::clone(&self.env_impl)
+    }
+
+    /// Test seam (R-XARECOVERED): the cleaner's first-active-txn-file clamp
+    /// value, so a witness can assert the clamp HOLDS the unresolved
+    /// recovered-prepared window across several checkpoints/cleaner passes and
+    /// RELEASES (returns `None`) once the branch is resolved — no stale pin.
+    /// `None` == `NULL_LSN` (no active/in-doubt txn clamping any file).
+    #[doc(hidden)]
+    pub fn first_active_lsn_for_test(&self) -> Option<u64> {
+        let v = self.env_impl.lock().get_txn_manager().get_first_active_lsn();
+        if v == noxu_util::NULL_LSN.as_u64() { None } else { Some(v) }
     }
 
     fn verify_inner(

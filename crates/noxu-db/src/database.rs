@@ -188,7 +188,17 @@ pub enum DbState {
 fn map_read_err(e: noxu_dbi::DbiError) -> NoxuError {
     match e {
         noxu_dbi::DbiError::LnFetchFailure { .. }
-        | noxu_dbi::DbiError::EnvironmentFailure { .. } => NoxuError::from(e),
+        | noxu_dbi::DbiError::EnvironmentFailure { .. }
+        // R-XAREC (S1): a lock timeout / conflict on a READ (e.g. a reader of
+        // an in-doubt recovered-prepared record that the resurrected prepared
+        // txn write-locked) must surface the TYPED `NoxuError::LockTimeout` /
+        // `LockConflict`, not a stringy `OperationNotAllowed` — so callers can
+        // `matches!(.., NoxuError::LockTimeout { .. })` and retry (JE throws
+        // the typed `LockTimeoutException`).  The cursor-WRITE path already
+        // preserves these (`map_cursor_err`, X-13 / A11); the read path did
+        // not — fixed here.
+        | noxu_dbi::DbiError::TxnError(_)
+        | noxu_dbi::DbiError::LockConflict(_) => NoxuError::from(e),
         e => NoxuError::OperationNotAllowed(e.to_string()),
     }
 }
