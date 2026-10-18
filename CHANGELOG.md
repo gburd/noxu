@@ -212,6 +212,22 @@ user-facing scope, symptoms, and preconditions.
   Linux where `strace` is present, a syscall-level crash-consistency assertion
   that an `fsync` of the parent directory follows the `rename`.
 
+- **An XA rollback of a prepared branch was not force-flushed** (`R-XAREC F1`):
+  a distributed-transaction (XA) `rollback` of a prepared branch — recovered
+  from a crash or live in-process — wrote its resolving `TxnAbort` frame WITHOUT
+  fsync/flush, while the symmetric commit paths force-flush (`CommitSync`). After
+  `xa_rollback(xid)` returned success, a crash before an independent checkpoint
+  lost the `TxnAbort`, so the next recovery re-surfaced the branch in-doubt and
+  (with R-XARECOVERED) redid + re-locked its LNs — a reader of the rolled-back
+  record then blocked, and `xa_recover` listed the XID again. Fixed so both
+  XA-rollback paths force-flush (`fsync=true, flush=true`), matching JE
+  `Txn.abort(Xid)` = `abort(true /*forceFlush*/)` (`Txn.java:611-617`) and
+  `XAEnvironment.rollback` (`XAEnvironment.java:284-299`). Plain non-XA
+  `Transaction::abort` is unchanged (NO_SYNC default, JE-correct). This defect
+  was introduced by the R-XARECOVERED redo+relock fix (before it, a rolled-back
+  prepared branch's LNs were never redone, so there was nothing to resurrect) and
+  is fixed in the same release.
+
 ### Fixed — isolation
 
 - **Cursor scans dirty-read an uncommitted delete / insert-abort**

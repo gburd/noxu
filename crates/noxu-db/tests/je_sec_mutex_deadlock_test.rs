@@ -122,17 +122,17 @@ fn is_retriable(e: &noxu_db::NoxuError) -> bool {
     // transients.  The Mutex-deadlock this guard targets produced NONE of
     // these — it produced an undetectable hang the watchdog catches.
     //
-    // v7.11.1 backport deviation: at the tag, `Database::get`/`get_into`/
-    // `delete*` string-wrap the typed txn error as
-    // `OperationNotAllowed("transaction error: …")` (the typed
-    // `map_err(NoxuError::from)` mapping lands with the later A11/A14
-    // error-handling work, out of this batch).  So the acceptable
-    // sec->primary txn-visible DEADLOCK / LOCK TIMEOUT surfaces as a string,
-    // not a typed `DeadlockDetected`/`LockTimeout`, and the typed predicates
-    // below miss it.  Recognise the string form too.  This does NOT weaken
-    // the hang oracle: the Mutex<->record hang produces NO error at all (both
-    // parties block forever), so the watchdog SIGABRT catches it regardless of
-    // this classifier.
+    // As of v7.11.1 (R-XARECOVERED read-path typing, owner #19 (a)) the
+    // public read/`delete*` entry points surface the TYPED
+    // `DeadlockDetected`/`LockTimeout`/`LockConflict` (via `map_read_err` /
+    // `map_cursor_err`), so the typed predicates below catch the acceptable
+    // sec->primary txn-visible transient directly.  The string-form fallback
+    // (`is_wrapped_txn_transient`) is kept only as defensive belt-and-braces
+    // for any residual `OperationNotAllowed`-wrapped txn error; it is no longer
+    // the primary path.  This does NOT weaken the hang oracle: the
+    // Mutex<->record hang produces NO error at all (both parties block
+    // forever), so the watchdog SIGABRT catches it regardless of this
+    // classifier.
     fn is_wrapped_txn_transient(e: &noxu_db::NoxuError) -> bool {
         if let noxu_db::NoxuError::OperationNotAllowed(m) = e {
             let m = m.to_ascii_lowercase();
