@@ -190,12 +190,26 @@ fn xa_recovered_commit_refused_on_master_wired_env() {
             vec![xid.clone()],
             "the branch must still be in-doubt (no TxnCommit was written)"
         );
+        // R-XARECOVERED: recovery now redoes AND re-locks a recovered prepared
+        // branch's LNs, so while the branch is in-doubt its record is held under
+        // the recovered-prepared WRITE lock. A reader therefore BLOCKS on the
+        // in-doubt lock and surfaces the typed NoxuError::LockTimeout (owner
+        // decision #19 / JE parity), instead of reading the uncommitted value or
+        // a stale absence. Positively witness that behaviour before resolving.
+        match db.get(key) {
+            Err(NoxuError::LockTimeout { .. }) => {}
+            other => panic!(
+                "an in-doubt recovered-prepared record must block the reader                  with a typed LockTimeout (R-XARECOVERED, owner #19), got {other:?}"
+            ),
+        }
+        // Resolve it now (standalone) so the write lock is released; the branch
+        // was never committed (the recovered xa_commit was refused), so after a
+        // rollback the data must NOT be durable.
+        xa.xa_rollback(&xid, XaFlags::NOFLAGS).unwrap();
         assert!(
             db.get(key).unwrap().is_none(),
-            "the recovered-commit was refused, so the data must NOT be durable"
+            "the recovered-commit was refused and the branch rolled back, so the              data must NOT be durable"
         );
-        // Clean up: resolve it now (standalone) so the env can close cleanly.
-        xa.xa_rollback(&xid, XaFlags::NOFLAGS).unwrap();
         let _ = db.close();
         let _ = xa.inner().close();
     }
