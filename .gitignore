@@ -15,6 +15,8 @@ vgcore*
 **/core.[0-9]*
 *.bk
 *orig
+*.orig
+*.rej
 tags
 perf*
 *folded
@@ -40,6 +42,11 @@ cargo-timing*
 !.agent/
 !.agent/skills/
 !.agent/skills/*.md
+# Agent scratch notes are NOT tracked (the "!.agent/" re-include above
+# would otherwise let them back in). Load-bearing design notes live under
+# docs/src/maintainer/, not here.
+.agent/notes-*
+.agent/AGENT.md
 # Archived audit/review transcripts kept for the record but NOT published
 # or committed (removed from docs/src/internal/ in the 2026-06 cleanup).
 .agent/archived-audits/
@@ -48,6 +55,14 @@ _
 # TLA+ TLC scratch directories and logs
 tla/states/
 docs/book/
+
+# Agent / tool session state that must never be committed.
+.claude/
+.kiro/
+resolve_*.py
+.placeholder
+scheduled_tasks.lock
+nohup.out
 
 # perf record raw captures — regenerate locally; only text summaries are tracked
 *.perf.data

@@ -26,7 +26,7 @@
 //! and `env_latch_timeout_ms` were wired in 7.1 (JE `ENV_FORCED_YIELD` /
 //! `ENV_LATCH_TIMEOUT`); `env_fair_latches` (JE `setFairLatches`) was wired
 //! in this release via a per-latch `FairQueue` FIFO admission queue (see
-//! `noxu-latch::fair_queue` and `.agent/notes-fair-latches.md`).
+//! `noxu-latch::fair_queue` and `docs/src/maintainer/fair-latches.md`).
 //!
 //! # Graduation audit trail
 //!

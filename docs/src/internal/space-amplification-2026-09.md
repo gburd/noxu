@@ -11,9 +11,9 @@ recommends or makes a default change.
 ## Caveat that applies to every number below
 
 All measurements were taken on a shared EC2 `i4i.16xlarge` (64 vCPU, 495 GB
-RAM, local NVMe XFS at `/data`) that **three peer agents were concurrently
-using for unrelated work**. `uptime` during this session showed load
-averages around 125 on the 64-vCPU box. Throughput/wall-clock numbers
+RAM, local NVMe XFS at `/data`) that was **concurrently running unrelated
+work**: `uptime` showed load averages around 125 on the 64-vCPU box.
+Throughput/wall-clock numbers
 (writes/s, load time, drain wall-clock) are consequently **not clean**
 and should be treated as order-of-magnitude only. Space (byte) measurements
 (`du -sb`, log write-byte counters) are not affected by CPU contention and
@@ -257,7 +257,7 @@ real compaction, not data loss, at this scale too.
 
 Status: **complete.** Run on a **dedicated** `i4i.16xlarge` (64 vCPU, 3.4 TB
 NVMe XFS at `/data`) with no other tenant — `uptime` shows load average under
-1.1 throughout this session, so (unlike Phase 1) every number below,
+1.1 throughout the run, so (unlike Phase 1) every number below,
 including wall-clock/throughput, is clean, not order-of-magnitude.
 
 ### Premise correction (read this before the sweep numbers)
@@ -295,11 +295,12 @@ counted obsolete, anywhere:
    But in Noxu, `abort_data` is unconditionally populated with the real
    before-image bytes on **every** overwrite (`CursorImpl::finalize_write_lock`
    passes `old_data` from `get_slot_before_image`, used for in-memory undo
-   on abort) — not only when the LN is actually embedded. Noxu's own
-   `embedded_ln` field is hard-coded `true` for a separate, already-flagged
-   fidelity gap (see the `ponytail:` comment at `cursor_impl.rs` line ~3512),
-   so it cannot be used to gate this. The filter therefore fires on **every**
-   overwrite, and the prior version is never counted obsolete anywhere.
+   on abort) — not only when the LN is actually embedded. The log-write
+   path does now compute a true embedded flag (`new_embedded_ln` in
+   `cursor_impl.rs::log_ln_write`), but the commit-time filter above keys off
+   `abort_data.is_some()`, not that flag — and `abort_data` is populated on
+   **every** overwrite. The filter therefore fires on **every** overwrite,
+   and the prior version is never counted obsolete anywhere.
 
    A second, narrower instance of the same class of gap: `Checkpointer`'s
    full-BIN-flush path (`crates/noxu-recovery/src/checkpointer.rs
@@ -432,7 +433,7 @@ under `SAP_DRAIN_MODE=passive`, at any scale tested.
 ```text
 SAP_DIR=/data/space-runs/p1-passive SAP_RECORDS=2000000 SAP_VALUE=512 SAP_CACHE_MB=512 \
 SAP_UPDATE_SECONDS=180 SAP_THREADS=16 SAP_MIN_UTIL=50 SAP_DRAIN_MODE=passive SAP_FINAL_CLEAN_PASSES=60 \
-SAP_ADMIN_BIN=/data/work/target/release/noxu-admin \
+SAP_ADMIN_BIN=target/release/noxu-admin \
 ./target/release/noxu-space-amp-probe
 ```
 
@@ -460,7 +461,7 @@ run and reclaimed nothing.
 ```text
 SAP_DIR=/data/space-runs/p1-forced SAP_RECORDS=2000000 SAP_VALUE=512 SAP_CACHE_MB=512 \
 SAP_UPDATE_SECONDS=180 SAP_THREADS=16 SAP_MIN_UTIL=50 SAP_DRAIN_MODE=forced SAP_FINAL_CLEAN_PASSES=40 \
-SAP_ADMIN_BIN=/data/work/target/release/noxu-admin \
+SAP_ADMIN_BIN=target/release/noxu-admin \
 ./target/release/noxu-space-amp-probe
 ```
 
@@ -610,7 +611,7 @@ steady-phase window regardless of its setting.
 ```text
 SAP_DIR=/data/space-runs/sweep-20-forced SAP_RECORDS=2000000 SAP_VALUE=512 SAP_CACHE_MB=512 \
 SAP_UPDATE_SECONDS=180 SAP_THREADS=16 SAP_MIN_UTIL=20 SAP_DRAIN_MODE=forced SAP_FINAL_CLEAN_PASSES=40 \
-SAP_ADMIN_BIN=/data/work/target/release/noxu-admin \
+SAP_ADMIN_BIN=target/release/noxu-admin \
 ./target/release/noxu-space-amp-probe
 ```
 

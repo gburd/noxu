@@ -203,10 +203,11 @@ impl ConsistencyTracker {
     /// atomic store; this tick bounds the wakeup latency if a `notify`
     /// is ever missed, so the wait can never hang past the policy timeout.
     //
-    // ponytail: 5ms re-check tick instead of wiring the latch-trip callback
-    // into the replay thread (JE trips the latch from `trackVLSN`). The tick
-    // bounds wakeup latency and guarantees no hang; wire an explicit notify
-    // into `ReplicaReplay::advance_vlsn` if sub-ms read latency ever matters.
+    // Design note: Noxu uses a 5ms re-check tick instead of wiring the
+    // latch-trip callback into the replay thread (JE trips the latch from
+    // `trackVLSN`).  The tick bounds wakeup latency and guarantees the wait
+    // can never hang; an explicit notify could be wired into
+    // `ReplicaReplay::advance_vlsn` if sub-ms read latency ever mattered.
     const RECHECK_TICK: Duration = Duration::from_millis(5);
 
     /// Build a tracker over the REP-7 `last_applied_vlsn` handle.

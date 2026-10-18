@@ -34,7 +34,7 @@
 //! ## Fair (FIFO) latches (JE `setFairLatches` / `ENV_FAIR_LATCHES`)
 //!
 //! See `crate::fair_queue` for the mechanism (a per-latch FIFO admission
-//! queue) and `.agent/notes-fair-latches.md` for the JE semantics this ports
+//! queue) and `docs/src/maintainer/fair-latches.md` for the JE semantics this ports
 //! and why: JE's own reference source never actually wires
 //! `ENV_FAIR_LATCHES` into a `SharedLatchImpl`/`LatchImpl` constructor (both
 //! `LatchFactory` call sites hardcode `false`), so there is no live JE

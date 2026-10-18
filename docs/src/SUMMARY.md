@@ -113,6 +113,9 @@
   - [Testing](maintainer/testing.md)
   - [Chaos and Soak Testing](maintainer/chaos-soak-testing.md)
   - [Benchmarking](maintainer/benchmarking.md)
+  - [Fair Latches](maintainer/fair-latches.md)
+  - [CleanerStats Field Wiring](maintainer/cleaner-stats.md)
+  - [Live Txn-Chain Reconstruction](maintainer/live-txn-chain.md)
 
 ---
 

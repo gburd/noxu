@@ -1474,10 +1474,12 @@ impl SecondaryDatabase {
                     &pri_data,
                     &mut sec_key,
                 ) {
-                    // ponytail: populate with expiration 0 (never-expire index
-                    // entry); the live write path (update_secondary via
-                    // maintain) carries the real primary expiration. Revisit if
-                    // a populate-time TTL witness is needed.
+                    // Populate with expiration 0 (a never-expire index
+                    // entry): population runs once at open time, and the
+                    // live write path (update_secondary via maintain)
+                    // carries the real primary expiration thereafter.  A
+                    // populate-time TTL would only matter if an index were
+                    // rebuilt from already-expiring primaries.
                     self.state.insert_sec_key(None, &sec_key, &pri_key, 0)?;
                 }
             } else if let Some(multi_creator) =

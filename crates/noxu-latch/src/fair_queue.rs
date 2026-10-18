@@ -5,7 +5,7 @@
 
 //! Per-latch FIFO admission queue backing `env_fair_latches`.
 //!
-//! See `.agent/notes-fair-latches.md` (repo root) for the JE semantics this
+//! See `docs/src/maintainer/fair-latches.md` for the JE semantics this
 //! ports and why Noxu implements the strictly-stronger full-FIFO guarantee
 //! rather than JE's documented contiguous-reader batching.
 //!

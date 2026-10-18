@@ -12,7 +12,7 @@
 //! (route `run_analysis` through `scan_forward_fn` instead of materialising
 //! the bounded range into a `Vec<PositionedEntry>`).
 //!
-//! ponytail: a probe, not a regression gate — #[ignore]'d so CI never runs it.
+//! This is a probe, not a regression gate: #[ignore]'d so CI never runs it.
 
 use noxu_db::{DatabaseConfig, DatabaseEntry, EnvironmentConfig};
 use std::path::Path;
@@ -81,10 +81,10 @@ fn recovery_open_timing_100k() {
         // skips Drop -> close -> checkpoint, leaving the full post-checkpoint
         // tail for recovery to replay (the scenario the benchmark hits).
         //
-        // ponytail: forget leaks the handles for the rest of the test process;
-        // fine for a one-shot ignored probe. The forgotten env still holds the
-        // env file lock, so recovery runs against a COPY of the log files in a
-        // second dir (a crash leaves the lock unheld on disk anyway).
+        // `mem::forget` leaks the handles for the rest of the test process;
+        // that is fine for a one-shot ignored probe.  The forgotten env still
+        // holds the env file lock, so recovery runs against a COPY of the log
+        // files in a second dir (a crash leaves the lock unheld anyway).
         std::mem::forget(db);
         std::mem::forget(env);
     }

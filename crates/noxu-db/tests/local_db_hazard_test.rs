@@ -1,15 +1,15 @@
-//! Coordinator hazard review of GAP-REPLAY-3 local-DB screening.
+//! Hazard analysis of GAP-REPLAY-3 local-DB screening.
 //!
 //! On the earlier tip 4adbd0d4 the JE-exact predicate ENABLED a replica/local
 //! write & create to a NON-replicated database (to match JE's
-//! `allowReplicaWrite`).  The coordinator flagged three hazards from the JE
-//! machinery Noxu does not yet have.  These witnesses first established the
-//! empirical truth on 4adbd0d4, and now (on the SAFE tip) assert the hazards
-//! are PREVENTED: a replica refuses all local-origin user writes & creates
-//! (the 7.11.x safety gate — a replicated env treats every user DB as
-//! replicated for screening).  See `local-db-design.md` for the full port.
+//! `allowReplicaWrite`).  That exposed three hazards from JE machinery Noxu
+//! does not yet have.  These witnesses first established the empirical truth
+//! on 4adbd0d4, and now (on the SAFE tip) assert the hazards are PREVENTED:
+//! a replica refuses all local-origin user writes & creates (the 7.11.x
+//! safety gate — a replicated env treats every user DB as replicated for
+//! screening).
 //!
-//! Findings on 4adbd0d4 (recorded for the design note):
+//! Findings on 4adbd0d4:
 //!   H1 (VLSN collision): REFUTED as described — the user data-path commit
 //!      writes a NULL_VLSN entry and never drives the replication VLSN counter
 //!      (`EnvironmentImpl::log_txn_commit`, the only consumer, has NO

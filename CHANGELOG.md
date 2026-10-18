@@ -1098,7 +1098,7 @@ Stable-foundational crates are unchanged at the public-API level
   `acquire_shared` now join before contending for the real inner lock, and
   leave (from the RAII guard's `Drop`, exactly once) after releasing it.
   Zero cost when the flag is off: the acquire/release fast path pays
-  exactly one relaxed atomic load. Per `.agent/notes-fair-latches.md`, Noxu
+  exactly one relaxed atomic load. Per `docs/src/maintainer/fair-latches.md`, Noxu
   implements the strictly stronger full-FIFO guarantee (every acquisition
   serialized in arrival order, readers included) rather than JE's
   documented — and, per that investigation, never actually wired in JE's
@@ -5874,8 +5874,9 @@ bump — `LOG_VERSION` is unchanged.
   safe in the current design because the compressor only ever sees committed
   defunct slots (the dbi write path physically removes slots under the txn
   write lock; the only writer of `BinStub.known_deleted = true` is
-  BIN-delta/recovery replay of committed deletes). A `ponytail:` code comment
-  in `compress_bin` records the ceiling and upgrade path.
+  BIN-delta/recovery replay of committed deletes). The `compress_bin` /
+  `compress_bin_with_lock_check` doc comment records the ceiling and the
+  upgrade path.
 
 ### Fixed (replication — split-brain)
 
