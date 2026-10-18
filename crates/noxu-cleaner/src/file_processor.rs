@@ -885,7 +885,6 @@ impl SharedTreeLookup {
         self
     }
 
-
     /// R-UNOPENED-RECLAIM (D-ADDITIVE-SAFETY): decide how to treat `db_id`.
     ///
     /// * `Registered(tree)` -- a tree is registered for this exact `db_id` in
