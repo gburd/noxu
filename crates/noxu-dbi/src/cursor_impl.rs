@@ -1877,21 +1877,12 @@ impl CursorImpl {
                 .lock(lsn, LockType::Write, false)
                 .map_err(DbiError::TxnError)?;
         } else if let Some(lm) = &self.lock_manager {
-            // JE release-on-move (LockMode.java:84-86; Cursor.java:5108-5118):
-            // "releasing [non-txn locks] before the move prevents more than
-            // one lock from being held during a cursor move".  JE does this in
-            // beginMoveCursor -> CursorImpl.reset -> locker.releaseNonTxnLocks
-            // (CursorImpl.java:566/602), which releases ALL of the bare
-            // locker's locks with NO per-record LSN bookkeeping.  A bare
-            // cursor's read locks already release per operation, so the only
-            // cross-operation lock this retires is a prior RMW WRITE lock on a
-            // record the cursor has moved off; releasing it before acquiring
-            // the current record's WRITE lock makes a bare RMW scan hold AT
-            // MOST the lock on its current record.  No-op when a Txn is
-            // attached (release_non_txn_locks returns early) -- those locks
-            // belong to the Txn.  Idempotent when re-upgrading the same record
-            // (release-all then re-acquire the same owner's lock).
-            self.release_non_txn_locks();
+            // JE takes LockMode.RMW as a WRITE lock on the CURRENT record
+            // (Cursor.java:5281).  The bare cursor's prior-record non-txn
+            // locks were already released at the MOVE that positioned here
+            // (release_non_txn_locks_on_move, the JE beginMoveCursor ->
+            // reset / beforeNonStickyOp analogue), so this just takes the
+            // current record's WRITE lock under the cursor's own id.
             lm.lock(lsn, self.id, LockType::Write, false, false)
                 .map_err(DbiError::TxnError)?;
         }
@@ -1928,6 +1919,10 @@ impl CursorImpl {
         search_mode: SearchMode,
     ) -> Result<OperationStatus, DbiError> {
         self.check_state()?;
+
+        // JE beginMoveCursor: a search is a MOVE -- release the bare cursor's
+        // non-txn locks (e.g. a prior RMW WRITE lock) BEFORE repositioning.
+        self.release_non_txn_locks_on_move();
 
         let is_dup = self.is_sorted_dup();
 
@@ -3963,6 +3958,8 @@ impl CursorImpl {
     /// * `NotFound` if the tree is empty
     pub fn get_first(&mut self) -> Result<OperationStatus, DbiError> {
         self.check_state()?;
+        // JE beginMoveCursor: getFirst is a MOVE -- release bare non-txn locks.
+        self.release_non_txn_locks_on_move();
 
         let result: Option<(
             Vec<u8>,
@@ -4143,6 +4140,9 @@ impl CursorImpl {
     /// * `NotFound` if the tree is empty
     pub fn get_last(&mut self) -> Result<OperationStatus, DbiError> {
         self.check_state()?;
+        // JE beginMoveCursor: getLast is a MOVE -- release bare non-txn locks
+        // BEFORE positioning (and before the EOF-sentinel lock below).
+        self.release_non_txn_locks_on_move();
 
         // C2/V2/F10: lock the per-database EOF sentinel BEFORE positioning,
         // unconditionally, so a concurrent transaction cannot insert a new
@@ -4553,6 +4553,12 @@ impl CursorImpl {
         mode: GetMode,
     ) -> Result<OperationStatus, DbiError> {
         self.check_state()?;
+
+        // JE beginMoveCursor: getNext/getPrev is a MOVE -- release the bare
+        // cursor's non-txn locks (e.g. a prior RMW WRITE lock) BEFORE
+        // advancing.  An uninitialized cursor holds nothing (helper is a
+        // no-op), so this is safe above the NotInitialized early-return.
+        self.release_non_txn_locks_on_move();
 
         if self.state == CursorState::NotInitialized {
             return Ok(OperationStatus::NotFound);
@@ -6807,6 +6813,22 @@ impl CursorImpl {
         if let Some(lm) = &self.lock_manager {
             lm.release_all_for_locker(self.id);
         }
+    }
+
+    /// JE release-on-MOVE (LockMode.java:84-86; Cursor.java beginMoveCursor
+    /// -> CursorImpl.reset / beforeNonStickyOp, CursorImpl.java:547/597/602).
+    /// A non-transactional cursor releases ALL of its non-txn locks when it
+    /// MOVES to a different record -- before ANY positioning op (search,
+    /// getFirst/getLast, getNext/getPrev), regardless of whether the next op
+    /// is an RMW.  JE does this in beginMoveCursor BEFORE the new record is
+    /// positioned/read/locked, so a bare cursor holds AT MOST the lock on its
+    /// CURRENT record.  A bare cursor's read locks already release per op, so
+    /// the only cross-operation lock this retires is a prior RMW WRITE lock on
+    /// the record the cursor is moving off.  No-op under a Txn (those locks
+    /// belong to the Txn).  Called at the TOP of each reposition op; the
+    /// per-op read-lock and the new record's RMW write-lock are taken after.
+    fn release_non_txn_locks_on_move(&self) {
+        self.release_non_txn_locks();
     }
 
     pub fn close(&mut self) -> Result<(), DbiError> {

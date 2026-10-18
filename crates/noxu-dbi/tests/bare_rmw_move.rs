@@ -43,7 +43,7 @@ fn bare_rmw_releases_prior_record_lock_on_move() {
     let tm = Arc::new(TxnManager::new(lm.clone()));
     let mut cursor = CursorImpl::new(db, 0)
         .with_lock_manager(lm.clone())
-        .with_txn_manager(tm.clone());
+        .with_txn_manager(tm);
 
     // Position on A and RMW-upgrade -> WRITE lock on A.
     cursor.search(b"A", None, SearchMode::Set).unwrap();
