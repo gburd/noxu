@@ -434,6 +434,20 @@ enum LockHeld {
     LmRead,
 }
 
+/// Outcome of the JE lock-WHILE-latched step ([`CursorImpl::lock_ln_latched`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LatchedLock {
+    /// The record lock was granted (or none was needed) WHILE the BIN was
+    /// latched and the slot was still at the prefetched LSN: the caller's
+    /// prefetched bytes are the committed value (JE "granted while latched, no
+    /// need to check LSN").
+    AuthoritativePrefetch,
+    /// The lock was DENIED by a concurrent writer, or the slot moved / went
+    /// away under the latch: the caller must run the blocking re-read
+    /// (`reread_data_locking_current_lsn`), which never returns dirty data.
+    FallToBlockingReread,
+}
+
 impl CursorImpl {
     /// Position the cursor on the first (`forward = true`) / last
     /// (`forward = false`) LIVE record, re-descending to the first / last
@@ -546,9 +560,11 @@ impl CursorImpl {
         let raw_data = e.data.clone().unwrap_or_default();
         let lsn = e_lsn.as_u64();
 
-        // `lock_ln` may Err (deadlock / RangeRestart); the guard drops and
-        // releases the descent pin so the evictor is not wedged.
-        let rc_c = self.lock_ln_mode(lsn, forward)?;
+        // R-LATCHLOCK: `revalidate_scanned_slot_rc` now takes the record lock
+        // WHILE the BIN is latched (JE lockLN) and decides authoritative vs
+        // blocking-reread under that latch; it may Err (deadlock /
+        // RangeRestart), the guard drops and releases the descent pin so the
+        // evictor is not wedged.
         // BUG-RC-SCAN-TORN-READ (depends on C2 A23): re-lock+re-read
         // committed bytes on contention or an LSN move.  FID-CURSOR-1/7: the
         // SCAN revalidation re-checks the record BY KEY (`raw_key`), so a
@@ -562,7 +578,7 @@ impl CursorImpl {
                 idx as usize,
                 &raw_key,
                 lsn,
-                rc_c,
+                forward,
             )?
         };
         let (raw_key, raw_data, lsn) = match revalidated {
@@ -2070,23 +2086,27 @@ impl CursorImpl {
                     // range lock) and does not advance, so an insert outside
                     // the matched key is not blocked (Cursor.java:4031,
                     // 4426-4435 exactKeyMatch branch).  Anchor READ via
-                    // lock_ln_mode(.., false) (A15), NOT the forward RANGE_READ.
-                    let contended = self.lock_ln_mode(slot_lsn, false)?;
-                    // X-10 + D1 (C2): if the slot LSN moved (or our lock had to
-                    // wait), the pre-fetched bytes may be a concurrent writer's
-                    // UNCOMMITTED in-place mutation.  Re-read under a lock on the
-                    // slot's CURRENT lsn so we block out the writer's txn
-                    // instead of returning its uncommitted value.  The re-read
-                    // keeps the slot's residency (Option<Bytes>) and returns the
-                    // stable current lsn (C2 tuple), so a non-resident LN is
-                    // fetched below at the lsn it was re-read with (D1).
-                    let (final_data, slot_lsn) = if contended
-                        || Self::slot_lsn_changed(
-                            &bin_arc, slot_index, slot_lsn,
-                        ) {
-                        self.reread_data_locking_current_lsn(key, slot_lsn)?
-                    } else {
-                        (slot_data, slot_lsn)
+                    // lock_ln_latched(.., false) (A15), NOT the forward
+                    // RANGE_READ.
+                    // R-LATCHLOCK / X-10 + D1 (C2): take the ANCHOR READ lock
+                    // WHILE the BIN is latched (JE lockLN).  AuthoritativePrefetch
+                    // means the lock was granted under the latch with the slot
+                    // still at `slot_lsn`, so the prefetch is the committed
+                    // value; otherwise re-read under a lock on the slot's
+                    // CURRENT lsn so we block out the writer's txn instead of
+                    // returning its uncommitted value.  The re-read keeps the
+                    // slot's residency (Option<Bytes>) and returns the stable
+                    // current lsn (C2 tuple), so a non-resident LN is fetched
+                    // below at the lsn it was re-read with (D1).
+                    let (final_data, slot_lsn) = match self.lock_ln_latched(
+                        &bin_arc, slot_index, slot_lsn, false,
+                    )? {
+                        LatchedLock::AuthoritativePrefetch => {
+                            (slot_data, slot_lsn)
+                        }
+                        LatchedLock::FallToBlockingReread => {
+                            self.reread_data_locking_current_lsn(key, slot_lsn)?
+                        }
                     };
                     // BUG-SEC-DIRTYREAD-DELETED-PRIMARY: the slot was live at
                     // the pre-lock descent but the re-read-under-lock found it
@@ -2237,20 +2257,25 @@ impl CursorImpl {
                     // Cursor.java:4426-4435).  The advance-to-next-slot case
                     // (search key absent) is handled in the else arm below
                     // with the RANGE_READ advance lock.  Anchor READ via
-                    // lock_ln_mode(.., false) (A15), NOT the forward RANGE_READ.
-                    let contended = self.lock_ln_mode(slot_lsn, false)?;
-                    // X-10 + D1 (C2): re-read under a lock on the slot's CURRENT
-                    // lsn (see the Set/Both branch) so a moved slot never returns
-                    // a concurrent writer's uncommitted bytes; the re-read keeps
+                    // lock_ln_latched(.., false) (A15), NOT the forward
+                    // RANGE_READ.
+                    // R-LATCHLOCK / X-10 + D1 (C2): take the ANCHOR READ lock
+                    // WHILE the BIN is latched (JE lockLN); on
+                    // AuthoritativePrefetch the prefetch is committed, else
+                    // re-read under a lock on the slot's CURRENT lsn (see the
+                    // Set/Both branch) so a moved slot never returns a
+                    // concurrent writer's uncommitted bytes; the re-read keeps
                     // residency and returns the stable current lsn so a
                     // non-resident LN is fetched below at that lsn (D1).
-                    let (final_data, slot_lsn) = if contended
-                        || Self::slot_lsn_changed(
-                            &bin_arc, slot_index, slot_lsn,
-                        ) {
-                        self.reread_data_locking_current_lsn(key, slot_lsn)?
-                    } else {
-                        (slot_data, slot_lsn)
+                    let (final_data, slot_lsn) = match self.lock_ln_latched(
+                        &bin_arc, slot_index, slot_lsn, false,
+                    )? {
+                        LatchedLock::AuthoritativePrefetch => {
+                            (slot_data, slot_lsn)
+                        }
+                        LatchedLock::FallToBlockingReread => {
+                            self.reread_data_locking_current_lsn(key, slot_lsn)?
+                        }
                     };
                     // BUG-SEC-DIRTYREAD-DELETED-PRIMARY: the slot was live at
                     // the pre-lock descent but the re-read-under-lock found it
@@ -2339,7 +2364,6 @@ impl CursorImpl {
                     };
                     match next_entry {
                         Some((k, v, lsn, slot_idx)) => {
-                            let rc_c = self.lock_ln(lsn)?;
                             // Pin the BIN for the range-found key.
                             let bin_arc = {
                                 let db = self.db_impl.read();
@@ -2348,19 +2372,23 @@ impl CursorImpl {
                                 })
                             };
                             // READ_COMMITTED revalidation (C1/V1): `k`/`v` were
-                            // captured by `find_range_entry` BEFORE `lock_ln`,
+                            // captured by `find_range_entry` BEFORE the lock,
                             // so a writer that mutated this slot inside the
-                            // prefetch->lock window leaves them stale.  Re-derive
-                            // from the now-authoritative slot if its LSN moved.
-                            // JE CursorImpl.lockLN re-reads bin.getLsn(index)
-                            // after locking (CursorImpl.java:3641-3680) and
+                            // prefetch->lock window leaves them stale.
+                            // R-LATCHLOCK: `revalidate_scanned_slot_rc` takes the
+                            // record lock WHILE the BIN is latched (JE lockLN,
+                            // RANGE_READ advance = `true`) and re-derives from
+                            // the now-authoritative slot unless granted under
+                            // the latch at the prefetched LSN.  JE CursorImpl
+                            // .lockLN re-reads bin.getLsn(index) after locking
+                            // (CursorImpl.java:3641-3680) and
                             // getCurrent/fetchLN(index) returns current-slot data
                             // (CursorImpl.java:2230/2294).
                             let revalidated = match bin_arc.as_ref() {
                                 Some(arc) => {
                                     let arc = arc.clone();
                                     self.revalidate_scanned_slot_rc(
-                                        &arc, slot_idx, &k, lsn, rc_c,
+                                        &arc, slot_idx, &k, lsn, true,
                                     )?
                                 }
                                 None => None,
@@ -2478,19 +2506,25 @@ impl CursorImpl {
                     // exactKeyMatch -> searchLockType=READ, Cursor.java:4426-4435).
                     let exact_both = matches!(search_mode, SearchMode::Both)
                         && raw_key == search_two_part_key;
-                    let rc_c_dup = self.lock_ln_mode(slot_lsn, !exact_both)?;
                     // READ_COMMITTED revalidation (C1/V1): `raw_key`/`idx` were
-                    // captured BEFORE `lock_ln`; if a writer moved this slot's
-                    // LSN inside the prefetch->lock window, re-derive the
-                    // authoritative two-part key from the pinned slot.  JE
-                    // CursorImpl.lockLN re-reads bin.getLsn(index) after locking
-                    // (CursorImpl.java:3641-3680); getCurrent decodes the
-                    // current slot (CursorImpl.java:2230).  `current_data` stays
-                    // None here and is decoded lazily by get_current(), so we
-                    // only need the authoritative key + LSN.
+                    // captured BEFORE the lock; R-LATCHLOCK:
+                    // `revalidate_scanned_slot_rc` takes the record lock WHILE
+                    // the BIN is latched (JE lockLN; anchor READ for an exact
+                    // getSearchBoth, else RANGE_READ advance = `!exact_both`)
+                    // and re-derives the authoritative two-part key from the
+                    // pinned slot unless granted under the latch at the
+                    // prefetched LSN.  JE CursorImpl.lockLN re-reads
+                    // bin.getLsn(index) after locking (CursorImpl.java:3641-3680);
+                    // getCurrent decodes the current slot (CursorImpl.java:2230).
+                    // `current_data` stays None here and is decoded lazily by
+                    // get_current(), so we only need the authoritative key + LSN.
                     let (final_key, final_lsn) = match self
                         .revalidate_scanned_slot_rc(
-                            &bin_arc, idx, &raw_key, slot_lsn, rc_c_dup,
+                            &bin_arc,
+                            idx,
+                            &raw_key,
+                            slot_lsn,
+                            !exact_both,
                         )? {
                         Some(Some((rk, _rd, rl))) => (rk, rl),
                         // FID-CURSOR-1/7: the positioned dup slot was DEFUNCT
@@ -2673,68 +2707,6 @@ impl CursorImpl {
         Ok(OperationStatus::Success)
     }
 
-    /// Acquires a read lock on a log record by LSN.
-    ///
-    /// `CursorImpl.lockLN(LockType.READ)`.  When no lock manager
-    /// is wired (read-only cursors / unit tests) this is a no-op.
-    ///
-    /// For txn-backed cursors the lock is tracked in the `Txn` and held until
-    /// commit/abort.  For auto-commit cursors the lock is acquired (to wait
-    /// for any current exclusive writer to finish) and then released
-    /// immediately — mirroring `AutoTxn` single-operation semantics.
-    ///
-    /// **SERIALIZABLE isolation (T-F2)**: when the cursor's txn has
-    /// `is_serializable_isolation()` set, this acquires `LockType::RangeRead`
-    /// instead of `LockType::Read`, mirroring JE `Cursor.getLockType(rangeLock
-    /// = true)`.  `RangeRead` conflicts with a concurrent `RangeInsert` on the
-    /// same LSN, blocking or triggering a restart on phantom inserts.
-    ///
-    /// Returns an error only when the lock would deadlock or the locker is
-    /// invalid; `NULL_LSN` records are skipped (lock-free slots).
-    ///
-    /// Returns `Ok(contended)` where `contended = true` means the lock was
-    /// not immediately available — a concurrent writer held an exclusive lock
-    /// and we had to wait.  When `contended` is `true`, any data pre-fetched
-    /// before calling this method may be stale (the writer may have committed
-    /// or aborted during the wait), and the caller should re-read from the BIN.
-    /// When `contended` is `false`, the lock was granted immediately with no
-    /// intervening write, so pre-fetched data remains valid.
-    ///
-    /// Returns `Err(DbiError::TxnError(TxnError::RangeRestart))` if a
-    /// concurrent `RangeInsert` owner caused a range restart — the caller
-    /// must abort the current scan position and restart the operation.
-    /// Has the BIN slot we pre-fetched changed since we captured it?
-    ///
-    /// Cursor reads capture a slot's data BEFORE requesting its record lock, so
-    /// a writer that acquires, mutates and releases the slot inside that window
-    /// leaves the pre-fetched bytes stale. Contention reported by `lock_ln` does
-    /// not cover that case: if the writer has already finished, the lock is
-    /// granted immediately and no contention is seen, yet the captured data is
-    /// already wrong.
-    ///
-    /// Comparing the slot's LSN against the pre-fetched one closes that window
-    /// for the cost of one BIN latch and an index — no tree descent — because
-    /// every write to a record logs a new entry and installs a new LSN in the
-    /// slot.
-    fn slot_lsn_changed(
-        bin_arc: &std::sync::Arc<
-            noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>,
-        >,
-        slot_index: usize,
-        pre_fetched_lsn: u64,
-    ) -> bool {
-        let guard = bin_arc.read();
-        match &*guard {
-            noxu_tree::tree::TreeNode::Bottom(bin) => {
-                slot_index < bin.entries.len()
-                    && bin.get_lsn(slot_index).as_u64() != pre_fetched_lsn
-            }
-            // Slot no longer lives in a BIN (split/compress): fall back to the
-            // re-read rather than trusting the pre-fetch.
-            _ => true,
-        }
-    }
-
     /// Re-derive `(key, data, lsn)` from the *authoritative* pinned BIN slot
     /// after a record lock has been acquired, but only if the slot's LSN moved
     /// while we were unlatched.
@@ -2800,24 +2772,27 @@ impl CursorImpl {
         >,
         slot_index: usize,
         pre_lock_lsn: u64,
-        contended: bool,
+        range_lock: bool,
     ) -> Result<Option<Option<(Vec<u8>, Bytes, u64)>>, DbiError> {
         use noxu_tree::tree::TreeNode;
-        // Fast path: no contention AND the slot LSN is unchanged -> the
-        // prefetch is authoritative (same O(1) check A14-min uses).
+        // R-LATCHLOCK: acquire the record lock WHILE the BIN is latched (JE
+        // lockLN).  AuthoritativePrefetch means the lock was granted (or none
+        // was needed) under the latch with the slot still at `pre_lock_lsn`, so
+        // no concurrent writer owns it and the prefetch is the committed value
+        // (same O(1) fast path, now ordered against the inserter's
+        // lock-before-publish, closing the dirty-read window).
         //
         // FID-CURSOR-1: a PENDING-deleted slot must NEVER take the fast path.
         // The scan deliberately lands on a PD slot (its KD-only skip predicate
         // does not skip PD), then locks it.  If the deleter already committed
-        // and released its WRITE lock, `lock_ln_mode` grants immediately
-        // (`contended == false`) and the slot LSN is unchanged, so the fast
-        // path would return the pre-lock (deleted) prefetch as if it were a
-        // live record — a dirty read of the committed delete.  Forcing the
-        // slow path makes the `slot_is_live` check below reject the PD slot
-        // (returning `Some(None)` → the scan advances), and on an ABORT the
-        // slot is no longer PD so it re-resolves to the restored record (JE
-        // `lockLNAndCheckDefunct` re-reads the slot after the blocking lock,
-        // CursorImpl.java:2148-2222).
+        // and released its WRITE lock, the latched lock grants and the slot LSN
+        // is unchanged, so the fast path would return the pre-lock (deleted)
+        // prefetch as if it were a live record — a dirty read of the committed
+        // delete.  Forcing the slow path makes the `slot_is_live` check below
+        // reject the PD slot (returning `Some(None)` → the scan advances), and
+        // on an ABORT the slot is no longer PD so it re-resolves to the
+        // restored record (JE `lockLNAndCheckDefunct` re-reads the slot after
+        // the blocking lock, CursorImpl.java:2148-2222).
         let slot_is_pending_deleted = {
             let guard = bin_arc.read();
             match &*guard {
@@ -2828,8 +2803,12 @@ impl CursorImpl {
             }
         };
         if !slot_is_pending_deleted
-            && !contended
-            && !Self::slot_lsn_changed(bin_arc, slot_index, pre_lock_lsn)
+            && self.lock_ln_latched(
+                bin_arc,
+                slot_index,
+                pre_lock_lsn,
+                range_lock,
+            )? == LatchedLock::AuthoritativePrefetch
         {
             return Ok(None);
         }
@@ -2891,7 +2870,7 @@ impl CursorImpl {
         slot_index: usize,
         expected_key: &[u8],
         pre_lock_lsn: u64,
-        contended: bool,
+        range_lock: bool,
     ) -> Result<Option<Option<(Vec<u8>, Bytes, u64)>>, DbiError> {
         use noxu_tree::tree::TreeNode;
         // A PENDING-deleted slot must never take the fast path (see
@@ -2907,9 +2886,17 @@ impl CursorImpl {
                 _ => false,
             }
         };
+        // R-LATCHLOCK: take the record lock WHILE the BIN is latched (JE
+        // lockLN) — AuthoritativePrefetch means granted under the latch with
+        // the slot still at `pre_lock_lsn`, so the prefetch is committed and
+        // authoritative; otherwise fall through to the blocking re-read.
         if !slot_is_pending_deleted
-            && !contended
-            && !Self::slot_lsn_changed(bin_arc, slot_index, pre_lock_lsn)
+            && self.lock_ln_latched(
+                bin_arc,
+                slot_index,
+                pre_lock_lsn,
+                range_lock,
+            )? == LatchedLock::AuthoritativePrefetch
         {
             return Ok(None);
         }
@@ -3107,10 +3094,6 @@ impl CursorImpl {
         Ok(Some(OperationStatus::Success))
     }
 
-    fn lock_ln(&self, lsn: u64) -> Result<bool, DbiError> {
-        self.lock_ln_mode(lsn, true)
-    }
-
     /// JE `CursorImpl.lockLN(lockType)` where `lockType` is
     /// `Cursor.getLockType(lockMode, range_lock)` (Cursor.java:5273-5290):
     ///
@@ -3258,6 +3241,222 @@ impl CursorImpl {
             Ok(contended)
         } else {
             Ok(false)
+        }
+    }
+
+    /// JE `CursorImpl.lockLN`'s lock-WHILE-latched step (R-LATCHLOCK): take the
+    /// record lock *while the BIN is latched* so the grant is ordered against a
+    /// concurrent inserter's lock-before-publish, closing the dirty-read
+    /// window.  This is the structural fix for the reader-side TOCTOU: the old
+    /// `lock_ln_mode` + `slot_lsn_changed` fast path sampled contention and the
+    /// slot LSN *unlatched*, so on a 2-core interleaving a non-blocking READ on
+    /// the inserter's published-but-uncommitted LSN could be granted (the
+    /// inserter's WRITE lock not yet visible to the reader's lock-table read,
+    /// no happens-before edge), the LSN re-check saw the published LSN
+    /// unchanged, and the prefetched *uncommitted* bytes were returned — a
+    /// READ_COMMITTED dirty read (isolation S2).
+    ///
+    /// JE avoids this by never un-ordering the lock from the latch
+    /// (CursorImpl.java:3590 "Try a non-blocking lock first, to avoid
+    /// unlatching"; :3620-3627 "Lock was granted while latched, no need to
+    /// check LSN").  The inserter publishes the new LSN into the BIN slot UNDER
+    /// the BIN write-latch, *after* taking its WRITE lock
+    /// (`finalize_write_lock` precedes `apply_tree_insert`).  A reader that
+    /// acquires the BIN *read* latch synchronises-with that write-latch
+    /// release, so if it then observes the published LSN in the slot it is
+    /// guaranteed to observe the WRITE lock in the lock table too — its
+    /// non-blocking READ is DENIED and it falls to the blocking re-read, which
+    /// waits out the inserter's txn and returns only committed data.
+    ///
+    /// Contract: the caller must have prefetched `(slot_lsn, …)` from the slot
+    /// at `slot_index` of `bin_arc` *under a BIN latch*.  This method re-takes
+    /// the BIN read latch and, atomically under it, (1) re-verifies the slot is
+    /// still live at `slot_lsn`, (2) attempts the record lock NON-BLOCKING.  It
+    /// returns:
+    ///
+    /// * [`LatchedLock::AuthoritativePrefetch`] — the lock was granted (or no
+    ///   lock is needed: own-txn footprint / read-uncommitted / RangeInsert
+    ///   co-location / NULL lsn) WHILE the slot was latched AND still at
+    ///   `slot_lsn`; the caller's prefetched bytes are the committed value and
+    ///   may be returned directly (JE's "granted while latched" branch).  For
+    ///   READ_COMMITTED the (newly taken) lock is released immediately, exactly
+    ///   as `lock_ln_mode` does, preserving RC's no-held-lock footprint.
+    /// * [`LatchedLock::FallToBlockingReread`] — the lock was DENIED (a
+    ///   concurrent writer owns it), or the slot moved / went away / is no
+    ///   longer a BIN under the latch; the caller must run
+    ///   [`Self::reread_data_locking_current_lsn`] (JE's unlatch → blocking
+    ///   lock → re-latch → LSN re-check → revert-and-loop path), which NEVER
+    ///   returns dirty data.
+    ///
+    /// `range_lock` selects the SERIALIZABLE anchor/advance lock type exactly
+    /// as [`Self::lock_ln_mode`] (`false` = READ anchor, `true` = RANGE_READ
+    /// advance under serializable isolation).
+    ///
+    /// Lock-order (R2): the record lock is taken ONLY non-blocking while the
+    /// BIN read latch is held — the lock manager's non-blocking path completes
+    /// synchronously under its shard mutex and never touches the tree, so the
+    /// edge is one-way (BIN latch → shard mutex) and cannot deadlock.  A
+    /// blocking wait is never issued under the latch; that is the caller's
+    /// unlatched re-read.
+    fn lock_ln_latched(
+        &self,
+        bin_arc: &std::sync::Arc<
+            noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>,
+        >,
+        slot_index: usize,
+        slot_lsn: u64,
+        range_lock: bool,
+    ) -> Result<LatchedLock, DbiError> {
+        use noxu_tree::tree::TreeNode;
+        // NULL_LSN (unlogged / deferred-write slot): no record lock to take and
+        // no writer can be hiding behind one — the prefetch is authoritative.
+        if slot_lsn == noxu_util::NULL_LSN.as_u64() {
+            return Ok(LatchedLock::AuthoritativePrefetch);
+        }
+        // Take the BIN read latch and HOLD it across the non-blocking lock
+        // attempt.  Acquiring this latch synchronises-with the inserter's BIN
+        // write-latch release (which happened AFTER it took its WRITE lock and
+        // published the LSN), establishing the happens-before edge the old
+        // unlatched probe lacked.
+        let guard = bin_arc.read();
+        let still_at_lsn = match &*guard {
+            TreeNode::Bottom(bin) => {
+                slot_index < bin.entries.len()
+                    && bin.slot_is_live(slot_index)
+                    && bin.get_lsn(slot_index).as_u64() == slot_lsn
+            }
+            // Slot no longer lives in a BIN (split/compress): fall back to the
+            // authoritative blocking re-read.
+            _ => false,
+        };
+        if !still_at_lsn {
+            // The slot moved / went away / is no longer a BIN since the
+            // prefetch: do not trust the prefetch.  (JE's "LSN changed while
+            // unlatched" revert-and-loop; here we route to the blocking
+            // re-read which performs that loop.)
+            return Ok(LatchedLock::FallToBlockingReread);
+        }
+        // Attempt the record lock NON-BLOCKING while the BIN is latched.
+        // Granted  => no concurrent writer (JE "granted while latched").
+        // Denied   => a writer owns the slot's LSN => blocking re-read.
+        let granted =
+            self.try_nonblocking_lock_latched(slot_lsn, range_lock)?;
+        // While we still hold the latch, re-confirm the slot has not moved off
+        // `slot_lsn` (belt-and-braces: the latch already prevents a concurrent
+        // BIN mutation, but a split/compress releasing & re-taking the arc
+        // could in principle have changed the node kind between the two
+        // borrows — the single `guard` here rules that out, so this is purely
+        // defensive and matches JE's post-grant `bin.getLsn(index)` identity).
+        let outcome = if granted {
+            LatchedLock::AuthoritativePrefetch
+        } else {
+            LatchedLock::FallToBlockingReread
+        };
+        drop(guard);
+        Ok(outcome)
+    }
+
+    /// The non-blocking record-lock attempt used by [`Self::lock_ln_latched`],
+    /// factored out of [`Self::lock_ln_mode`] so it can run WHILE the BIN latch
+    /// is held (the only lock-manager call permitted under a latch is a
+    /// non-blocking one — lock-order rule R2).
+    ///
+    /// Returns `Ok(true)` when the lock was granted (or no lock is needed), and
+    /// `Ok(false)` when it was DENIED by a concurrent writer.  Mirrors
+    /// `lock_ln_mode`'s lock-type selection, read-uncommitted / RangeInsert
+    /// co-location skips, and READ_COMMITTED immediate-release semantics
+    /// exactly; the ONLY difference is that it NEVER issues a blocking wait
+    /// (denial is reported, not awaited), because a blocking wait while latched
+    /// is forbidden.
+    fn try_nonblocking_lock_latched(
+        &self,
+        lsn: u64,
+        range_lock: bool,
+    ) -> Result<bool, DbiError> {
+        if let Some(txn) = &self.txn_ref {
+            let mut guard = txn.lock().unwrap();
+            // Read-uncommitted (txn default OR per-op): JE lockLN still calls
+            // locker.lock(lsn, NONE, ...) to run checkState/checkPreempted but
+            // takes no record lock — nothing a writer can block on, so the
+            // prefetch is authoritative.
+            if self.op_read_uncommitted || guard.is_read_uncommitted_default() {
+                guard
+                    .lock(lsn, LockType::None, false)
+                    .map_err(DbiError::TxnError)?;
+                return Ok(true);
+            }
+            // A RangeInsert next-key lock this txn already owns stands; an
+            // illegal (RangeInsert, Read/RangeRead) upgrade is not requested
+            // and the read proceeds against the latched slot (same skip as
+            // `lock_ln_mode`).
+            if guard.holds_range_insert(lsn) {
+                return Ok(true);
+            }
+            let lock_type = if range_lock && guard.is_serializable_isolation() {
+                LockType::RangeRead
+            } else {
+                LockType::Read
+            };
+            // READ_COMMITTED probe fast-path (same optimisation as
+            // `lock_ln_mode`): RC releases the read lock immediately after the
+            // op, so the lock only serves to detect a concurrent writer.  Under
+            // the BIN latch the probe is authoritative — "no foreign write
+            // owner, no waiter" means the slot's LSN we observed is committed
+            // (the inserter holds WRITE before publishing, visible through the
+            // same shard, and the latch orders our shard read after its publish
+            // + lock).  Behaviour-identical to acquire+immediate-release; a
+            // write owner or waiter falls through to the full non-blocking
+            // attempt.  Only valid for RC (RR/SR hold the read lock to commit).
+            if guard.is_read_committed_isolation()
+                && !guard.holds_range_insert(lsn)
+                && guard
+                    .probe_read_uncontended(lsn)
+                    .map_err(DbiError::TxnError)?
+            {
+                return Ok(true);
+            }
+            // Try the non-blocking lock.  A grant means no foreign writer owns
+            // the slot's LSN RIGHT NOW, and because we hold the BIN latch (so
+            // we observed the slot AT `lsn`), the inserter's lock-before-publish
+            // guarantees that if any writer had published this LSN uncommitted
+            // its WRITE lock would be present and the request DENIED.
+            match guard.lock(lsn, lock_type, true) {
+                Ok(_) => {
+                    // READ_COMMITTED releases the read lock immediately after
+                    // the operation (RC footprint); RR/SR keep it to commit so
+                    // concurrent writers block for the txn's duration.
+                    if guard.is_read_committed_isolation() {
+                        guard.release_lock(lsn).map_err(DbiError::TxnError)?;
+                    }
+                    Ok(true)
+                }
+                Err(noxu_txn::TxnError::LockNotAvailable { .. }) => Ok(false),
+                // RangeRestart: a concurrent RangeInsert owner — propagate so
+                // the caller restarts the scan (JE RangeRestartException).
+                Err(e) => Err(DbiError::TxnError(e)),
+            }
+        } else if let Some(lm) = &self.lock_manager {
+            // Auto-commit: Read regardless of isolation (no cross-op phantom
+            // protection), acquired and released immediately — it only serves
+            // to detect a concurrent writer, now under the BIN latch.
+            // Probe fast-path (same as `lock_ln_mode`'s auto-commit branch /
+            // CHANGELOG 6.4.1): a single shard access confirms the slot is
+            // unlocked, skipping the acquire+release pair; under the latch the
+            // "no writer now" result is authoritative.
+            if lm.probe_read_uncontended(lsn, self.id) {
+                return Ok(true);
+            }
+            match lm.lock(lsn, self.id, LockType::Read, true, false) {
+                Ok(_) => {
+                    lm.release(lsn, self.id).map_err(DbiError::TxnError)?;
+                    Ok(true)
+                }
+                Err(noxu_txn::TxnError::LockNotAvailable { .. }) => Ok(false),
+                Err(e) => Err(DbiError::TxnError(e)),
+            }
+        } else {
+            // No txn and no lock manager: nothing to lock, nothing to block.
+            Ok(true)
         }
     }
 
@@ -4133,22 +4332,23 @@ impl CursorImpl {
                     self.update_bin_pin(Some(bin_arc));
                     return self.retrieve_next(GetMode::Next);
                 }
-                let rc_c = self.lock_ln_mode(lsn, true)?;
                 // FID-CURSOR-1/7: the first slot may be PENDING-deleted (a
-                // committed delete not yet compressed).  Use the SCAN
-                // revalidation (re-check BY KEY) and, if it is defunct under
-                // the lock (`Some(None)`), advance to the next NON-defunct
-                // slot via retrieve_next starting FROM this slot's index (so
-                // the within-BIN scan steps to idx+1 and finds a same-BIN live
-                // neighbour, e.g. getFirst skipping a committed-deleted key 1
-                // to reach key 2 in the same BIN) — never return the stale
-                // prefetch (JE getFirst falls into getNext's re-resolve).
+                // committed delete not yet compressed).  R-LATCHLOCK: the SCAN
+                // revalidation takes the record lock WHILE the BIN is latched
+                // (JE lockLN, RANGE_READ advance = `true`, re-checked BY KEY)
+                // and, if it is defunct under the lock (`Some(None)`), advance
+                // to the next NON-defunct slot via retrieve_next starting FROM
+                // this slot's index (so the within-BIN scan steps to idx+1 and
+                // finds a same-BIN live neighbour, e.g. getFirst skipping a
+                // committed-deleted key 1 to reach key 2 in the same BIN) —
+                // never return the stale prefetch (JE getFirst falls into
+                // getNext's re-resolve).
                 let (key, data, lsn) = match self.revalidate_scanned_slot_rc(
                     &bin_arc,
                     idx as usize,
                     &key,
                     lsn,
-                    rc_c,
+                    true,
                 )? {
                     Some(Some((rk, rd, rl))) => (rk, rd, rl),
                     Some(None) => {
@@ -4319,9 +4519,10 @@ impl CursorImpl {
                     self.update_bin_pin(Some(bin_arc));
                     return self.retrieve_next(GetMode::Prev);
                 }
-                let rc_c = self.lock_ln_mode(lsn, false)?;
-                // FID-CURSOR-1/7 (symmetric to get_first): SCAN revalidation
-                // by key; a defunct (PENDING-deleted / removed) last slot
+                // FID-CURSOR-1/7 (symmetric to get_first): R-LATCHLOCK SCAN
+                // revalidation takes the record lock WHILE the BIN is latched
+                // (JE lockLN; getLast anchor READ = `false`, re-checked BY
+                // KEY); a defunct (PENDING-deleted / removed) last slot
                 // re-anchors and delegates to retrieve_next(Prev) rather than
                 // returning the stale prefetch.
                 let (key, data, lsn) = match self.revalidate_scanned_slot_rc(
@@ -4329,7 +4530,7 @@ impl CursorImpl {
                     idx as usize,
                     &key,
                     lsn,
-                    rc_c,
+                    false,
                 )? {
                     Some(Some((rk, rd, rl))) => (rk, rd, rl),
                     Some(None) => {
@@ -5000,7 +5201,10 @@ impl CursorImpl {
                 )?;
                 return Ok(s);
             }
-            let rc_c = self.lock_ln_mode(lsn, forward)?;
+            // R-LATCHLOCK: `revalidate_scanned_slot_rc` takes the record lock
+            // WHILE the BIN is latched (JE lockLN; `forward` selects the
+            // RANGE_READ advance / READ anchor lock type) and decides
+            // authoritative-prefetch vs blocking-reread under that latch.
             let cur_arc = self.current_bin_arc.clone();
             let revalidated = match &cur_arc {
                 Some(arc) => self.revalidate_scanned_slot_rc(
@@ -5008,7 +5212,7 @@ impl CursorImpl {
                     idx as usize,
                     &key,
                     lsn,
-                    rc_c,
+                    forward,
                 )?,
                 None => None,
             };
@@ -5213,17 +5417,19 @@ impl CursorImpl {
                     )?;
                     return Ok(s);
                 }
-                // NEW-9 (leak fix): `lock_ln` can return Err (deadlock /
+                // NEW-9 (leak fix): the latched lock inside
+                // `revalidate_scanned_slot_rc` can return Err (deadlock /
                 // RangeRestart / lock-manager error).  On that `?`,
                 // `pin_guard` drops and releases the descent pin
                 // (`cursor_count -= 1`) — the BIN is NOT left permanently
                 // pinned/wedged for the evictor.
-                let rc_c_xbin = self.lock_ln_mode(lsn, forward)?;
                 // The BIN is ALREADY pinned by the descent (NEW-9), so
                 // revalidate against THAT pinned arc — no second descent, no
-                // unpinned window.  SCAN revalidation re-checks BY KEY
-                // (`raw_key`), so a concurrent commit/abort that
-                // removed/shifted the slot is detected (`Some(None)`).
+                // unpinned window.  R-LATCHLOCK: the SCAN revalidation takes
+                // the record lock WHILE the BIN is latched (JE lockLN;
+                // `forward` selects RANGE_READ advance / READ anchor) and
+                // re-checks BY KEY (`raw_key`), so a concurrent commit/abort
+                // that removed/shifted the slot is detected (`Some(None)`).
                 let revalidated = {
                     let arc = pin_guard.arc().clone();
                     self.revalidate_scanned_slot_rc(
@@ -5231,7 +5437,7 @@ impl CursorImpl {
                         idx as usize,
                         &raw_key,
                         lsn,
-                        rc_c_xbin,
+                        forward,
                     )?
                 };
                 let (raw_key, raw_data, lsn) = match revalidated {
@@ -5320,7 +5526,10 @@ impl CursorImpl {
         lsn: u64,
         forward: bool,
     ) -> Result<bool, DbiError> {
-        let rc_c = self.lock_ln_mode(lsn, forward)?;
+        // R-LATCHLOCK: `revalidate_scanned_slot_rc` takes the record lock
+        // WHILE the BIN is latched (JE lockLN; `forward` selects the
+        // RANGE_READ advance / READ anchor lock type) and decides authoritative
+        // vs blocking-reread under that latch.
         let bin_arc = self.find_bin_arc_for_key(&raw_key);
         let revalidated = match bin_arc.as_ref() {
             Some(arc) => {
@@ -5330,7 +5539,7 @@ impl CursorImpl {
                     idx as usize,
                     &raw_key,
                     lsn,
-                    rc_c,
+                    forward,
                 )?
             }
             None => None,
