@@ -72,21 +72,52 @@ fn ln_fetch_and_cachemode_strip_carry_no_db_impl_lock() {
     let _ = env.evict_memory().unwrap();
 
     let done = Arc::new(AtomicBool::new(false));
+    // PROGRESS watchdog (not a wall-clock deadline). The workload is
+    // fdatasync-bound (64k durable commits + repeated full re-fault scans), so
+    // its absolute runtime scales with disk throughput: ~8s on x86 NVMe but
+    // ~85s on a slow riscv64 SATA host — all forward progress, no wedge. A
+    // fixed total-time deadline therefore mis-fires on slow hardware. Instead
+    // we abort only if NO reader scan and NO writer commit completes for
+    // STALL_SECS, which still catches a real deadlock/livelock (where the
+    // counter stops advancing) on any host, fast or slow. A generous absolute
+    // backstop (ABS_BACKSTOP_SECS) still bounds a pathological run that keeps
+    // trickling progress yet never terminates.
+    const STALL_SECS: u64 = 30;
+    const ABS_BACKSTOP_SECS: u64 = 900;
+    let progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let watchdog = {
         let done = Arc::clone(&done);
+        let progress = Arc::clone(&progress);
         std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(60);
-            while Instant::now() < deadline {
+            let start = Instant::now();
+            let mut last = progress.load(Ordering::Acquire);
+            let mut last_change = Instant::now();
+            loop {
                 if done.load(Ordering::Acquire) {
                     return;
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(100));
+                let now = progress.load(Ordering::Acquire);
+                if now != last {
+                    last = now;
+                    last_change = Instant::now();
+                }
+                let stalled =
+                    last_change.elapsed() >= Duration::from_secs(STALL_SECS);
+                let backstopped =
+                    start.elapsed() >= Duration::from_secs(ABS_BACKSTOP_SECS);
+                if stalled || backstopped {
+                    let why = if stalled {
+                        format!("no progress for {STALL_SECS}s")
+                    } else {
+                        format!("absolute backstop {ABS_BACKSTOP_SECS}s hit")
+                    };
+                    eprintln!(
+                        "STALL: LN re-fault + CacheMode strip workload wedged                          ({why}; progress counter at {now}) under concurrent                          read/write/strip — likely a deadlock/livelock, not                          slow hardware"
+                    );
+                    std::process::abort();
+                }
             }
-            eprintln!(
-                "STALL: LN re-fault + CacheMode strip workload did not \
-                 finish within 60s under concurrent read/write/strip"
-            );
-            std::process::abort();
         })
     };
 
@@ -94,6 +125,7 @@ fn ln_fetch_and_cachemode_strip_carry_no_db_impl_lock() {
         for _ in 0..N_READERS {
             let env = &env;
             let db = &db;
+            let progress = &progress;
             s.spawn(move || {
                 for _ in 0..ROUNDS {
                     let _ = env.evict_memory().unwrap();
@@ -133,12 +165,14 @@ fn ln_fetch_and_cachemode_strip_carry_no_db_impl_lock() {
                         }
                         break 'scan;
                     }
+                    progress.fetch_add(1, Ordering::Release);
                 }
             });
         }
         for w in 0..N_WRITERS {
             let env = &env;
             let db = &db;
+            let progress = &progress;
             s.spawn(move || {
                 for _ in 0..ROUNDS {
                     for i in 0..N_KEYS {
@@ -158,7 +192,10 @@ fn ln_fetch_and_cachemode_strip_carry_no_db_impl_lock() {
                                 )
                                 .and_then(|_| t.commit());
                             match r {
-                                Ok(()) => break,
+                                Ok(()) => {
+                                    progress.fetch_add(1, Ordering::Release);
+                                    break;
+                                }
                                 Err(e) if e.is_retryable() => {
                                     // `t` is already consumed by commit() on the
                                     // Ok path; on the retryable error path the
