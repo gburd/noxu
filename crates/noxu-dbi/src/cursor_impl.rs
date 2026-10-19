@@ -2225,12 +2225,65 @@ impl CursorImpl {
                     )? {
                         return Ok(hit);
                     }
-                    // v7.11.1 tag-native deviation: the integrate side here also
-                    // locked known-deleted slots before NOTFOUND via
-                    // `slot.kd_lsn` / `lock_skipped_defunct_slots` (A5 KD-slot
-                    // lineage, NOT in stack-v1); that block is dropped. The
-                    // A14 `try_repeatable_read_expired` call above is the only
-                    // A14 addition to this arm.
+                    // R-SECREAD-NOTFOUND: a DEFUNCT slot found at descent (PD or
+                    // KD, `kd_lsn = Some`) must be LOCKED on its real LSN
+                    // (blocking on the in-flight deleter) and the key
+                    // re-evaluated before it may be treated as absent -- JE
+                    // searchExact -> lockLNAndCheckDefunct ALWAYS calls lockLN
+                    // on the slot it found, even a defunct one
+                    // (CursorImpl.java:1937-1980, 2148-2210).  A same-key atomic
+                    // delete+reinsert leaves the slot transiently PD under the
+                    // writer's WRITE lock; without locking it the reader
+                    // momentarily observes NOTFOUND for a record that is always
+                    // logically present.  `reread_data_locking_current_lsn`
+                    // runs the JE lockLN blocking loop: it blocks on the
+                    // deleter, then re-reads the slot's current state, returning
+                    // the reinserted record when the writer commits, or the
+                    // "gone" sentinel only for a genuine committed delete under
+                    // a granted, stable lock.
+                    if let Some(kd_lsn) =
+                        slot.as_ref().and_then(|s| s.kd_lsn)
+                    {
+                        let (final_data, slot_lsn) =
+                            self.reread_data_locking_current_lsn(key, kd_lsn)?;
+                        if !(slot_lsn == 0 && final_data.is_none()) {
+                            // The slot became LIVE again (the reinsert of the
+                            // atomic update) -- return it exactly as the `found`
+                            // arm does.
+                            let final_data = match final_data {
+                                Some(d) => Some(d),
+                                None if slot_lsn != 0 => {
+                                    self.fetch_ln_data_from_log(slot_lsn)?
+                                }
+                                none => none,
+                            };
+                            if matches!(effective_mode, SearchMode::Both) {
+                                let user_data = data.unwrap_or(&[]);
+                                let stored =
+                                    final_data.as_deref().unwrap_or(&[]);
+                                if stored != user_data {
+                                    return Ok(OperationStatus::NotFound);
+                                }
+                            }
+                            self.current_key = Some(
+                                self.stored_full_key(key)
+                                    .unwrap_or_else(|| key.to_vec()),
+                            );
+                            self.current_data = final_data;
+                            self.current_lsn = slot_lsn;
+                            if let Some(bin_arc) =
+                                slot.as_ref().map(|s| s.bin_arc.clone())
+                            {
+                                self.update_bin_pin(Some(bin_arc));
+                            }
+                            self.state = CursorState::Initialized;
+                            return Ok(OperationStatus::Success);
+                        }
+                        // Genuine committed delete under a granted lock: fall
+                        // through to the phantom-protection + NOTFOUND path
+                        // below, exactly as JE returns null from
+                        // lockLNAndCheckDefunct for a committed-defunct slot.
+                    }
                     // Wave 5: contest a synthetic-key read lock on the
                     // missing slot to detect uncommitted deletes.  See
                     // `lock_synthetic_key_for_delete`.
@@ -3745,6 +3798,57 @@ impl CursorImpl {
     ///   timeout is an error, never the GONE sentinel, so "gone" and "could not
     ///   lock" never collide.  The pre-fix unlocked fallback that returned the
     ///   writer's uncommitted bytes on loop exhaustion is REMOVED.
+
+    /// The slot's CURRENT LSN for `key`, INCLUDING a defunct (PD/KD) slot
+    /// (`None` only when there is no exact slot at all under the latch).
+    ///
+    /// JE's `lockLN` locks a fixed BIN slot index and follows `bin.getLsn(idx)`
+    /// even when the slot is defunct (`isEntryKnownDeleted` -> NULL_LSN ->
+    /// defunct; otherwise the DeleteLN LSN).  Noxu may physically relocate a
+    /// slot, so the equivalent is to re-locate the key and read the current
+    /// (possibly defunct) slot's LSN; a defunct slot still write-locked by its
+    /// deleter is the LSN the reader must block on before treating the key as
+    /// absent (R-SECREAD-NOTFOUND; JE CursorImpl.java:3539-3683).
+    fn defunct_slot_lsn_for_key(&self, key: &[u8]) -> Option<u64> {
+        let db = self.db_impl.read();
+        let tree = db.get_real_tree()?;
+        // `slot_lsn_any` returns the slot LSN regardless of KD/PD state and
+        // `None` when there is no exact slot (JE getParentBINForChildLN +
+        // findEntry).  A NULL_LSN defunct slot carries no lock to block on, so
+        // it is reported as "no lockable slot" (None).
+        match tree.slot_lsn_any(key) {
+            Some((lsn, _is_deleted)) if lsn.as_u64() != noxu_util::NULL_LSN.as_u64() => {
+                Some(lsn.as_u64())
+            }
+            _ => None,
+        }
+    }
+
+    /// True iff a Read lock on `lsn` would BLOCK -- i.e. a FOREIGN writer owns
+    /// it or a waiter is queued (the inverse of JE
+    /// `LockManager.isLockUncontended`, LockManager.java:692 ->
+    /// `nWaiters()==0 && nOwners()==0`, but discounting this locker's own
+    /// ownership via `probe_read_uncontended`'s requester check).  Used to
+    /// decide whether a transiently-absent slot is still held by an in-flight
+    /// deleter (keep blocking, JE lockLN) or genuinely gone (the deleter
+    /// committed, the lock is uncontended).
+    fn lsn_write_contended(&self, lsn: u64) -> bool {
+        if let Some(txn) = &self.txn_ref {
+            let guard = txn.lock().unwrap();
+            // `probe_read_uncontended` returns false when a foreign write
+            // owner or any waiter is present (a Read here would block); our
+            // own ownership is discounted by the requester-id check.
+            match guard.probe_read_uncontended(lsn) {
+                Ok(uncontended) => !uncontended,
+                Err(_) => false,
+            }
+        } else if let Some(lm) = &self.lock_manager {
+            !lm.probe_read_uncontended(lsn, self.id)
+        } else {
+            false
+        }
+    }
+
     fn reread_data_locking_current_lsn(
         &self,
         key: &[u8],
@@ -3809,13 +3913,70 @@ impl CursorImpl {
                     self.lock_ln_release_held(known_lsn, held);
                     known_lsn = cur_lsn;
                 }
-                // key gone (committed delete): no slot.  Return lsn 0 so
-                // the caller's `slot_lsn != 0` guard disables the non-resident
-                // refetch (0 is the invalid-lsn sentinel these cursor data
-                // paths use, matching `rehydrate_current_data`).
+                // No LIVE slot for `key`.  Before declaring the record
+                // gone, apply JE's rule (CursorImpl.lockLNAndCheckDefunct ->
+                // lockLN, CursorImpl.java:2148-2210, 3539-3683; BIN.compress
+                // comment BIN.java:1143-1172): a DEFUNCT slot (PD or KD) whose
+                // LSN is still WRITE-LOCKED by an in-flight deleter must be
+                // LOCKED (blocking on the deleter) before it may be treated as
+                // absent.  A same-key atomic delete+reinsert (the updater of
+                // SecondaryMultiTest.testMultiReadUpdate) leaves the slot
+                // transiently defunct under the writer's WRITE lock; JE's
+                // lockLN blocks on that writer and, after commit, re-reads the
+                // slot's NEW (reinsert) LSN and returns the record -- it never
+                // reports NOTFOUND for a record that is always logically
+                // present.  (R-SECREAD-NOTFOUND.)
                 None => {
-                    self.lock_ln_release_held(known_lsn, held);
-                    return Ok((None, 0));
+                    match self.defunct_slot_lsn_for_key(key) {
+                        // A defunct slot still exists for the key.
+                        Some(defunct_lsn) if defunct_lsn != known_lsn => {
+                            // The writer moved the slot off `known_lsn` (its
+                            // delete / reinsert published a new LSN).  Revert
+                            // the now-useless lock on the OLD lsn (JE
+                            // revertLock) and re-lock the slot's CURRENT lsn so
+                            // we block on the in-flight deleter.  UNBOUNDED,
+                            // exactly like JE's lockLN loop -- progress is
+                            // bounded by committing writers; the blocking
+                            // acquire's own timeout is the only hard bound and
+                            // surfaces as an error, never dirty data.
+                            self.lock_ln_release_held(known_lsn, held);
+                            known_lsn = defunct_lsn;
+                        }
+                        // The defunct slot reports the SAME LSN we locked.
+                        // We held a Read lock on exactly this LSN across the
+                        // re-read, so the deleter that owned `known_lsn` has
+                        // released it (our Read lock was granted) and nothing
+                        // re-published the slot at a new LSN.  JE
+                        // lockLNAndCheckDefunct treats a defunct slot under a
+                        // granted, stable-LSN lock as a committed delete ->
+                        // null -> NOTFOUND (CursorImpl.java:2148-2210).  Return
+                        // the "gone" sentinel.
+                        Some(_) => {
+                            self.lock_ln_release_held(known_lsn, held);
+                            return Ok((None, 0));
+                        }
+                        // No slot at all for the key under the latch.  If an
+                        // in-flight deleter still owns/awaits the lock on
+                        // `known_lsn`, the slot is only transiently gone (a
+                        // same-key reinsert is in progress or the slot is being
+                        // reused) -- re-lock `known_lsn` to BLOCK on that writer
+                        // and loop (JE never sees a physically-removed in-flight
+                        // slot; this is the Noxu-equivalent "re-locate the key
+                        // after the wait").  Once the lock is UNCONTENDED the
+                        // deleter has committed with no live reinsert -> the
+                        // record is genuinely gone.
+                        None => {
+                            self.lock_ln_release_held(known_lsn, held);
+                            if known_lsn != noxu_util::NULL_LSN.as_u64()
+                                && self.lsn_write_contended(known_lsn)
+                            {
+                                // Writer still in flight on this LSN: loop and
+                                // block on it via lock_ln_hold at the top.
+                                continue;
+                            }
+                            return Ok((None, 0));
+                        }
+                    }
                 }
             }
         }
