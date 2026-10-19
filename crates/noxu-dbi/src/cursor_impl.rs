@@ -2913,42 +2913,6 @@ impl CursorImpl {
         }
     }
 
-    fn revalidate_locked_slot(
-        bin_arc: &std::sync::Arc<
-            noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>,
-        >,
-        slot_index: usize,
-        pre_lock_lsn: u64,
-    ) -> Option<Option<(Vec<u8>, Bytes, u64)>> {
-        use noxu_tree::tree::TreeNode;
-        let guard = bin_arc.read();
-        match &*guard {
-            TreeNode::Bottom(bin) => {
-                if slot_index >= bin.entries.len() {
-                    // Slot fell off the end (split/compress) — force fallback.
-                    return Some(None);
-                }
-                let cur_lsn = bin.get_lsn(slot_index).as_u64();
-                if cur_lsn == pre_lock_lsn {
-                    // Unchanged: the prefetch is still authoritative.
-                    return None;
-                }
-                // LSN moved while unlatched: re-derive from the current slot.
-                if !bin.slot_is_live(slot_index) {
-                    // Slot is now known-deleted/expired — do not trust it as a
-                    // live read; let the caller apply its miss/skip handling.
-                    return Some(None);
-                }
-                let key = bin.get_full_key(slot_index)?;
-                let data =
-                    bin.entries[slot_index].data.clone().unwrap_or_default();
-                Some(Some((key, data, cur_lsn)))
-            }
-            // No longer a BIN (split/compress): force the caller to fall back.
-            _ => Some(None),
-        }
-    }
-
     /// Re-resolves the FULL stored key of the slot matching `key`, BY KEY
     /// under the BIN latch (never by a pre-lock search index).
     ///
