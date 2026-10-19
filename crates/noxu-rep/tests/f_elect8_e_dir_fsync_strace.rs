@@ -43,6 +43,48 @@ fn strace_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Build an `strace -e trace=` syscall filter containing only the syscall
+/// names this build of strace accepts *on this architecture*. The riscv64
+/// (and other `renameat2`-only) kernel ABIs do not have the legacy `rename` /
+/// `renameat` / `open` syscalls, and strace rejects an unknown name in the
+/// filter with a non-zero exit ("invalid system call \rename"), which
+/// would otherwise fail this test for a reason that has nothing to do with the
+/// property under test. We probe each candidate with `strace -e trace=<name>
+/// true` and keep only the accepted ones. The directory-fsync-after-rename
+/// property is still asserted — on riscv64 the glibc `rename()` wrapper issues
+/// `renameat2`, which stays in the filter, and the parser already matches
+/// `renameat2(` / `openat(`.
+fn build_strace_filter() -> String {
+    // Candidates in two groups; at least one rename-family and the fsync /
+    // dir-open family must survive, or the test cannot assert its property.
+    let rename_family = ["rename", "renameat", "renameat2"];
+    let other = ["fsync", "fdatasync", "openat", "open", "close"];
+    let accepts = |name: &str| -> bool {
+        Command::new("strace")
+            .args(["-e", &format!("trace={name}"), "true"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    let mut kept: Vec<&str> = Vec::new();
+    for n in rename_family.iter().chain(other.iter()) {
+        if accepts(n) {
+            kept.push(n);
+        }
+    }
+    // Sanity: we must retain at least one rename-family syscall and fdatasync
+    // or fsync, else the probe below cannot persist/observe the ordering.
+    assert!(
+        rename_family.iter().any(|r| kept.contains(r)),
+        "strace accepts no rename-family syscall name on this arch; cannot run the ordering check"
+    );
+    assert!(
+        kept.contains(&"fsync") || kept.contains(&"fdatasync"),
+        "strace accepts neither fsync nor fdatasync on this arch"
+    );
+    kept.join(",")
+}
+
 /// Parse an strace line-trace and assert a directory fsync follows the rename
 /// of the state file. Returns Ok(()) on success, Err(reason) on violation.
 fn assert_dir_fsync_after_rename(
@@ -142,12 +184,13 @@ fn dir_fsync_follows_rename_strace() {
     // Re-exec THIS test binary, running only this test, under strace. The env
     // var makes the child perform the probe workload and exit(0) immediately.
     let self_exe = std::env::current_exe().expect("current_exe");
+    let trace_filter = format!("trace={}", build_strace_filter());
     let status = Command::new("strace")
         .args([
             "-f", // follow threads/forks
             "-y", // annotate fds with paths (robustness; parser also works without)
             "-e",
-            "trace=rename,renameat,renameat2,fsync,fdatasync,openat,open,close",
+            &trace_filter,
             "-o",
         ])
         .arg(&trace_path)
