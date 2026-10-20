@@ -24,11 +24,10 @@
 //!   * the run terminates within the lock-timeout bound (no deadlock/hang);
 //!   * a name is never observed half-created / half-removed (open either
 //!     succeeds with a consistent tree or fails NotFound — never a torn tree).
+//!
 //! This catches the R-LIVEDDL-711 class (a race that leaves a db empty/gone
 //! with records lost) because such an outcome violates the count set, and it
 //! catches a lock-protocol defect (deadlock / unbounded block / untyped error).
-
-#![allow(clippy::doc_lazy_continuation)]
 
 use noxu_db::{DatabaseConfig, Environment, EnvironmentConfig, NoxuError};
 use std::collections::BTreeSet;

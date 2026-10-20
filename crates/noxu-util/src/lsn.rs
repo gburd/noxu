@@ -227,10 +227,16 @@ impl Lsn {
         Self::new(EOF_FILE_NUM, h).as_u64()
     }
 
-    /// Stable, collision-free lock id for the catalog NameLN of a database
-    /// `name` — the lock-manager key a catalog operation (remove / rename /
-    /// truncate / open) uses to serialise against a concurrent operation on the
-    /// same name (R-LIVEDDL-711).
+    /// Stable lock id for the catalog NameLN of a database `name` -- the
+    /// lock-manager key a catalog operation (remove / rename / truncate /
+    /// open) uses to serialise against a concurrent operation on the same
+    /// name (R-LIVEDDL-711).  See `# Stability` for the collision caveat (the
+    /// id is collision-free against real LSNs and the sibling synthetic
+    /// families, but NOT among names).
+    ///
+    /// Internal engine primitive; `#[doc(hidden)]` and not part of the stable
+    /// public API (used cross-crate by `noxu-db` / `noxu-dbi`, so it cannot be
+    /// `pub(crate)`).  May change or be removed without a major version bump.
     ///
     /// JE locks the NameLN *record* at its name key:
     /// `DbTree.lockNameLN` → `CursorImpl.searchExact(key = name, LockType.WRITE)`
@@ -277,6 +283,7 @@ impl Lsn {
     /// with a real LSN-keyed lock or with either other synthetic family.  The
     /// low 32 bits are a 32-bit FNV-1a hash of the UTF-8 name bytes, masked so
     /// they never equal `u32::MAX` (same convention as the sibling helpers).
+    #[doc(hidden)]
     pub fn name_lock_id(name: &str) -> u64 {
         const FNV_OFFSET: u32 = 0x811c_9dc5;
         const FNV_PRIME: u32 = 0x0100_0193;

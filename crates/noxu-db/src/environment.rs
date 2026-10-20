@@ -311,6 +311,30 @@ impl ActiveTxns {
     }
 }
 
+/// R-LIVEDDL-711 (S3): RAII release for an auto-commit catalog name lock.
+///
+/// An auto-commit (`None` txn) catalog op takes the NameLN lock under a
+/// throwaway locker id that no `Txn` owns, so nothing releases it at
+/// commit/abort.  Before this guard the release was a straight-line call after
+/// the inner op; a PANIC inside the op unwound past it and leaked the lock,
+/// permanently wedging every future catalog op on that name (the database
+/// became un-removable).  Holding the release in `Drop` makes it run on EVERY
+/// exit — normal return, `?` early return, and unwind — so a panic can no
+/// longer strand the lock.  `release_name_record` is idempotent and also
+/// unregisters the throwaway locker's diagnostic label, so arming the guard
+/// even when the acquire failed is correct (it only drops the label).
+struct AutoNameLockGuard<'a> {
+    env_impl: &'a Arc<Mutex<EnvironmentImpl>>,
+    name: &'a str,
+    locker_id: i64,
+}
+
+impl Drop for AutoNameLockGuard<'_> {
+    fn drop(&mut self) {
+        self.env_impl.lock().release_name_record(self.name, self.locker_id);
+    }
+}
+
 impl Environment {
     /// Opens or creates a database environment.
     ///
@@ -961,38 +985,47 @@ impl Environment {
         // it is excluded here.  The probe is released immediately after the
         // open for the auto-commit locker; for `Some(txn)` the READ is held by
         // the txn (JE's handle lock lives for the handle's life).
-        let open_probe_auto_id: Option<i64> = if is_transactional_create {
-            None
-        } else if let Some(t) = txn {
-            // Probe under the opener's own txn so a truncate/remove that holds
-            // the WRITE under this same txn is not self-blocked.
-            self.lock_name_record_under_txn_typed(
-                t,
-                name,
-                LockType::Read,
-                /*non_blocking=*/ true,
-            )?;
-            None
-        } else {
-            // Auto-commit open: throwaway locker takes the READ probe; released
-            // after the open regardless of outcome.
-            let (auto_id, res) = {
-                let env_impl = self.env_impl.lock();
-                let auto_id = env_impl.next_auto_locker_id();
-                let res = env_impl.lock_name_record(
+        let open_probe_guard: Option<AutoNameLockGuard<'_>> =
+            if is_transactional_create {
+                None
+            } else if let Some(t) = txn {
+                // Probe under the opener's own txn so a truncate/remove that holds
+                // the WRITE under this same txn is not self-blocked.
+                self.lock_name_record_under_txn_typed(
+                    t,
                     name,
                     LockType::Read,
-                    auto_id,
                     /*non_blocking=*/ true,
-                );
-                (auto_id, res)
+                )?;
+                None
+            } else {
+                // Auto-commit open: throwaway locker takes the READ probe,
+                // released by the RAII guard after the open regardless of
+                // outcome — including an unwind if the open panics
+                // (R-LIVEDDL-711 S3).
+                let (auto_id, res) = {
+                    let env_impl = self.env_impl.lock();
+                    let auto_id = env_impl.next_auto_locker_id();
+                    let res = env_impl.lock_name_record(
+                        name,
+                        LockType::Read,
+                        auto_id,
+                        /*non_blocking=*/ true,
+                    );
+                    (auto_id, res)
+                };
+                // Arm the guard before checking `res` so a failed acquire still
+                // drops the throwaway locker's label (idempotent release).
+                let guard = AutoNameLockGuard {
+                    env_impl: &self.env_impl,
+                    name,
+                    locker_id: auto_id,
+                };
+                if let Err(e) = res {
+                    return Err(map_dbi_err(name)(e));
+                }
+                Some(guard)
             };
-            if let Err(e) = res {
-                self.env_impl.lock().release_name_record(name, auto_id);
-                return Err(map_dbi_err(name)(e));
-            }
-            Some(auto_id)
-        };
 
         let db_impl_arc = {
             let env_impl = self.env_impl.lock();
@@ -1033,11 +1066,11 @@ impl Environment {
         };
         // R-LIVEDDL-711: release the auto-commit open READ probe now that the
         // DatabaseImpl is resolved (or the open failed); its job was the
-        // conflict check against an in-doubt WRITE holder.  Done before the
-        // `?` so an open error cannot leak the throwaway locker's lock.
-        if let Some(auto_id) = open_probe_auto_id {
-            self.env_impl.lock().release_name_record(name, auto_id);
-        }
+        // conflict check against an in-doubt WRITE holder.  Dropped before the
+        // `?` so an open error cannot leak the throwaway locker's lock; the
+        // guard's `Drop` also covers an unwind if the open above panicked
+        // (R-LIVEDDL-711 S3).
+        drop(open_probe_guard);
         let db_impl_arc = db_impl_arc?;
 
         // Register abort/commit callbacks on the transaction so that
@@ -1187,6 +1220,14 @@ impl Environment {
     /// for the handle-open path (non-blocking → `LockConflict` on a conflict).
     /// The lock is released after `op` returns, win or lose.  A concurrent
     /// transactional DDL holding the name conflicts here.
+    ///
+    /// R-LIVEDDL-711 (S3, review finding): the release runs through an RAII
+    /// [`AutoNameLockGuard`] so a PANIC in `op` cannot leak the auto-commit
+    /// name lock.  Before the guard, a panic unwinding past the manual release
+    /// left the NameLN lock held by a dead throwaway locker, which permanently
+    /// wedged every future catalog op on that name (an un-removable database).
+    /// The transactional paths get this for free via `release_all_locks`;
+    /// JE's auto-commit `Locker.operationEnd` likewise releases on any exit.
     fn with_name_record_lock<T>(
         &self,
         name: &str,
@@ -1202,14 +1243,16 @@ impl Environment {
                 .map_err(map_dbi_err(name));
             (locker_id, acquired)
         };
-        if let Err(e) = acquired {
-            // Nothing to release: the acquire failed, but still drop the label.
-            self.env_impl.lock().release_name_record(name, locker_id);
-            return Err(e);
-        }
-        let result = op();
-        self.env_impl.lock().release_name_record(name, locker_id);
-        result
+        // Arm the release guard whether or not the acquire succeeded: on a
+        // failed acquire there is no lock to drop but the throwaway locker's
+        // diagnostic label still needs unregistering (both are handled by
+        // `release_name_record`, which is idempotent).  On success the guard
+        // releases the held lock when it drops — on the normal return, on an
+        // early `?` return, AND on an unwind if `op` panics.
+        let _guard =
+            AutoNameLockGuard { env_impl: &self.env_impl, name, locker_id };
+        acquired?;
+        op()
     }
 
     /// Removes a database.
@@ -3239,6 +3282,79 @@ mod tests {
         // close() must still succeed; env_check_leaks only warns (side effect).
         // There are no *tracked* active transactions, so the active-txn guard
         // does not block the close.
+        env.close().unwrap();
+    }
+
+    // R-LIVEDDL-711 (S3) WITNESS: a panic inside the inner op of an
+    // auto-commit catalog operation must NOT leak the NameLN lock.
+    //
+    // RED (pre-RAII, `let result = op(); release(); result;`): the panic
+    // unwinds past the manual release, so the throwaway auto-commit locker
+    // keeps the WRITE lock on `name_lock_id("x")` forever.  A subsequent
+    // auto-commit `remove_database(None, "x")` then takes the same WRITE lock
+    // blocking, finds it held by the dead locker, and BLOCKS to the lock
+    // timeout (`LockTimeout`) -- the database is permanently un-removable.
+    //
+    // GREEN (with `AutoNameLockGuard`): the guard releases on unwind, the lock
+    // is not leaked, and the later remove succeeds promptly.
+    #[test]
+    fn test_name_lock_released_on_panic_in_auto_commit_op() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let (_temp_dir, config) = temp_env_config();
+        let env = Environment::open(config).unwrap();
+        let db_cfg = DatabaseConfig::new().with_allow_create(true);
+        // Create "x" so the later remove targets a real database.
+        {
+            let db = env.open_database(None, "x", &db_cfg).unwrap();
+            drop(db);
+        }
+
+        let name_lock = noxu_util::Lsn::name_lock_id("x");
+
+        // Drive a panic through the exact auto-commit lock path (private
+        // method, reachable from this in-module test).  The op panics while
+        // the throwaway locker holds the WRITE lock on name_lock_id("x").
+        let caught = catch_unwind(AssertUnwindSafe(|| {
+            let _ = env.with_name_record_lock::<()>(
+                "x",
+                LockType::Write,
+                /*non_blocking=*/ false,
+                || {
+                    panic!(
+                        "injected panic while holding the auto-commit name lock"
+                    )
+                },
+            );
+        }));
+        assert!(caught.is_err(), "the injected op must have panicked");
+
+        // The name lock must NOT be leaked: no owner holds name_lock_id("x").
+        {
+            let env_impl = env.env_impl.lock();
+            let leaks = env_impl.get_lock_manager().report_leaked_locks();
+            assert!(
+                !leaks.iter().any(|(lsn, _owners)| *lsn == name_lock),
+                "the auto-commit name lock leaked after a panic in op(): {leaks:?}"
+            );
+        }
+
+        // And the database must still be removable -- promptly, not after a
+        // lock-timeout block.  (On the buggy build this call blocks on the
+        // stranded WRITE lock and fails with LockTimeout / hangs.)
+        let start = std::time::Instant::now();
+        let rc = env.remove_database(None, "x");
+        let elapsed = start.elapsed();
+        assert!(
+            rc.is_ok(),
+            "remove_database(None, x) after a panicked op must succeed, \
+             got {rc:?} (the name lock leaked)"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "remove_database took {elapsed:?} -- it blocked on a leaked name lock"
+        );
+
         env.close().unwrap();
     }
 
