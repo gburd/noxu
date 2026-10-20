@@ -245,6 +245,17 @@ impl Lsn {
     ///
     /// # Stability
     ///
+    /// NOTE: the lock id is a 32-bit FNV-1a hash in its low bits, so two
+    /// DISTINCT names CAN collide onto the same lock-id (e.g. `"costarring"`
+    /// and `"liquid"`, both `0x5e4daa9d`).  A collision causes only FALSE
+    /// CONTENTION -- a spurious, typed, retryable `LockTimeout` /
+    /// `DeadlockDetected` between two unrelated names; it NEVER loses or
+    /// corrupts data and never aliases a real LSN (reserved `0xFFFF_FFFD`).
+    /// JE locks the NameLN *record* and so has no false collisions; a fully
+    /// collision-free id (the committed NameLN slot LSN, as v8 uses) is the
+    /// follow-up.  It is collision-free only among synthetic lock-id
+    /// *families* and against real LSNs -- NOT among names.
+    ///
     /// The returned id is a pure function of `name`, computed on the fly at
     /// each call site — there is no side-map to keep consistent.  The name
     /// string is immutable for as long as a transaction holds its DDL lock, so

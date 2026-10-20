@@ -28,6 +28,8 @@
 //! with records lost) because such an outcome violates the count set, and it
 //! catches a lock-protocol defect (deadlock / unbounded block / untyped error).
 
+#![allow(clippy::doc_lazy_continuation)]
+
 use noxu_db::{DatabaseConfig, Environment, EnvironmentConfig, NoxuError};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -177,10 +179,10 @@ fn run_seed(seed: u64) {
                     Ok(()) => {
                         // A typed conflict on commit is also acceptable.
                         if commit {
-                            if let Err(e) = txn.commit() {
-                                if !is_acceptable(&e) {
-                                    return Err(format!("commit: {e:?}"));
-                                }
+                            if let Err(e) = txn.commit()
+                                && !is_acceptable(&e)
+                            {
+                                return Err(format!("commit: {e:?}"));
                             }
                         } else {
                             let _ = txn.abort();
