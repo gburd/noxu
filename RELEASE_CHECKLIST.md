@@ -43,8 +43,14 @@ Complete all items before publishing a release.
 ## Release Process
 
 1. Update version in workspace `Cargo.toml`
-2. Update CHANGELOG.md
-3. Create git tag: `git tag -a v0.x.y -m "Release v0.x.y"`
-4. Push tag: `git push origin v0.x.y`
-5. CI builds and publishes crates
-6. Verify crates appear on crates.io
+2. Bump the internal `noxu-*` entries under `[workspace.dependencies]` to an
+   exact pin of the new version (for example `version = "=X.Y.Z"`). The internal
+   crates are lock-step versioned; a caret requirement (for example `"7.10.1"`)
+   lets a published crate resolve an older sibling from crates.io that lacks the
+   new release's internal APIs, so the exact pin is required. Leave the external
+   `quoracle` requirement unchanged.
+3. Update CHANGELOG.md
+4. Create git tag: `git tag -a v0.x.y -m "Release v0.x.y"`
+5. Push tag: `git push origin v0.x.y`
+6. CI builds and publishes crates
+7. Verify crates appear on crates.io

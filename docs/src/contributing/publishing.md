@@ -52,6 +52,20 @@ Confirm the workspace version matches the release tag:
 grep '^version' Cargo.toml   # should print: version = "X.Y.Z"
 ```
 
+Confirm the internal `noxu-*` entries under `[workspace.dependencies]` are
+exact-pinned to the release version (not a caret range). The internal crates
+are lock-step versioned, so each must require exactly the version being
+published; otherwise a published crate could resolve an older sibling from
+crates.io that lacks this release's internal APIs:
+
+```bash
+# every internal noxu-* line should read version = "=X.Y.Z"
+grep -E '^noxu[a-z-]* *= *\{ version' Cargo.toml
+```
+
+The external `quoracle` requirement is left unchanged (it resolves to its own
+latest compatible published version).
+
 Run the full CI suite locally before publishing:
 
 ```bash

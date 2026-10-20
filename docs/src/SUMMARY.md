@@ -84,6 +84,7 @@
   - [Performance Benchmarks](operations/benchmarks.md)
   - ["Where Noxu Leads" Benchmarks](operations/lead-benchmarks.md)
   - [Known Limitations](operations/known-limitations.md)
+  - [Security / Data-Integrity Advisory — v7.11.0](operations/security-advisory-v7.11.0.md)
 
 ---
 

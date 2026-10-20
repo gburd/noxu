@@ -16,7 +16,7 @@ listed in [References](#references).
 
 ## [Unreleased]
 
-## [7.11.1] - unreleased (release candidate)
+## [7.11.1] - 2026-10-20
 
 v7.11.1 is a **patch release** from v7.11.0: bug fixes only, with no on-disk
 format change (`LOG_VERSION` stays 3), no new log entry type, and no
@@ -34,9 +34,9 @@ method is non-breaking (SemVer policy §"not breaking";
 
 **Upgrade strongly recommended.** This release closes several silent
 data-loss holes reachable with default settings on small or cache-pressured
-environments. See the advisories
-`advisory-cleaner-live-file.md` and `advisory-live-ln-reclaim.md` for
-user-facing scope, symptoms, and preconditions.
+environments. See the consolidated
+[Security / Data-Integrity Advisory — v7.11.0](docs/src/operations/security-advisory-v7.11.0.md)
+for user-facing scope, symptoms, and preconditions of every fixed defect.
 
 ### Fixed — data loss (UPGRADE STRONGLY RECOMMENDED)
 
@@ -229,6 +229,80 @@ user-facing scope, symptoms, and preconditions.
   is fixed in the same release.
 
 ### Fixed — isolation
+
+- **DDL inside a prepared XA transaction was wrongly resolved across a crash**
+  (`R-XADDL-711`, data integrity / isolation S2): a database CREATE, REMOVE or
+  RENAME performed inside an XA transaction that reached `prepare` (phase 1)
+  and was then resolved across a crash — the mandatory `xa_recover()` reopen
+  followed by `xa_commit` / `xa_rollback` — was wrongly resolved. A committed
+  REMOVE left the database resurrected with all its records; a committed RENAME
+  left it under both the old and new names; a prepared branch carrying more
+  than one DDL op had its committed removals/renames silently undone; and while
+  a branch was in doubt a concurrent CREATE, REMOVE, RENAME, TRUNCATE or OPEN
+  of the affected name was accepted as though the branch had already committed
+  — a concurrent truncate of an in-doubt-remove database then lost that
+  database's records on a subsequent rollback. Root cause: a NameLN (the
+  catalog log entry a DDL op writes) was not collected, relocked, or resolved
+  for a recovered prepared branch, and the post-recovery checkpoint's catalog
+  relog could reinstate the victim past its delete tombstone. (In v7.11.0 the
+  failure mode was worse: a transactional remove/rename logged nothing at
+  prepare time, so the prepared branch vanished entirely across a crash — an XA
+  prepare-durability violation.) Fixed by collecting a prepared transaction's
+  NameLNs during recovery and reconstructing the in-doubt catalog state per
+  NameLN (rename paired by database id), marking the removed/renamed-away names
+  so the checkpoint relog cannot resurrect them, and making every catalog
+  operation on an in-doubt name conflict until the branch resolves —
+  mirroring JE's resurrected-`PreparedTxn` handling (`RecoveryManager` per-LN
+  redo/relock and `Txn.commit`/`abort` over all the branch's databases). No
+  on-disk format or public-API change. Witnesses added (`xa_ddl_711`, 25 cases
+  incl. a 30-seed multi-op fuzz), RED on the prior single-op fix and GREEN
+  after, both arches.
+
+- **Concurrent catalog DDL took no lock on the name record, losing committed
+  data on abort** (`R-LIVEDDL-711`, data integrity / isolation S2): a database
+  REMOVE, RENAME or TRUNCATE performed inside a transaction took no lock on the
+  catalog name record, so a concurrent auto-commit REMOVE, RENAME, TRUNCATE or
+  OPEN of the same database was not serialised against the uncommitted
+  operation. If the transaction then aborted, the concurrent operation's effect
+  was already applied and the rollback could not undo it — the database was
+  left gone or empty, losing committed records. (The same hole exists on all of
+  v7.11.x, including v7.11.0; it is pre-existing on the whole 7.11.x line.)
+  Fixed by taking a lock on the name record for the lifetime of the DDL — a
+  blocking WRITE for remove/rename/truncate (a concurrent catalog op blocks or
+  fails with a typed, retryable lock error) and a non-blocking (fail-fast) read
+  for open (a concurrent open of a name a transaction is removing/renaming
+  fails immediately with a lock conflict; JE instead blocks the open on the
+  NameLN read lock — v8 restores the blocking read, so the wait-vs-refuse
+  behaviour of open is a documented 7.11.x deviation). `database_names()` stays
+  lock-free. A transaction holding such a DDL and a recovered in-doubt
+  prepared-XA DDL share the one name-record lock — matching JE's
+  `DbTree.lockNameLN` (WRITE) for remove/rename/truncate and the resurrected
+  prepared transaction's NameLN relock. The lock id is a per-name synthetic id;
+  two distinct names with equal 32-bit hashes may false-contend (a typed,
+  retryable conflict, never data loss). No on-disk format or public-API change.
+  Witnesses added (`liveddl_711` 10-case matrix + `liveddl_concurrent_fuzz`
+  30-seed fuzz), RED on v7.11.0 / the RC and GREEN after the fix, both arches.
+
+- **READ_COMMITTED (or weaker) readers could return an uncommitted insert's
+  value under concurrent inserts on ≥ 2 cores** (`R-LATCHLOCK`, isolation S2):
+  a `READ_COMMITTED` (or weaker, including the default lock mode) point get,
+  cursor scan, RMW read, or secondary read of a key that a concurrent
+  transaction was inserting could return the *uncommitted* inserted value
+  when the read and the insert ran on two or more CPU cores at the same
+  instant. The value could subsequently abort, so the reader could act on
+  data that never committed. Root cause: a reader-side TOCTOU — the read path
+  resolved the slot (LSN + data) under the BIN latch, **dropped the latch**,
+  then attempted the record lock and ran its stale-checks **unlatched**, so
+  there was no happens-before edge ordering the inserter's lock-table write
+  (lock-before-publish) against the reader's lock-table read; a reader could
+  observe the published new LSN yet miss the inserter's WRITE lock and return
+  the prefetched uncommitted bytes. Fixed to JE parity (`CursorImpl.lockLN`):
+  the record lock is now acquired **while the BIN is latched** at every
+  data-returning read site, so a reader that sees a published-but-uncommitted
+  record also sees the inserter's write lock and blocks until it commits or
+  aborts (returning only committed data). No on-disk format or public-API
+  change. Witnesses added (point get + RC scan + RMW + secondary), RED on
+  v7.11.0 / the RC and GREEN after the fix under 2-core load.
 
 - **A reader could momentarily see `NOTFOUND` for a record that is always
   present under a concurrent atomic update** (`R-SECREAD-NOTFOUND`): while a
@@ -670,6 +744,57 @@ checkpoint-serial/flush-levels machinery). These crates carry **no stability
 guarantee** and may change in any release; the nine Stable /
 Stable-foundational crates are unchanged at the public-API level
 (`cargo-semver-checks`: 9/9 "no semver update required" vs v7.11.0).
+
+### Known issues / deferred to v7.11.2
+
+Small, patch-safe follow-ups recorded during the v7.11.1 review cycle. None is a
+data-loss, durability, or liveness defect; each is a fidelity or classification
+refinement safe to land in the next patch.
+
+- **FID-711-SECDEL-ERRTYPE (S4).** Secondary-database maintenance flattens
+  typed lock errors (deadlock / lock-timeout) into a single string-valued
+  `NoxuError::OperationNotAllowed` at 11 sites in `secondary_database.rs`
+  (lines 310, 396, 400, 474, 527, 541, 607, 632, 1456, 1461, 1502). This is
+  **not** data loss — the enclosing transaction aborts — but it mis-classifies a
+  retryable lock conflict as a non-retryable operation error, so a caller that
+  keys its retry logic on the typed error cannot tell a transient deadlock /
+  lock timeout from a genuine refusal. The fix (surface the typed
+  deadlock / lock-timeout error unchanged) is mechanical but spans 11 sites and
+  is deferred to v7.11.2.
+- **OBS-1 (documentation).** The R-LATCHLOCK review brief asserted that the
+  engine has "no lock-skipping fast path for locking reads." That premise is
+  inaccurate — the locking read path does take an uncontended-lock fast path
+  (faithfully ported) — so the brief's wording, not the code, is what needs
+  correcting. No code change; a documentation clean-up deferred to v7.11.2.
+- **R-XARECOVERED `env.close()` permissiveness (S5).** `Environment::close()`
+  succeeds when an **unresolved recovered in-doubt XA transaction** is still
+  outstanding, rather than refusing the close. This is **data-safe**: the
+  in-doubt transaction remains durable across close + reopen and is still
+  resolvable (commit / rollback / forget) afterwards. It is a close-permissiveness
+  fidelity gap only — a strict environment would refuse to close while an
+  in-doubt branch is outstanding — recorded for v7.11.2.
+- **FID-711-NAMELOCK-HASH (S4).** The catalog name-record lock introduced for
+  `R-LIVEDDL-711` keys on a 32-bit FNV-1a hash of the database name
+  (`Lsn::name_lock_id`), which is **not** collision-free among names: two
+  distinct names with equal 32-bit hashes (for example `"costarring"` and
+  `"liquid"`) share one lock-table slot. A collision is **safety-preserving** —
+  it can only produce a spurious, typed, retryable lock conflict
+  (`LockTimeout` / `DeadlockDetected`), never data loss, a wrong read, or a
+  hang. The fix is a collision-free name lock id derived from the NameLN record
+  identity (v8 uses the NameLN record's slot LSN, matching JE, whose conflict
+  unit is the NameLN record and so has no false collisions); deferred to
+  v7.11.2.
+- **FID-711-OPEN-FAILFAST (S4).** For `R-LIVEDDL-711`, OPEN of a name a
+  concurrent transaction is removing/renaming takes a **non-blocking
+  (fail-fast)** read of the name record and returns a typed lock conflict
+  immediately, whereas JE's `DbTree.getDb` takes a **blocking** READ on the
+  NameLN and waits for the holder to resolve. Fail-fast open is data-safe (open
+  is read-only; it cannot lose or corrupt data) but is a wait-vs-refuse
+  fidelity deviation; remove / rename / truncate already block as JE does. v8
+  restores the blocking open read; deferred to v7.11.2.
+- **FID-THREADLOCKER-SHARE (S3)** is already recorded below under *deferred to
+  v8.0.0* (thread-local lock sharing for non-transactional lockers needs the
+  v8.0.0 locker rework and is not patch-safe).
 
 ### Known issues / deferred to v8.0.0
 
