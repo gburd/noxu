@@ -230,6 +230,55 @@ user-facing scope, symptoms, and preconditions.
 
 ### Fixed — isolation
 
+- **A reader could momentarily see `NOTFOUND` for a record that is always
+  present under a concurrent atomic update** (`R-SECREAD-NOTFOUND`): while a
+  transaction atomically deleted-and-reinserted the same key (the classic
+  `SecondaryMultiTest.testMultiReadUpdate` pattern), a concurrent reader of
+  that key could observe a transient `NOTFOUND`, even though the key is never
+  logically absent. Two layers: (A) a PRIMARY exact read of a
+  defunct-at-descent slot returned `NOTFOUND` without locking the in-flight
+  deleter; fixed to route it through JE's `lockLN` /
+  `lockLNAndCheckDefunct` loop (block on the deleter, revert + re-lock the
+  current LSN, unbounded), so the reader blocks until commit and then sees the
+  live reinsert. (B) a VIA-SECONDARY read (the secondary index is a
+  SORTED-DUP DB) skipped the PENDING-deleted `(sec_key, pri_key)` dup slot
+  during the secondary-maintenance delete+readd window — its two-part-key seek
+  used a predicate that excluded PENDING_DELETED, so it returned `NOTFOUND`
+  without ever locking the deleter. Fixed so the dup seek lands on a
+  PENDING-deleted slot (skipping only KNOWN_DELETED / TTL-expired, per JE
+  `CursorImpl.lockAndGetCurrent`, CursorImpl.java:2060-2064) and routes it
+  through the same lock-and-revalidate path; an exact `Set`/`Both` search that
+  advances off a defunct match now re-checks the key match rather than
+  crossing to a different key (JE `searchExact` returns `KEYEMPTY`, never the
+  next key's record). **Present since v7.11.0** (`b17f8258`): v7.11.0 had no
+  PENDING_DELETED concept, so the read paths treated an uncommitted-deleted
+  slot as absent instead of locking the deleter. No on-disk format change
+  (LOG_VERSION stays 3). **Advisory:** the window is only observed under
+  genuine read/update concurrency on the same key (direct or via a secondary
+  index); it is a transient wrong-`NOTFOUND`, not data loss or corruption, and
+  the correct value is returned once the updater commits. Combined Layer A+B
+  deterministic witness (`secdup_pd_witness`) plus the ported
+  `SecondaryMultiTest` multi-read family (`je_secondary_multi_test`).
+
+- **A concurrent insert of a brand-new key could raise a spurious
+  `SecondaryIntegrityException`** (`NEW-SECMAINT-OLDDATA-TOCTOU`): on a
+  database with a secondary index, two transactions inserting the SAME
+  brand-new primary key concurrently both read the secondary-maintenance
+  pre-image (`old_data`) as absent BEFORE the primary write took its slot
+  lock, so after the lock serialised them the loser re-inserted an identical
+  `(sec_key, pri_key)` duplicate and raised `SecondaryIntegrityException`.
+  Fixed to read the pre-image UNDER the primary's write lock (JE
+  `Cursor.putNotify` reads the old LN inside the locked slot), so the second
+  writer blocks on the shared key-coordination lock, sees the first's
+  committed record as `old_data`, and performs a correct update with no
+  duplicate secondary insert. **Present since v7.11.0** (`b17f8258`).
+  **Advisory:** this raised a loud, cleanly-aborting error (the enclosing
+  transaction aborted); it did **not** invalidate the environment, mark the
+  secondary corrupt, or produce an orphan secondary entry — a permanent
+  integrity witness (`sec_orphan_witness`, concurrent same-key writes with
+  distinct secondary keys) confirms no orphan is ever produced. JE never
+  raises this under ordinary concurrency.
+
 - **Cursor scans dirty-read an uncommitted delete / insert-abort**
   (`FID-CURSOR-1`, `FID-CURSOR-7`): a `getNext`/`getPrev` scan skipped a
   deleted-but-uncommitted slot WITHOUT taking the record lock, so it dirty-read
