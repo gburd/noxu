@@ -27,7 +27,7 @@ fn check(tree: &Tree, probe: &[u8], want: Option<Vec<u8>>) {
         want,
         "first_entry_at_or_after({probe:?})"
     );
-    let r = tree.first_entry_at_or_after_with_index(probe);
+    let r = tree.first_entry_at_or_after_with_index(probe, true);
     assert_eq!(
         r.as_ref().map(|r| r.0.clone()),
         want,
