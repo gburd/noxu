@@ -3,6 +3,7 @@
 
 use crate::analysis_result::{PreparedLnReplay, PreparedTxnInfo};
 use crate::checkpoint_end::CheckpointEnd;
+use crate::log_scanner::NameLnRecord;
 use noxu_util::{Lsn, NULL_LSN};
 use std::fmt;
 
@@ -75,6 +76,19 @@ pub struct RecoveryInfo {
     /// Stored as raw byte vectors instead of `LnRecord` so this struct
     /// stays self-contained (`LnRecord` borrows lifetime-bound `Bytes`).
     pub prepared_txn_lns: hashbrown::HashMap<u64, Vec<PreparedLnReplay>>,
+
+    /// R-XADDL-711 (S2): NameLN / NameLNTxn entries belonging to each
+    /// unresolved prepared (in-doubt XA) transaction, in WAL order, keyed by
+    /// txn_id.  A NameLN is an ordinary transactional LN of the name database
+    /// (JE RecoveryManager.undoLNs resurrects a prepared txn's LNs -- NameLN
+    /// included -- and relocks them, RecoveryManager.java:1603/2205), so a
+    /// prepared DDL op's NameLN must be collected exactly like its data LNs.
+    /// EnvironmentImpl::new reconstructs the in-doubt catalog state (pending
+    /// create / pending remove-or-rename + pending_ddl_names) from these and
+    /// resolves them when xa_commit / xa_rollback runs the recovered branch's
+    /// commit/abort (the live DDL commit/abort callback equivalent).  Empty
+    /// when no prepared txn performed a DDL op.
+    pub prepared_txn_name_lns: hashbrown::HashMap<u64, Vec<NameLnRecord>>,
 
     /// Database name → database ID mappings recovered from `NameLN` / `NameLNTxn`
     /// WAL entries.  Populated by the analysis pass and consumed by
@@ -196,6 +210,7 @@ impl RecoveryInfo {
             use_min_replicated_txn_id: 0,
             recovered_prepared_txns: Vec::new(),
             prepared_txn_lns: hashbrown::HashMap::new(),
+            prepared_txn_name_lns: hashbrown::HashMap::new(),
             recovered_db_names: hashbrown::HashMap::new(),
             recovered_db_comparators: hashbrown::HashMap::new(),
             recovered_db_fanouts: hashbrown::HashMap::new(),

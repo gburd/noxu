@@ -2213,6 +2213,16 @@ impl Environment {
                 }
             }
         }
+        // R-XADDL-711 (S2): resolve any CATALOG (DDL) action this recovered
+        // prepared branch carried -- run the SAME live-DDL commit callback
+        // (commit_pending_database / remove_database_if_id /
+        // rename_database_if_id + clear_pending_ddl).  After the durable
+        // TxnCommit above, mirroring the live callback order (physical catalog
+        // cleanup runs post-commit).
+        self.env_impl
+            .lock()
+            .resolve_recovered_prepared_ddl(txn_id, /* commit = */ true)
+            .map_err(NoxuError::from)?;
         Ok(())
     }
 
@@ -2236,8 +2246,16 @@ impl Environment {
             true,  /* fsync */
             true,  /* flush */
             0,     /* vlsn: NULL_VLSN for abort */
-        )
-        .map(|_| ())
+        )?;
+        // R-XADDL-711 (S2): resolve any CATALOG (DDL) action this recovered
+        // branch carried as a ROLLBACK -- the live-DDL abort callback
+        // (abort_pending_database for a pending create / in-doubt rename
+        // target; clear_pending_ddl for remove/rename -- old name survives).
+        self.env_impl
+            .lock()
+            .resolve_recovered_prepared_ddl(txn_id, /* commit = */ false)
+            .map_err(NoxuError::from)?;
+        Ok(())
     }
 
     /// Resolves a recovered prepared transaction's LNs at `xa_commit` time.
