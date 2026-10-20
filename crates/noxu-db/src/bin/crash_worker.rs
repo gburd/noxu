@@ -1951,6 +1951,375 @@ fn main() {
         // common setup above DID open "test" (a write) -- so for a faithful
         // read-only probe use the witness/test harness, not this.  This mode
         // instead prints names immediately then exits.
+        // ============================================================
+        // R-XADDL-711 v2 re-review ADVERSARIAL modes (independent, no reuse).
+        // ============================================================
+
+        // RVX-1: a prepared branch whose ops touch the SAME name more than
+        // once: create "a"(8 recs) -> rename a->b -> create "a" again(3 recs)
+        // -> remove pre-existing "e".  Commit ground-truth: b present(8 - a's
+        // first-create records, renamed keeps db_id), a present(3 - the SECOND
+        // create), e gone.  Exercises create/rename-source/create on one name
+        // in one branch (db_id pairing MUST pair the first a-delete with the
+        // b-create, NOT with the second a-create).
+        "rvx_same_name_twice_prepare" => {
+            {
+                let vtxn = env.begin_transaction(None).expect("seed txn");
+                let e = env
+                    .open_database(Some(&vtxn), "e", &db_config)
+                    .expect("create e");
+                for i in 0u32..8 {
+                    e.put_in(
+                        &vtxn,
+                        DatabaseEntry::from_bytes(&i.to_be_bytes()),
+                        DatabaseEntry::from_bytes(&xarec_payload(i)),
+                    )
+                    .expect("seed e");
+                }
+                e.close().ok();
+                vtxn.commit().expect("commit seed");
+            }
+            // Seed committed "a"(8) alongside e so the rename a->b has a
+            // committed source (a create-then-rename of an uncommitted name in
+            // one branch is a separate pre-existing deferred-DDL limitation, not
+            // under test here).  The second create of "a" reuses the freed name.
+            {
+                let vtxn2 = env.begin_transaction(None).expect("seed a txn");
+                let a0 = env
+                    .open_database(Some(&vtxn2), "a", &db_config)
+                    .expect("create a0");
+                for i in 0u32..8 {
+                    a0.put_in(
+                        &vtxn2,
+                        DatabaseEntry::from_bytes(&i.to_be_bytes()),
+                        DatabaseEntry::from_bytes(&xarec_payload(i)),
+                    )
+                    .expect("seed a0");
+                }
+                a0.close().ok();
+                vtxn2.commit().expect("commit seed a");
+            }
+            let txn = env.begin_transaction(None).expect("begin tr");
+            env.rename_database(Some(&txn), "a", "b").expect("rename a->b");
+            let a2 = env
+                .open_database(Some(&txn), "a", &db_config)
+                .expect("create a2");
+            for i in 0u32..3 {
+                a2.put_in(
+                    &txn,
+                    DatabaseEntry::from_bytes(&i.to_be_bytes()),
+                    DatabaseEntry::from_bytes(&xarec_payload(i)),
+                )
+                .expect("put a2");
+            }
+            a2.close().ok();
+            env.remove_database(Some(&txn), "e").expect("remove e");
+            txn.prepare(1, b"rvx_gtrid", b"same_twice")
+                .expect("prepare same_twice");
+            std::mem::forget(txn);
+            flag(&dir, "firstlsn_done");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        // RVX-2: TWO in-doubt branches touching DIFFERENT names, resolved in
+        // OPPOSITE order.  Branch "p" removes pre-existing "p"(8); branch "q"
+        // removes pre-existing "q"(8).  After recover, COMMIT q FIRST then
+        // COMMIT p.  Both removals must take effect regardless of order.
+        "rvx_two_branches_prepare" => {
+            {
+                let vtxn = env.begin_transaction(None).expect("seed txn");
+                for nm in ["p", "q"] {
+                    let d = env
+                        .open_database(Some(&vtxn), nm, &db_config)
+                        .expect("create");
+                    for i in 0u32..8 {
+                        d.put_in(
+                            &vtxn,
+                            DatabaseEntry::from_bytes(&i.to_be_bytes()),
+                            DatabaseEntry::from_bytes(&xarec_payload(i)),
+                        )
+                        .expect("seed");
+                    }
+                    d.close().ok();
+                }
+                vtxn.commit().expect("commit seed");
+            }
+            let tp = env.begin_transaction(None).expect("begin p");
+            env.remove_database(Some(&tp), "p").expect("remove p");
+            tp.prepare(1, b"rvx_gtrid", b"br_p").expect("prepare p");
+            std::mem::forget(tp);
+            let tq = env.begin_transaction(None).expect("begin q");
+            env.remove_database(Some(&tq), "q").expect("remove q");
+            tq.prepare(1, b"rvx_gtrid", b"br_q").expect("prepare q");
+            std::mem::forget(tq);
+            flag(&dir, "firstlsn_done");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        // RVX-2 resolve: commit the branch that removed "q" FIRST, then the
+        // branch that removed "p".  (bqual "br_q"/"br_p" identifies them.)
+        "rvx_two_branches_resolve_qp" => {
+            let prepared = env.recovered_prepared_txns();
+            assert_eq!(prepared.len(), 2, "rvx_two_branches: two prepared");
+            // Identify each branch by its recovered bqual.
+            let mut txn_q: Option<u64> = None;
+            let mut txn_p: Option<u64> = None;
+            for pt in &prepared {
+                let bq = String::from_utf8_lossy(&pt.xid_bqual).to_string();
+                if bq == "br_q" {
+                    txn_q = Some(pt.txn_id);
+                } else if bq == "br_p" {
+                    txn_p = Some(pt.txn_id);
+                }
+            }
+            let txn_q = txn_q.expect("found br_q");
+            let txn_p = txn_p.expect("found br_p");
+            // Commit q FIRST.
+            let lq = env.take_recovered_prepared_lns(txn_q);
+            env.apply_recovered_prepared_lns(&lq).expect("apply q");
+            env.write_txn_commit_for_recovered(txn_q).expect("commit q");
+            env.forget_recovered_prepared_txn(txn_q);
+            // Then commit p.
+            let lp = env.take_recovered_prepared_lns(txn_p);
+            env.apply_recovered_prepared_lns(&lp).expect("apply p");
+            env.write_txn_commit_for_recovered(txn_p).expect("commit p");
+            env.forget_recovered_prepared_txn(txn_p);
+            flag(&dir, "firstlsn_done");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        // RVX-3: in-doubt branch, then a CLEAN env.close(), then REOPEN, then
+        // resolve.  A prepared REMOVE "x"(8) survives a clean close+reopen
+        // while still in doubt, is re-surfaced by xa_recover, and commits.
+        // (The close() runs a final checkpoint; the branch must still resolve.)
+        "rvx_close_reopen_resolve" => {
+            // Phase keyed by a flag so the SAME mode can drive both opens.
+            if !dir.join("rvx3_first_done").exists() {
+                let prepared = env.recovered_prepared_txns();
+                assert_eq!(
+                    prepared.len(),
+                    1,
+                    "rvx3: one prepared on first open"
+                );
+                // Clean close WHILE in doubt (final checkpoint runs).
+                env.close().ok();
+                flag(&dir, "rvx3_first_done");
+                flag(&dir, "firstlsn_done");
+            } else {
+                // Second open: branch must still be in doubt; commit it.
+                let prepared = env.recovered_prepared_txns();
+                assert_eq!(
+                    prepared.len(),
+                    1,
+                    "rvx3: branch must survive clean close+reopen in doubt"
+                );
+                let txn_id = prepared[0].txn_id;
+                let lns = env.take_recovered_prepared_lns(txn_id);
+                env.apply_recovered_prepared_lns(&lns).expect("apply");
+                env.write_txn_commit_for_recovered(txn_id).expect("commit");
+                env.forget_recovered_prepared_txn(txn_id);
+                flag(&dir, "firstlsn_done");
+                loop {
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+
+        // RVX-4: resolve a committed in-doubt REMOVE "x" WHILE another thread
+        // repeatedly opens "x".  Before resolution every open must conflict
+        // (DatabaseInUse); after resolution opens of the removed name must
+        // fail cleanly (NotFound) -- never panic, deadlock, or succeed as a
+        // live handle on a removed db.  The opener loops for a bounded time.
+        "rvx_resolve_vs_concurrent_open" => {
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+            let prepared = env.recovered_prepared_txns();
+            assert_eq!(prepared.len(), 1, "rvx4: one prepared");
+            let txn_id = prepared[0].txn_id;
+            let env = Arc::new(env);
+            let stop = Arc::new(AtomicBool::new(false));
+            let inuse = Arc::new(AtomicU64::new(0));
+            let notfound = Arc::new(AtomicU64::new(0));
+            let other = Arc::new(AtomicU64::new(0));
+            let opened_ok = Arc::new(AtomicBool::new(false));
+            let mut handles = Vec::new();
+            for _ in 0..4 {
+                let env = Arc::clone(&env);
+                let stop = Arc::clone(&stop);
+                let inuse = Arc::clone(&inuse);
+                let notfound = Arc::clone(&notfound);
+                let other = Arc::clone(&other);
+                let opened_ok = Arc::clone(&opened_ok);
+                handles.push(thread::spawn(move || {
+                    let cfg = DatabaseConfig::new()
+                        .with_allow_create(false)
+                        .with_transactional(true);
+                    while !stop.load(Ordering::SeqCst) {
+                        match env.open_database(None, "x", &cfg) {
+                            Ok(d) => {
+                                opened_ok.store(true, Ordering::SeqCst);
+                                let _ = d.close();
+                            }
+                            Err(e) => {
+                                let s = format!("{e:?}");
+                                // R-LIVEDDL-711 (ONE MECHANISM): an open of an
+                                // in-doubt name is now refused by the real
+                                // NameLN READ lock -> `LockConflict` (the JE
+                                // `DatabasePreemptedException` analogue), the
+                                // former lock-free path returned `DatabaseInUse`.
+                                // Count either as the in-doubt refusal.
+                                if s.contains("InUse")
+                                    || s.contains("in use")
+                                    || s.contains("LockConflict")
+                                    || s.contains("Conflict")
+                                    || s.contains("LockTimeout")
+                                {
+                                    inuse.fetch_add(1, Ordering::SeqCst);
+                                } else if s.contains("NotFound")
+                                    || s.contains("does not exist")
+                                {
+                                    notfound.fetch_add(1, Ordering::SeqCst);
+                                } else {
+                                    other.fetch_add(1, Ordering::SeqCst);
+                                }
+                            }
+                        }
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                }));
+            }
+            // Let the openers run against the in-doubt name.
+            thread::sleep(Duration::from_millis(200));
+            let before_inuse = inuse.load(Ordering::SeqCst);
+            // Resolve (commit the removal) while they hammer.
+            let lns = env.take_recovered_prepared_lns(txn_id);
+            env.apply_recovered_prepared_lns(&lns).expect("apply");
+            env.write_txn_commit_for_recovered(txn_id).expect("commit");
+            env.forget_recovered_prepared_txn(txn_id);
+            // Let them observe the post-resolution state.
+            thread::sleep(Duration::from_millis(200));
+            stop.store(true, Ordering::SeqCst);
+            for h in handles {
+                let _ = h.join();
+            }
+            flag(
+                &dir,
+                &format!(
+                    "rvx4_before_inuse_{}",
+                    if before_inuse > 0 { 1 } else { 0 }
+                ),
+            );
+            flag(
+                &dir,
+                &format!(
+                    "rvx4_opened_ok_{}",
+                    if opened_ok.load(Ordering::SeqCst) { 1 } else { 0 }
+                ),
+            );
+            flag(
+                &dir,
+                &format!("rvx4_notfound_{}", notfound.load(Ordering::SeqCst)),
+            );
+            flag(&dir, &format!("rvx4_other_{}", other.load(Ordering::SeqCst)));
+            flag(&dir, "firstlsn_done");
+        }
+
+        // RVX-5: LIVE (no crash, no XA) analogue of FID-RF1V2-1.  Txn T does
+        // remove("x") (x pre-existing, 8 recs) but does NOT commit; a
+        // concurrent op (truncate / remove / open) hits "x"; then T ABORTS.
+        // On 7.11.x "x" has no name-record lock (D-ADDITIVE-SAFETY #18) and the
+        // LIVE deferred remove is deliberately NOT blocked.  Records the
+        // concurrent op's outcome + x's final record count so the test can
+        // judge whether the live case loses data.  op selected by $RVX5_OP.
+        "rvx_live_remove_concurrent_then_abort" => {
+            use std::sync::Arc;
+            let op = env::var("RVX5_OP").unwrap_or_else(|_| "truncate".into());
+            {
+                let vtxn = env.begin_transaction(None).expect("seed txn");
+                let x = env
+                    .open_database(Some(&vtxn), "x", &db_config)
+                    .expect("create x");
+                for i in 0u32..8 {
+                    x.put_in(
+                        &vtxn,
+                        DatabaseEntry::from_bytes(&i.to_be_bytes()),
+                        DatabaseEntry::from_bytes(&xarec_payload(i)),
+                    )
+                    .expect("seed x");
+                }
+                x.close().ok();
+                vtxn.commit().expect("commit seed");
+            }
+            let env = Arc::new(env);
+            // T: uncommitted remove("x").
+            let t = env.begin_transaction(None).expect("begin T");
+            env.remove_database(Some(&t), "x").expect("remove x under T");
+            // Concurrent op from another thread (bounded).
+            let env2 = Arc::clone(&env);
+            #[allow(clippy::redundant_clone)]
+            let op2 = op.clone();
+            let h = thread::spawn(move || -> String {
+                let cfg = DatabaseConfig::new()
+                    .with_allow_create(false)
+                    .with_transactional(true);
+                match op2.as_str() {
+                    "truncate" => match env2.truncate_database(None, "x") {
+                        Ok(n) => format!("truncate_ok_{n}"),
+                        Err(e) => format!("truncate_err_{e:?}"),
+                    },
+                    "remove" => match env2.remove_database(None, "x") {
+                        Ok(()) => "remove_ok".into(),
+                        Err(e) => format!("remove_err_{e:?}"),
+                    },
+                    _ => match env2.open_database(None, "x", &cfg) {
+                        Ok(d) => {
+                            let _ = d.close();
+                            "open_ok".into()
+                        }
+                        Err(e) => format!("open_err_{e:?}"),
+                    },
+                }
+            });
+            let concurrent = h.join().unwrap_or_else(|_| "panic".into());
+            // Now ABORT T -> the remove is rolled back; x must survive intact.
+            t.abort().expect("abort T");
+            // Observe x's live record count (same probe as the test helper:
+            // count the 8 seeded keys whose value matches xarec_payload).
+            let (x_ex, xr) = {
+                let cfg = DatabaseConfig::new()
+                    .with_allow_create(false)
+                    .with_transactional(true);
+                match env.open_database(None, "x", &cfg) {
+                    Ok(d) => {
+                        let t = env.begin_transaction(None).expect("rtxn");
+                        let mut c = 0u32;
+                        for i in 0u32..8 {
+                            let want = xarec_payload(i);
+                            if let Ok(Some(v)) = d.get_in(&t, i.to_be_bytes())
+                                && v[..] == want[..]
+                            {
+                                c += 1;
+                            }
+                        }
+                        t.commit().ok();
+                        let _ = d.close();
+                        (true, c)
+                    }
+                    Err(_) => (false, 0),
+                }
+            };
+            flag(&dir, &format!("rvx5_concurrent_{concurrent}"));
+            flag(&dir, &format!("rvx5_x_ex_{}", if x_ex { 1 } else { 0 }));
+            flag(&dir, &format!("rvx5_xr_{xr}"));
+            flag(&dir, "firstlsn_done");
+        }
+
         "xaddl_dump_ro" => {
             let names = env.database_names().expect("database_names");
             eprintln!("XADDL_DUMP_RO names={names:?}");
@@ -2139,6 +2508,174 @@ fn main() {
                 thread::sleep(Duration::from_millis(50));
             }
         }
+        "rvx_same_name_twice_live" => {
+            // LIVE control for RVX-1: same op sequence (rename a->b, recreate a,
+            // remove e) in ONE txn, committed DIRECTLY (no prepare, no crash).
+            // Isolates whether the recreate-after-rename-away loss is specific
+            // to the recovered in-doubt resolution or a pre-existing live limit.
+            {
+                let vtxn = env.begin_transaction(None).expect("seed");
+                for nm in ["a", "e"] {
+                    let d = env
+                        .open_database(Some(&vtxn), nm, &db_config)
+                        .expect("seed open");
+                    for i in 0u32..8 {
+                        d.put_in(
+                            &vtxn,
+                            DatabaseEntry::from_bytes(&i.to_be_bytes()),
+                            DatabaseEntry::from_bytes(&xarec_payload(i)),
+                        )
+                        .expect("seed put");
+                    }
+                    d.close().ok();
+                }
+                vtxn.commit().expect("commit seed");
+            }
+            let txn = env.begin_transaction(None).expect("begin");
+            env.rename_database(Some(&txn), "a", "b").expect("rename a->b");
+            let a2 = env
+                .open_database(Some(&txn), "a", &db_config)
+                .expect("create a2");
+            for i in 0u32..3 {
+                a2.put_in(
+                    &txn,
+                    DatabaseEntry::from_bytes(&i.to_be_bytes()),
+                    DatabaseEntry::from_bytes(&xarec_payload(i)),
+                )
+                .expect("put a2");
+            }
+            a2.close().ok();
+            env.remove_database(Some(&txn), "e").expect("remove e");
+            txn.commit().expect("commit txn");
+            let names = env.database_names().expect("names");
+            flag(&dir, &format!("rvxlive_names_{}", names.join("-")));
+            env.close().ok();
+            flag(&dir, "firstlsn_done");
+        }
+        // RVX-LIVE: LIVE (no crash, no XA) FID-RF1V2-1 matrix.  Txn T does
+        // a DDL op on pre-existing "x"(8 recs) but does NOT resolve yet; a
+        // concurrent AUTO-COMMIT op (remove / truncate / rename / open) hits
+        // "x"; then T is committed OR aborted per $RVXL_T.  Records the
+        // concurrent op's outcome and x's (or the rename target's) final
+        // record count.  $RVXL_OP in {remove,truncate,rename,open};
+        // $RVXL_T in {abort,commit}.  7.11.x takes no name-record lock on the
+        // LIVE deferred DDL (D-ADDITIVE-SAFETY #18), so this probes whether the
+        // live case loses data.
+        "rvxl_matrix" => {
+            use std::sync::Arc;
+            let op = env::var("RVXL_OP").unwrap_or_else(|_| "remove".into());
+            let decision =
+                env::var("RVXL_T").unwrap_or_else(|_| "abort".into());
+            {
+                let vtxn = env.begin_transaction(None).expect("seed txn");
+                let x = env
+                    .open_database(Some(&vtxn), "x", &db_config)
+                    .expect("create x");
+                for i in 0u32..8 {
+                    x.put_in(
+                        &vtxn,
+                        DatabaseEntry::from_bytes(&i.to_be_bytes()),
+                        DatabaseEntry::from_bytes(&xarec_payload(i)),
+                    )
+                    .expect("seed x");
+                }
+                x.close().ok();
+                vtxn.commit().expect("commit seed");
+            }
+            let env = Arc::new(env);
+            // T: an UNCOMMITTED DDL op on "x" (for rename, rename x->y).
+            let t = env.begin_transaction(None).expect("begin T");
+            match op.as_str() {
+                "remove" => {
+                    env.remove_database(Some(&t), "x").expect("T remove x");
+                }
+                "truncate" => {
+                    // A deferred truncate under T (records deleted under T,
+                    // restored on abort).
+                    env.truncate_database(Some(&t), "x").expect("T truncate x");
+                }
+                "rename" => {
+                    env.rename_database(Some(&t), "x", "y")
+                        .expect("T rename x->y");
+                }
+                _ => {
+                    // T holds an open handle on x (a reader) uncommitted.
+                    let d = env
+                        .open_database(Some(&t), "x", &db_config)
+                        .expect("T open x");
+                    d.close().ok();
+                }
+            }
+            // Concurrent AUTO-COMMIT op from another thread.
+            let env2 = Arc::clone(&env);
+            #[allow(clippy::redundant_clone)]
+            let op2 = op.clone();
+            let h = thread::spawn(move || -> String {
+                let cfg = DatabaseConfig::new()
+                    .with_allow_create(false)
+                    .with_transactional(true);
+                // The concurrent op mirrors the T op's hazard: a remove races a
+                // remove, a truncate races a truncate, a rename races a remove.
+                match op2.as_str() {
+                    "truncate" => match env2.truncate_database(None, "x") {
+                        Ok(n) => format!("truncate_ok_{n}"),
+                        Err(e) => format!("truncate_err_{e:?}"),
+                    },
+                    "open" => match env2.open_database(None, "x", &cfg) {
+                        Ok(d) => {
+                            let _ = d.close();
+                            "open_ok".into()
+                        }
+                        Err(e) => format!("open_err_{e:?}"),
+                    },
+                    // remove and rename both race a concurrent remove("x").
+                    _ => match env2.remove_database(None, "x") {
+                        Ok(()) => "remove_ok".into(),
+                        Err(e) => format!("remove_err_{e:?}"),
+                    },
+                }
+            });
+            let concurrent = h.join().unwrap_or_else(|_| "panic".into());
+            // Resolve T.
+            if decision == "commit" {
+                t.commit().expect("commit T");
+            } else {
+                t.abort().expect("abort T");
+            }
+            // Count x's (and y's) records.
+            let count = |env: &noxu_db::Environment, nm: &str| -> (u8, u32) {
+                let cfg = DatabaseConfig::new()
+                    .with_allow_create(false)
+                    .with_transactional(true);
+                match env.open_database(None, nm, &cfg) {
+                    Ok(d) => {
+                        let rt = env.begin_transaction(None).expect("rt");
+                        let mut c = 0u32;
+                        for i in 0u32..8 {
+                            let want = xarec_payload(i);
+                            if let Ok(Some(v)) = d.get_in(&rt, i.to_be_bytes())
+                                && v[..] == want[..]
+                            {
+                                c += 1;
+                            }
+                        }
+                        rt.commit().ok();
+                        let _ = d.close();
+                        (1, c)
+                    }
+                    Err(_) => (0, 0),
+                }
+            };
+            let (x_ex, xr) = count(&env, "x");
+            let (y_ex, yr) = count(&env, "y");
+            flag(&dir, &format!("rvxl_concurrent_{concurrent}"));
+            flag(&dir, &format!("rvxl_x_ex_{x_ex}"));
+            flag(&dir, &format!("rvxl_xr_{xr}"));
+            flag(&dir, &format!("rvxl_y_ex_{y_ex}"));
+            flag(&dir, &format!("rvxl_yr_{yr}"));
+            flag(&dir, "firstlsn_done");
+        }
+
         other => panic!("Unknown NOXU_CRASH_MODE: {other}"),
     }
 }

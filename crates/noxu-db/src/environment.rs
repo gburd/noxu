@@ -17,6 +17,7 @@ use noxu_engine::env_stats::{
 };
 use noxu_log::LogManager;
 use noxu_sync::Mutex;
+use noxu_txn::{LockType, Locker};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -99,6 +100,14 @@ fn map_dbi_err(name: &str) -> impl Fn(noxu_dbi::DbiError) -> NoxuError + '_ {
         noxu_dbi::DbiError::DatabaseNotFound(_) => NoxuError::DatabaseNotFound(
             format!("Database '{}' does not exist", name),
         ),
+        // R-LIVEDDL-711: preserve typed lock/conflict errors (the NameLN lock
+        // can time out / deadlock / be denied) so callers see a *retryable*
+        // `NoxuError::LockTimeout` / `DeadlockDetected` / `LockConflict`
+        // rather than an opaque, non-retryable `EnvironmentFailure`.  JE's
+        // `LockConflictException` family is retryable; flattening it here
+        // would break at-conflict retry (and `is_retryable()`).
+        noxu_dbi::DbiError::LockConflict(_)
+        | noxu_dbi::DbiError::TxnError(_) => NoxuError::from(e),
         _ => NoxuError::environment(e.to_string()),
     }
 }
@@ -119,6 +128,9 @@ fn map_rename_err<'a>(
                 new_name
             ))
         }
+        // R-LIVEDDL-711: preserve typed lock/conflict errors (see map_dbi_err).
+        noxu_dbi::DbiError::LockConflict(_)
+        | noxu_dbi::DbiError::TxnError(_) => NoxuError::from(e),
         _ => NoxuError::environment(e.to_string()),
     }
 }
@@ -935,6 +947,53 @@ impl Environment {
         // NEW-REC-1: LSN of the provisional NameLNTxn written for a
         // transactional create; recorded on the inner Txn below.
         let mut name_ln_lsn: Option<noxu_util::Lsn> = None;
+
+        // R-LIVEDDL-711: the handle-open read path takes a non-blocking READ on
+        // the NameLN (JE `DbTree.getDb` + `acquireHandleLock` ->
+        // `nonBlockingLock(lsn, READ)`, DbTree.java:706-725/:1524).  While
+        // another txn holds the name's WRITE lock for an uncommitted
+        // remove/rename, this READ is DENIED and the open conflicts
+        // (`LockConflict`, JE `DatabasePreemptedException`) rather than opening
+        // a handle on a database about to vanish.  An open under the SAME txn
+        // that holds the WRITE (e.g. a transactional truncate opening the db)
+        // shares its own lock and does not conflict.  A transactional CREATE
+        // routes its own NameLN WRITE through `open_database_transactional`, so
+        // it is excluded here.  The probe is released immediately after the
+        // open for the auto-commit locker; for `Some(txn)` the READ is held by
+        // the txn (JE's handle lock lives for the handle's life).
+        let open_probe_auto_id: Option<i64> = if is_transactional_create {
+            None
+        } else if let Some(t) = txn {
+            // Probe under the opener's own txn so a truncate/remove that holds
+            // the WRITE under this same txn is not self-blocked.
+            self.lock_name_record_under_txn_typed(
+                t,
+                name,
+                LockType::Read,
+                /*non_blocking=*/ true,
+            )?;
+            None
+        } else {
+            // Auto-commit open: throwaway locker takes the READ probe; released
+            // after the open regardless of outcome.
+            let (auto_id, res) = {
+                let env_impl = self.env_impl.lock();
+                let auto_id = env_impl.next_auto_locker_id();
+                let res = env_impl.lock_name_record(
+                    name,
+                    LockType::Read,
+                    auto_id,
+                    /*non_blocking=*/ true,
+                );
+                (auto_id, res)
+            };
+            if let Err(e) = res {
+                self.env_impl.lock().release_name_record(name, auto_id);
+                return Err(map_dbi_err(name)(e));
+            }
+            Some(auto_id)
+        };
+
         let db_impl_arc = {
             let env_impl = self.env_impl.lock();
             if is_transactional_create {
@@ -970,8 +1029,16 @@ impl Environment {
                     }
                     _ => NoxuError::environment(e.to_string()),
                 }
-            })?
+            })
         };
+        // R-LIVEDDL-711: release the auto-commit open READ probe now that the
+        // DatabaseImpl is resolved (or the open failed); its job was the
+        // conflict check against an in-doubt WRITE holder.  Done before the
+        // `?` so an open error cannot leak the throwaway locker's lock.
+        if let Some(auto_id) = open_probe_auto_id {
+            self.env_impl.lock().release_name_record(name, auto_id);
+        }
+        let db_impl_arc = db_impl_arc?;
 
         // Register abort/commit callbacks on the transaction so that
         // transactional database creation is properly rolled back or
@@ -1061,6 +1128,90 @@ impl Environment {
                 == crate::durability::SyncPolicy::WriteNoSync
     }
 
+    /// R-LIVEDDL-711: acquire the catalog NameLN lock for `name` on behalf of a
+    /// transactional DDL op, held by `txn` until it commits or aborts.
+    ///
+    /// This is JE's `DbTree.lockNameLN` WRITE (`searchExact(key=name, WRITE)`,
+    /// `DbTree.java:952`): while `txn` holds the uncommitted remove / rename /
+    /// truncate of `name`, a concurrent catalog op on the same name BLOCKS (or
+    /// times out / deadlock-fails with a typed error).  The lock is taken
+    /// THROUGH the owning `Txn` (`Locker::lock`), so it is tracked in the
+    /// txn's lock set and released by the normal `release_all_locks` at
+    /// commit/abort — no extra teardown.  WRITE, blocking.
+    fn lock_name_record_under_txn(
+        &self,
+        txn: &Transaction,
+        name: &str,
+    ) -> Result<()> {
+        self.lock_name_record_under_txn_typed(txn, name, LockType::Write, false)
+    }
+
+    /// R-LIVEDDL-711: as [`Self::lock_name_record_under_txn`] but with an
+    /// explicit lock type and blocking mode — WRITE/blocking for
+    /// remove/rename/truncate, READ/non-blocking for the handle-open path (JE
+    /// `acquireHandleLock`).  A READ request from a locker that already holds
+    /// the WRITE lock on the same name (e.g. a transactional truncate that
+    /// then opens the db under the same txn) is satisfied by its own lock and
+    /// does not conflict.
+    fn lock_name_record_under_txn_typed(
+        &self,
+        txn: &Transaction,
+        name: &str,
+        lock_type: LockType,
+        non_blocking: bool,
+    ) -> Result<()> {
+        let Some(inner) = txn.get_inner_txn() else {
+            return Ok(());
+        };
+        let lock_id = noxu_util::Lsn::name_lock_id(name);
+        match inner.lock().unwrap_or_else(|p| p.into_inner()).lock(
+            lock_id,
+            lock_type,
+            non_blocking,
+        ) {
+            Ok(_) => Ok(()),
+            // A non-blocking denial surfaces as LockNotAvailable from the
+            // Txn/lock-manager; present it as the catalog name-conflict error
+            // JE's preempted handle open raises.
+            Err(noxu_txn::TxnError::LockNotAvailable { .. }) => {
+                Err(NoxuError::LockConflict(name.to_string()))
+            }
+            Err(e) => Err(NoxuError::from(e)),
+        }
+    }
+
+    /// R-LIVEDDL-711: run `op` while holding the catalog NameLN lock for `name`
+    /// under a throwaway auto-commit locker — JE's null-txn auto-commit locker
+    /// taking `DbTree.lockNameLN` for the duration of one auto-commit catalog
+    /// op.  `lock_type` is WRITE for remove/rename/truncate (blocking) and READ
+    /// for the handle-open path (non-blocking → `LockConflict` on a conflict).
+    /// The lock is released after `op` returns, win or lose.  A concurrent
+    /// transactional DDL holding the name conflicts here.
+    fn with_name_record_lock<T>(
+        &self,
+        name: &str,
+        lock_type: LockType,
+        non_blocking: bool,
+        op: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let (locker_id, acquired) = {
+            let env_impl = self.env_impl.lock();
+            let locker_id = env_impl.next_auto_locker_id();
+            let acquired = env_impl
+                .lock_name_record(name, lock_type, locker_id, non_blocking)
+                .map_err(map_dbi_err(name));
+            (locker_id, acquired)
+        };
+        if let Err(e) = acquired {
+            // Nothing to release: the acquire failed, but still drop the label.
+            self.env_impl.lock().release_name_record(name, locker_id);
+            return Err(e);
+        }
+        let result = op();
+        self.env_impl.lock().release_name_record(name, locker_id);
+        result
+    }
+
     /// Removes a database.
     ///
     /// When `txn` is `Some`, the removal participates in that transaction:
@@ -1114,18 +1265,37 @@ impl Environment {
 
         match txn {
             None => {
-                // Auto-commit: apply immediately (JE null-txn locker).
-                let mut databases = self.databases.lock();
-                {
-                    let env_impl = self.env_impl.lock();
-                    env_impl
-                        .remove_database(name)
-                        .map_err(map_dbi_err(name))?;
-                }
-                databases.remove(name);
-                Ok(())
+                // Auto-commit: apply immediately (JE null-txn locker), but
+                // hold the NameLN WRITE lock for the op so a concurrent
+                // transactional remove/rename/truncate of the same name (held
+                // in doubt by another txn) BLOCKS or typed-conflicts rather
+                // than racing this removal (R-LIVEDDL-711; JE
+                // `DbTree.doRemoveDb` -> `lockNameLN` WRITE, DbTree.java:952).
+                self.with_name_record_lock(
+                    name,
+                    LockType::Write,
+                    /*non_blocking=*/ false,
+                    || {
+                        let mut databases = self.databases.lock();
+                        {
+                            let env_impl = self.env_impl.lock();
+                            env_impl
+                                .remove_database(name)
+                                .map_err(map_dbi_err(name))?;
+                        }
+                        databases.remove(name);
+                        Ok(())
+                    },
+                )
             }
             Some(txn) => {
+                // R-LIVEDDL-711: take the NameLN WRITE lock under `txn`, held
+                // until it commits/aborts (JE `DbTree.doRemoveDb` ->
+                // `lockNameLN` WRITE, DbTree.java:952).  A concurrent catalog
+                // op on `name` now blocks/typed-conflicts until `txn`
+                // resolves, so an abort can no longer lose records a
+                // concurrent remove/truncate destroyed in the race window.
+                self.lock_name_record_under_txn(txn, name)?;
                 // BUG-DDL-DURABILITY-1: log the NameLN-delete tombstone as an
                 // ordinary TRANSACTIONAL LN inside the user txn BEFORE commit
                 // (JE DbTree.doRemoveDb deletes the NameLN through a cursor
@@ -1236,10 +1406,32 @@ impl Environment {
 
         match txn {
             None => {
-                let env_impl = self.env_impl.lock();
-                env_impl.truncate_database(name).map_err(map_dbi_err(name))
+                // R-LIVEDDL-711: hold the NameLN WRITE lock for the op so a
+                // concurrent transactional remove/rename/truncate of the same
+                // name (held in doubt by another txn) blocks/typed-conflicts
+                // (JE `DbTree.doTruncateDb` -> `lockNameLN` WRITE,
+                // DbTree.java:1282/952).
+                self.with_name_record_lock(
+                    name,
+                    LockType::Write,
+                    /*non_blocking=*/ false,
+                    || {
+                        let env_impl = self.env_impl.lock();
+                        env_impl
+                            .truncate_database(name)
+                            .map_err(map_dbi_err(name))
+                    },
+                )
             }
             Some(txn) => {
+                // R-LIVEDDL-711: take the NameLN WRITE lock under `txn`, held
+                // until it commits/aborts (JE `DbTree.doTruncateDb` ->
+                // `lockNameLN` WRITE, DbTree.java:1282).  A concurrent catalog
+                // op on `name` now blocks/typed-conflicts until `txn`
+                // resolves.  The open-under-`txn` below shares this locker, so
+                // it does not self-conflict.
+                self.lock_name_record_under_txn(txn, name)?;
+
                 // NEW-TRUNCATE-1 (data-loss fix): do the truncate EAGERLY under
                 // `txn`, not via a deferred commit callback.  The old code
                 // registered a commit callback that swapped in a fresh empty
@@ -1335,19 +1527,33 @@ impl Environment {
 
         match txn {
             None => {
-                let mut databases = self.databases.lock();
-                {
-                    let env_impl = self.env_impl.lock();
-                    env_impl
-                        .rename_database(old_name, new_name)
-                        .map_err(map_rename_err(old_name, new_name))?;
-                }
-                if let Some(handle) = databases.remove(old_name) {
-                    databases.insert(new_name.to_string(), handle);
-                }
-                Ok(())
+                // R-LIVEDDL-711: hold the NameLN WRITE lock for BOTH source
+                // and destination for the op, so a concurrent transactional
+                // rename/remove/truncate of either name (held in doubt by
+                // another txn) blocks/typed-conflicts (JE `DbTree.doRenameDb`
+                // -> `lockNameLN` WRITE on source + create WRITE on dest).
+                self.with_rename_record_locks(old_name, new_name, || {
+                    let mut databases = self.databases.lock();
+                    {
+                        let env_impl = self.env_impl.lock();
+                        env_impl
+                            .rename_database(old_name, new_name)
+                            .map_err(map_rename_err(old_name, new_name))?;
+                    }
+                    if let Some(handle) = databases.remove(old_name) {
+                        databases.insert(new_name.to_string(), handle);
+                    }
+                    Ok(())
+                })
             }
             Some(txn) => {
+                // R-LIVEDDL-711: take the NameLN WRITE lock under `txn` on the
+                // source AND destination, held until it commits/aborts (JE
+                // `DbTree.doRenameDb` -> `lockNameLN` WRITE on source, create
+                // WRITE on dest).  A concurrent catalog op on either name now
+                // blocks/typed-conflicts until `txn` resolves.
+                self.lock_name_record_under_txn(txn, old_name)?;
+                self.lock_name_record_under_txn(txn, new_name)?;
                 // BUG-DDL-DURABILITY-1: log the rename's NameLN entries
                 // (delete old + create new) as ordinary TRANSACTIONAL LNs
                 // inside the user txn BEFORE commit (JE DbTree.dbRename re-logs
@@ -1419,6 +1625,30 @@ impl Environment {
                 Ok(())
             }
         }
+    }
+
+    /// R-LIVEDDL-711: run `op` while holding the catalog NameLN WRITE lock for
+    /// BOTH names of an auto-commit rename (source + destination), under one
+    /// throwaway auto-commit locker.  JE `DbTree.doRenameDb` WRITE-locks the
+    /// source NameLN (`lockNameLN`, DbTree.java:952) and creates the
+    /// destination NameLN (also WRITE).  The two ids are taken in a canonical
+    /// (sorted) order so two renames racing in opposite directions cannot
+    /// deadlock against each other.  Both are released after `op`.
+    fn with_rename_record_locks<T>(
+        &self,
+        old_name: &str,
+        new_name: &str,
+        op: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        // Canonical acquire order (sorted) — deadlock-free across directions.
+        let (first, second) = if old_name <= new_name {
+            (old_name, new_name)
+        } else {
+            (new_name, old_name)
+        };
+        self.with_name_record_lock(first, LockType::Write, false, move || {
+            self.with_name_record_lock(second, LockType::Write, false, op)
+        })
     }
 
     /// Begins a new transaction.

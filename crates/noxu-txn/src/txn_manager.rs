@@ -245,6 +245,22 @@ impl TxnManager {
         txn
     }
 
+    /// R-LIVEDDL-711: allocate a fresh locker id without constructing a `Txn`.
+    ///
+    /// Drawn from the SAME `next_txn_id` space every other locker uses, so the
+    /// lock manager can render typed conflicts / deadlocks against it and it
+    /// can never alias a live transaction id.  Used by the auto-commit catalog
+    /// paths to hold the NameLN record lock (`DbTree.lockNameLN`) for the
+    /// duration of a single auto-commit remove / rename / truncate / open —
+    /// JE's null-txn auto-commit locker.  Also advances `last_local_txn_id`
+    /// so recovery's id-floor stays monotone (as `begin_auto_txn` does).
+    pub fn allocate_locker_id(&self) -> i64 {
+        let id = self.next_txn_id.fetch_add(1, Ordering::Relaxed);
+        self.last_local_txn_id.store(id, Ordering::Relaxed);
+        self.lock_manager.register_locker_label(id, "auto-ddl");
+        id
+    }
+
     /// Records that a transaction has committed.
     pub fn commit_txn(&self, txn_id: i64) {
         if self.all_txns.write().remove(&txn_id).is_some() {

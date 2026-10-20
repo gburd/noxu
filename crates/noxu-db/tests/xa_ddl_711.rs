@@ -863,13 +863,21 @@ fn fuzz_observe(
             Ok(db) => db,
             Err(e) => {
                 let s = format!("{e:?}");
-                // DbiError::DatabaseInUse (the FID-XADDL-3 in-doubt handle
-                // conflict) surfaces either as NoxuError::OperationNotAllowed
-                // or, via the EnvironmentFailure wrapper, as its Display string
-                // "database is in use (open handles exist)".  Either way the
-                // name is listed with its committed records intact.
-                if matches!(e, noxu_db::NoxuError::OperationNotAllowed(_))
-                    || s.contains("database is in use")
+                // An in-doubt handle conflict surfaces as the real NameLN lock
+                // being denied.  R-LIVEDDL-711 (ONE MECHANISM): the recovered
+                // in-doubt branch WRITE-relocks the name, so a concurrent open
+                // now gets a typed `LockConflict` / `LockTimeout` (JE
+                // `DatabasePreemptedException`); the pre-unification lock-free
+                // path returned `DatabaseInUse` (-> `OperationNotAllowed` or
+                // the "database is in use" Display).  All of these mean the
+                // name is still listed with its committed records intact.
+                if matches!(
+                    e,
+                    noxu_db::NoxuError::OperationNotAllowed(_)
+                        | noxu_db::NoxuError::LockConflict(_)
+                        | noxu_db::NoxuError::LockTimeout { .. }
+                        | noxu_db::NoxuError::DeadlockDetected
+                ) || s.contains("database is in use")
                 {
                     out.insert(name, ModelDb { base: true, data100: false });
                 } else {

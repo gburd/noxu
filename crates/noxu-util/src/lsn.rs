@@ -226,6 +226,60 @@ impl Lsn {
         }
         Self::new(EOF_FILE_NUM, h).as_u64()
     }
+
+    /// Stable, collision-free lock id for the catalog NameLN of a database
+    /// `name` — the lock-manager key a catalog operation (remove / rename /
+    /// truncate / open) uses to serialise against a concurrent operation on the
+    /// same name (R-LIVEDDL-711).
+    ///
+    /// JE locks the NameLN *record* at its name key:
+    /// `DbTree.lockNameLN` → `CursorImpl.searchExact(key = name, LockType.WRITE)`
+    /// (`DbTree.java:952`) for remove/rename/truncate, and
+    /// `DbTree.getDb` + `acquireHandleLock` → `nonBlockingLock(lsn, READ)`
+    /// (`DbTree.java:706-725`, `:1524`) for open.  The conflict unit is the
+    /// **name key**, not the database's data LSN or its `DatabaseId`: a rename
+    /// deletes the old-name NameLN and creates a new-name NameLN (two distinct
+    /// records), and a create of a not-yet-existent name has no `DatabaseId`
+    /// at all, yet both must still conflict with a concurrent remove/open of
+    /// the same name.  So the lock id is derived from the **name string**.
+    ///
+    /// # Stability
+    ///
+    /// The returned id is a pure function of `name`, computed on the fly at
+    /// each call site — there is no side-map to keep consistent.  The name
+    /// string is immutable for as long as a transaction holds its DDL lock, so
+    /// every concurrent catalog op on that name computes the **same** id and
+    /// contends on the same lock-table slot.  Relog (`relog_name_ln_once`) and
+    /// the cleaner move the NameLN's *physical LSN* while a transaction is
+    /// open, but they never change the name key — exactly as JE's record lock
+    /// follows the NameLN's node identity through slot migration rather than
+    /// its physical LSN.  The name key is the stable projection of that
+    /// identity.
+    ///
+    /// # Encoding
+    ///
+    /// Uses file number `0xFFFF_FFFD` (`MAX_FILE_NUM - 2`), reserved for
+    /// synthetic per-name catalog locks.  Real WAL LSNs allocate file numbers
+    /// from 0 upwards and never reach it; synthetic key-lock ids
+    /// (`synthetic_key_lock_id`) use `0xFFFF_FFFF` and EOF locks
+    /// (`eof_lock_lsn`) use `0xFFFF_FFFE`, so a name-lock id can never collide
+    /// with a real LSN-keyed lock or with either other synthetic family.  The
+    /// low 32 bits are a 32-bit FNV-1a hash of the UTF-8 name bytes, masked so
+    /// they never equal `u32::MAX` (same convention as the sibling helpers).
+    pub fn name_lock_id(name: &str) -> u64 {
+        const FNV_OFFSET: u32 = 0x811c_9dc5;
+        const FNV_PRIME: u32 = 0x0100_0193;
+        const NAME_FILE_NUM: u32 = 0xFFFF_FFFD;
+        let mut h = FNV_OFFSET;
+        for &b in name.as_bytes() {
+            h ^= b as u32;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        if h == u32::MAX {
+            h = 0;
+        }
+        Self::new(NAME_FILE_NUM, h).as_u64()
+    }
 }
 
 impl Ord for Lsn {

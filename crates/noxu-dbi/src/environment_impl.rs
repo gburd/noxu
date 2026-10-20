@@ -33,7 +33,9 @@ use noxu_log::{
 };
 use noxu_recovery::RecoveryManager;
 use noxu_sync::Mutex as NoxuMutex;
-use noxu_txn::{LockManager, Txn, TxnManager};
+use noxu_txn::{
+    LockGrantType, LockManager, LockType, Txn, TxnError, TxnManager,
+};
 use noxu_util::{lsn::NULL_LSN, vlsn::NULL_VLSN};
 
 /// Interruptible-sleep signal for a daemon thread.
@@ -1424,6 +1426,56 @@ impl EnvironmentImpl {
                     }
                 }
             }
+            // R-LIVEDDL-711 (ONE MECHANISM): relock each recovered in-doubt
+            // DDL NameLN under the resurrected prepared txn, keyed on the SAME
+            // `Lsn::name_lock_id` the LIVE catalog ops lock.  JE WRITE-relocks
+            // the resurrected `PreparedTxn`'s NameLN (`RecoveryManager.relock`
+            // -> `nonBlockingLock(logLsn, WRITE)`, RecoveryManager.java:2328),
+            // and every catalog op WRITE/READ-locks the NameLN via
+            // `DbTree.lockNameLN`/`getDb` -- so the SAME lock protects both the
+            // live and the recovered in-doubt case.  With this relock in place,
+            // a concurrent remove/rename/truncate/open of an in-doubt name now
+            // BLOCKS / typed-conflicts on the lock-manager lock (released by
+            // `release_all_for_locker` when the branch resolves), replacing the
+            // retired `is_recovered_prepared_ddl_name` flag check.  A rename
+            // locks BOTH its names (old + new), matching JE (source WRITE +
+            // dest create WRITE).  Non-blocking during recovery: no other
+            // locker exists yet, so the grant is immediate; a denial would
+            // indicate corruption and is logged (recovery continues).
+            for (txn_id, actions) in &recovered_prepared_ddl {
+                let mut names: Vec<&str> = Vec::new();
+                for a in actions {
+                    match a {
+                        RecoveredDdlAction::Create { name, .. }
+                        | RecoveredDdlAction::Remove { name, .. } => {
+                            names.push(name)
+                        }
+                        RecoveredDdlAction::Rename {
+                            old_name,
+                            new_name,
+                            ..
+                        } => {
+                            names.push(old_name);
+                            names.push(new_name);
+                        }
+                    }
+                }
+                names.sort_unstable();
+                names.dedup();
+                for name in names {
+                    if let Err(e) = txn_manager.relock_recovered_prepared(
+                        *txn_id as i64,
+                        noxu_util::Lsn::name_lock_id(name),
+                    ) {
+                        log::warn!(
+                            "R-LIVEDDL-711: name-lock relock of recovered \
+                             prepared txn {txn_id} on name {name:?} denied: \
+                             {e:?}; the in-doubt name is not isolation-\
+                             protected but its catalog state is safe"
+                        );
+                    }
+                }
+            }
             // node-id: seed the env's NodeSequence and the single tree-wide
             // node-id counter (L-30) past the recovered max.
             if recovered_max_node_id > 0 {
@@ -2638,22 +2690,16 @@ impl EnvironmentImpl {
             return Ok((db.clone(), None));
         }
 
-        // R-XADDL-711 (S2, FID-XADDL-3): opening (acquiring a handle on) a name
-        // under an UNRESOLVED RECOVERED prepared (in-doubt XA) DDL must
-        // conflict -- JE's `DbTree.acquireHandleLock` takes a READ lock on the
-        // NameLN, which the resurrected `PreparedTxn`'s WRITE lock DENIES
-        // (handle open preempted/blocked until the branch resolves).  This
-        // reconstructs the first fresh `DatabaseImpl` for a recovered name;
-        // for an in-doubt REMOVE/RENAME-old victim that is exactly the handle
-        // JE would refuse (and the path through which a concurrent op could
-        // otherwise destroy in-doubt data -- see the truncate guard).  An
-        // already-open handle was returned by the fast path above, so this
-        // cannot strand a live cursor; a pending CREATE name is not in
-        // `name_map` and falls through to the `pending_names` /
-        // `DatabaseNotFound` paths below.  Recovered in-doubt set only.
-        if self.is_recovered_prepared_ddl_name(name) {
-            return Err(DbiError::DatabaseInUse(name.to_string()));
-        }
+        // R-LIVEDDL-711 (ONE MECHANISM): the handle-open conflict against an
+        // UNRESOLVED RECOVERED prepared (in-doubt XA) DDL is now enforced by
+        // the real NameLN READ lock the caller (`Environment::open_database`)
+        // takes on `Lsn::name_lock_id(name)` before this reconstruction -- a
+        // non-blocking READ that the recovered branch's WRITE lock DENIES
+        // (-> `LockConflict`, JE `acquireHandleLock` nonblocking READ DENIED ->
+        // `DatabasePreemptedException`).  The former `is_recovered_prepared_
+        // ddl_name` flag check here is retired: live and recovered in-doubt DDL
+        // share the ONE lock.  (Recovery's own resolution uses
+        // `get_database_by_id`, never open-by-name, so it is not self-blocked.)
 
         // R-4 TOCTOU guard: if the name is currently being committed from
         // another transaction (name in pending_names but not yet in
@@ -3508,17 +3554,12 @@ impl EnvironmentImpl {
         name: &str,
     ) -> Result<DatabaseId, DbiError> {
         self.check_open()?;
-        // R-XADDL-711 (S2): a name that is the target of an UNRESOLVED RECOVERED
-        // prepared (in-doubt XA) DDL is "locked": a concurrent remove must
-        // conflict, not silently succeed over the in-doubt branch.  Lock-free
-        // equivalent of JE's NameLN WRITE lock held by the resurrected
-        // `PreparedTxn` until `xa_commit`/`xa_rollback` resolves it.  This is
-        // the RECOVERED in-doubt set only -- a LIVE deferred DDL under an
-        // in-process txn is NOT blocked (its identity guard F-DDL-1 resolves
-        // a concurrent recreate), matching the pre-existing lock-free design.
-        if self.is_recovered_prepared_ddl_name(name) {
-            return Err(DbiError::DatabaseInUse(name.to_string()));
-        }
+        // R-LIVEDDL-711 (ONE MECHANISM): the conflict against an in-doubt
+        // remove (live OR recovered) is now the real NameLN WRITE lock the
+        // caller takes on `Lsn::name_lock_id(name)`; the former
+        // `is_recovered_prepared_ddl_name` flag is retired.  This validator
+        // only checks existence + not-in-use (JE `lockNameLN` post-lock
+        // screen); the serialising lock is taken by the caller.
         let db_id = self
             .name_map
             .read()
@@ -3546,12 +3587,12 @@ impl EnvironmentImpl {
         new_name: &str,
     ) -> Result<DatabaseId, DbiError> {
         self.check_open()?;
-        // R-XADDL-711 (S2): the source of an UNRESOLVED RECOVERED prepared
-        // (in-doubt XA) remove/rename-away is "locked" -> conflict (see
-        // can_remove_database; recovered in-doubt only, not live deferred DDL).
-        if self.is_recovered_prepared_ddl_name(old_name) {
-            return Err(DbiError::DatabaseInUse(old_name.to_string()));
-        }
+        // R-LIVEDDL-711 (ONE MECHANISM): the conflict against an in-doubt
+        // rename source/target (live OR recovered) is now the real NameLN
+        // WRITE lock the caller takes on both names; the former
+        // `is_recovered_prepared_ddl_name` flag checks (old + new name) are
+        // retired.  This validator only checks existence / not-in-use /
+        // destination-free (JE `lockNameLN` post-lock screen).
         let db_id =
             self.name_map.read().get(old_name).copied().ok_or_else(|| {
                 DbiError::DatabaseNotFound(old_name.to_string())
@@ -3562,12 +3603,6 @@ impl EnvironmentImpl {
             return Err(DbiError::DatabaseInUse(old_name.to_string()));
         }
         if self.name_map.read().contains_key(new_name) {
-            return Err(DbiError::DatabaseAlreadyExists(new_name.to_string()));
-        }
-        // R-XADDL-711 (S2): the destination name may be the TARGET of an
-        // unresolved recovered prepared create/rename (it lives in
-        // `pending_names`, not `name_map`) -> conflict too.
-        if self.is_recovered_prepared_ddl_name(new_name) {
             return Err(DbiError::DatabaseAlreadyExists(new_name.to_string()));
         }
         Ok(db_id)
@@ -3845,17 +3880,12 @@ impl EnvironmentImpl {
     /// Mirrors `Environment.truncateDatabase(txn, dbName, returnCount)`.
     pub fn truncate_database(&self, name: &str) -> Result<u64, DbiError> {
         self.check_open()?;
-        // R-XADDL-711 (S2, FID-XADDL-3): a name under an UNRESOLVED RECOVERED
-        // prepared (in-doubt XA) DDL is "locked" -- a concurrent truncate must
-        // conflict, not silently empty the db.  JE's resurrected `PreparedTxn`
-        // holds a NameLN WRITE lock that `DbTree.doTruncateDb` -> `lockNameLN`
-        // (WRITE) blocks on; without this guard a concurrent truncate of an
-        // in-doubt-REMOVE db destroys the in-doubt records, which a subsequent
-        // ROLLBACK can no longer restore (data loss).  Lock-free equivalent;
-        // recovered in-doubt set only (live deferred DDL is not blocked).
-        if self.is_recovered_prepared_ddl_name(name) {
-            return Err(DbiError::DatabaseInUse(name.to_string()));
-        }
+        // R-LIVEDDL-711 (ONE MECHANISM): the conflict against an in-doubt
+        // truncate target (live OR recovered) is now the real NameLN WRITE
+        // lock the caller (`Environment::truncate_database`) takes on
+        // `Lsn::name_lock_id(name)`; the former `is_recovered_prepared_ddl_name`
+        // flag check is retired.  JE: `DbTree.doTruncateDb` -> `lockNameLN`
+        // WRITE (DbTree.java:1282/:952).
 
         let db_id = self
             .name_map
@@ -4281,6 +4311,89 @@ impl EnvironmentImpl {
         &self.txn_manager
     }
 
+    /// R-LIVEDDL-711: acquire the catalog NameLN lock for `name` under
+    /// `locker_id`, the lock-free-era equivalent of JE's `DbTree.lockNameLN`
+    /// (`searchExact(key=name, WRITE)`, `DbTree.java:952`) for
+    /// remove/rename/truncate and `DbTree.getDb`+`acquireHandleLock`
+    /// (`nonBlockingLock(lsn, READ)`, `DbTree.java:706-725`) for open.
+    ///
+    /// The lock id is [`noxu_util::Lsn::name_lock_id`] -- a stable, collision-
+    /// free function of the name, so every concurrent catalog op on the name
+    /// contends on the same lock-manager slot and deadlock detection /
+    /// `LockTimeout` work for free.
+    ///
+    /// `lock_type` is `Write` for remove/rename/truncate (blocking, waits on a
+    /// conflicting holder up to the locker's lock timeout) and `Read` for the
+    /// handle-open path (non-blocking, so a conflict is reported at once as
+    /// `LockConflict`, mirroring JE's `nonBlockingLock` ->
+    /// `DatabasePreemptedException`).  A non-blocking denial maps to
+    /// `DbiError::LockConflict`; a blocking timeout / deadlock surfaces as the
+    /// wrapped `TxnError` (-> `NoxuError::LockTimeout` / `DeadlockDetected`).
+    ///
+    /// The lock acquired here is NOT tracked on any `Txn`; the caller is
+    /// responsible for releasing it via [`Self::release_name_record`] (used by
+    /// the auto-commit paths, which mint a throwaway locker id).  The
+    /// transactional paths instead lock through the owning `Txn` so the lock
+    /// is released at commit/abort.
+    pub fn lock_name_record(
+        &self,
+        name: &str,
+        lock_type: LockType,
+        locker_id: i64,
+        non_blocking: bool,
+    ) -> Result<(), DbiError> {
+        let lock_id = noxu_util::Lsn::name_lock_id(name);
+        match self.lock_manager.lock(
+            lock_id,
+            locker_id,
+            lock_type,
+            non_blocking,
+            false, // jumpAheadOfWaiters: ordinary locker (JE Locker.java:503)
+        ) {
+            Ok(LockGrantType::Denied) => {
+                // Non-blocking request denied by a conflicting holder -- JE
+                // `acquireHandleLock` nonblocking READ DENIED -> preempted.
+                Err(DbiError::LockConflict(name.to_string()))
+            }
+            Ok(_) => Ok(()),
+            // A no-wait/non-blocking denial from the lock manager is
+            // `TxnError::LockNotAvailable`; present it as the catalog name
+            // conflict JE raises (`DatabasePreemptedException`), so the open
+            // path surfaces the retryable `LockConflict` the reviewer asked
+            // for rather than the lower-level no-wait code.
+            Err(TxnError::LockNotAvailable { .. }) => {
+                Err(DbiError::LockConflict(name.to_string()))
+            }
+            Err(e) => Err(DbiError::from(e)),
+        }
+    }
+
+    /// R-LIVEDDL-711: release the catalog NameLN lock acquired by
+    /// [`Self::lock_name_record`] under `locker_id`.  Used by the auto-commit
+    /// catalog paths, which take the lock under a throwaway locker id just for
+    /// the duration of the op.  Idempotent per the lock manager's `release`.
+    pub fn release_name_record(&self, name: &str, locker_id: i64) {
+        let lock_id = noxu_util::Lsn::name_lock_id(name);
+        if let Err(e) = self.lock_manager.release(lock_id, locker_id) {
+            // A missing release leaks at most one lock-table entry; log and
+            // continue (same policy as Txn::release_all_locks).
+            log::debug!(
+                "R-LIVEDDL-711: release_name_record({name}, locker={locker_id}) \
+                 no-op/err: {e}"
+            );
+        }
+        // Drop the diagnostic label `allocate_locker_id` registered for this
+        // throwaway auto-commit locker so the label registry does not grow.
+        self.lock_manager.unregister_locker_label(locker_id);
+    }
+
+    /// R-LIVEDDL-711: mint a throwaway auto-commit locker id for a name-record
+    /// lock.  Drawn from the same `next_txn_id` space as every other locker so
+    /// the lock manager can render typed conflicts/deadlocks against it.
+    pub fn next_auto_locker_id(&self) -> i64 {
+        self.txn_manager.allocate_locker_id()
+    }
+
     /// Returns the utilization tracker shared with the LogManager observer.
     ///
     ///
@@ -4396,29 +4509,16 @@ impl EnvironmentImpl {
             .unwrap_or_default()
     }
 
-    /// R-XADDL-711 (S2): is `name` the target of an UNRESOLVED RECOVERED
-    /// prepared (in-doubt XA) DDL action?  True while the branch is in-doubt
-    /// (between recovery and `xa_commit`/`xa_rollback`), false once resolved
-    /// (`resolve_recovered_prepared_ddl` removes the branch's actions).  Used by
-    /// `can_remove_database` / `can_rename_database` / `truncate_database` and
-    /// the handle-open read path to conflict a concurrent catalog op on an
-    /// in-doubt name -- the lock-free equivalent of JE's NameLN WRITE lock held
-    /// by the resurrected `PreparedTxn` (`RecoveryManager.relock`;
-    /// `DbTree.lockNameLN` WRITE for remove/truncate, `acquireHandleLock` READ
-    /// for open).  Only the RECOVERED in-doubt set; LIVE deferred DDL
-    /// (identity-guarded F-DDL-1) is deliberately not blocked.  Scans every
-    /// action of every branch, so a multi-DDL branch locks all its names.
-    fn is_recovered_prepared_ddl_name(&self, name: &str) -> bool {
-        self.recovered_prepared_ddl.lock().unwrap().values().flatten().any(
-            |a| match a {
-                RecoveredDdlAction::Create { name: n, .. } => n == name,
-                RecoveredDdlAction::Remove { name: n, .. } => n == name,
-                RecoveredDdlAction::Rename { old_name, new_name, .. } => {
-                    old_name == name || new_name == name
-                }
-            },
-        )
-    }
+    // R-LIVEDDL-711 (ONE MECHANISM): the former `is_recovered_prepared_ddl_name`
+    // flag check has been RETIRED.  Isolation of a recovered in-doubt (prepared
+    // XA) DDL name is now enforced by a real `lock_manager` WRITE lock on
+    // `Lsn::name_lock_id(name)`, relocked under the resurrected prepared txn
+    // during recovery (see `EnvironmentImpl::new`, alongside the data-LN
+    // relock) and released by `release_all_for_locker` when the branch
+    // resolves.  Every LIVE catalog op takes the SAME lock, so live and
+    // recovered in-doubt DDL share ONE mechanism -- exactly as JE uses the
+    // one NameLN lock (`DbTree.lockNameLN` / `getDb` / `RecoveryManager.relock`)
+    // for both.
 
     /// R-XADDL-711 (S2): resolve a RECOVERED prepared (in-doubt XA) txn's DDL
     /// (catalog) actions at `xa_commit` / `xa_rollback`.  Runs the SAME
