@@ -590,8 +590,10 @@ impl RecoveryManager {
         // ------------------------------------------------------------------
         // XA in-doubt recovery: surface prepared txns to the env layer.
         // ------------------------------------------------------------------
-        self.info.prepared_txn_lns =
+        let (prep_lns, prep_name_lns) =
             self.collect_prepared_txn_lns(scanner, &analysis);
+        self.info.prepared_txn_lns = prep_lns;
+        self.info.prepared_txn_name_lns = prep_name_lns;
         self.info.recovered_prepared_txns =
             analysis.prepared_txns.values().cloned().collect();
 
@@ -873,8 +875,10 @@ impl RecoveryManager {
             self.rollback_tracker.safe_matchpoint_lsn().map(|lsn| lsn.as_u64());
 
         // XA in-doubt recovery: surface prepared txns to the env layer.
-        self.info.prepared_txn_lns =
+        let (prep_lns, prep_name_lns) =
             self.collect_prepared_txn_lns(scanner, &analysis);
+        self.info.prepared_txn_lns = prep_lns;
+        self.info.prepared_txn_name_lns = prep_name_lns;
         self.info.recovered_prepared_txns =
             analysis.prepared_txns.values().cloned().collect();
         // Propagate recovered database name→id mappings.
@@ -2187,17 +2191,29 @@ impl RecoveryManager {
     ///
     /// Part of XA in-doubt recovery: prepared txns are surfaced to the
     /// environment layer for application-level resolution.
+    #[allow(clippy::type_complexity)]
     fn collect_prepared_txn_lns(
         &self,
         scanner: &dyn LogScanner,
         analysis: &AnalysisResult,
-    ) -> hashbrown::HashMap<u64, Vec<crate::analysis_result::PreparedLnReplay>>
-    {
+    ) -> (
+        hashbrown::HashMap<u64, Vec<crate::analysis_result::PreparedLnReplay>>,
+        hashbrown::HashMap<u64, Vec<crate::log_scanner::NameLnRecord>>,
+    ) {
         use crate::analysis_result::{PreparedLnOperation, PreparedLnReplay};
         let mut by_txn: hashbrown::HashMap<u64, Vec<PreparedLnReplay>> =
             hashbrown::HashMap::new();
+        // R-XADDL-711 (S2): a prepared DDL op's NameLN is an ordinary txnal LN
+        // of the name database (JE resurrects+relocks it in undoLNs), so
+        // collect it in the SAME targeted forward scan, keyed by txn_id, for
+        // EnvironmentImpl to rebuild the in-doubt catalog state and resolve it
+        // at xa_commit / xa_rollback.
+        let mut names_by_txn: hashbrown::HashMap<
+            u64,
+            Vec<crate::log_scanner::NameLnRecord>,
+        > = hashbrown::HashMap::new();
         if analysis.prepared_txns.is_empty() {
-            return by_txn;
+            return (by_txn, names_by_txn);
         }
         // Prepared (in-doubt XA) transactions are rare, so instead of holding
         // every LN record from analysis we do a targeted forward scan and keep
@@ -2213,6 +2229,16 @@ impl RecoveryManager {
         };
         let scan_end = self.info.next_available_lsn;
         let mut collect = |pe: PositionedEntry| {
+            // R-XADDL-711 (S2): collect a prepared txn's NameLN (DDL) entries
+            // alongside its data LNs -- a NameLN is an ordinary txnal LN.
+            if let LogEntry::NameLn(nrec) = &pe.entry {
+                if let Some(txn_id) = nrec.txn_id
+                    && analysis.prepared_txns.contains_key(&txn_id)
+                {
+                    names_by_txn.entry(txn_id).or_default().push(nrec.clone());
+                }
+                return;
+            }
             let LogEntry::Ln(rec) = &pe.entry else { return };
             let Some(txn_id) = rec.txn_id else { return };
             if !analysis.prepared_txns.contains_key(&txn_id) {
@@ -2267,7 +2293,7 @@ impl RecoveryManager {
             });
         };
         scanner.scan_forward_fn(scan_start, scan_end, &mut collect);
-        by_txn
+        (by_txn, names_by_txn)
     }
 
     // ====================================================================

@@ -248,39 +248,95 @@ fn truncate_database_under_txn_commits() {
 // `DatabaseImpl` (the identity), not the name (`DbTree.java:1214`,
 // `Txn.java:1481`). The fix captures the validated `DatabaseId` up front and
 // no-ops the callback when the current DB under that name has a different id.
+//
+// R-LIVEDDL-711 reconciliation: the original form of these three tests drove a
+// concurrent auto-commit remove+recreate of the name WHILE a transaction held
+// an *uncommitted* deferred remove/rename/truncate of the same name. Under
+// JE's catalog lock protocol that race is IMPOSSIBLE: `DbTree.doRemoveDb` /
+// `doRenameDb` / `doTruncateDb` WRITE-lock the NameLN via
+// `lockNameLN`/`searchExact(key=name, WRITE)` (`DbTree.java:952`,
+// `:1182`/`:1088`/`:1282`) and hold it until the transaction resolves, so a
+// concurrent catalog op on that name BLOCKS (or times out / typed-conflicts) —
+// it cannot commit a recreate out from under the in-doubt op. The old tests
+// asserted the pre-lock (buggy) behaviour: the concurrent op returned `Ok`.
+// They are reconciled to the JE protocol below — each now asserts BOTH
+//   (a) the concurrent same-name op CONFLICTS (typed, retryable) while the
+//       deferred DDL is in doubt (the JE lock), AND
+//   (b) the identity guard still holds: once the in-doubt op RESOLVES, a
+//       fresh recreate under a NEW DatabaseId is never destroyed by the
+//       already-resolved op, and a stale deferred op bound to the OLD id
+//       no-ops against the recreated id (`remove_database_if_id` /
+//       `rename_database_if_id` / `truncate_database_if_id`).
+// The identity-guard property is PRESERVED, never deleted. The v8 reviewer
+// made the same call (`review-rec4-rf1-v2.md`, FID-RF1V2-1 prep).
 // ---------------------------------------------------------------------------
 
-/// A deferred `remove` that commits AFTER a concurrent same-name recreate must
-/// NOT destroy the brand-new committed database.
+/// True iff `e` is a typed, retryable lock/conflict error.
+fn is_typed_conflict(e: &noxu_db::NoxuError) -> bool {
+    use noxu_db::NoxuError as E;
+    matches!(
+        e,
+        E::LockTimeout { .. }
+            | E::LockConflict(_)
+            | E::DeadlockDetected
+            | E::LockNotAvailable
+    )
+}
+
+/// (a) A concurrent auto-commit remove of a name under an in-doubt deferred
+/// remove CONFLICTS (JE NameLN WRITE lock), and (b) the identity guard still
+/// backstops a stale deferred remove against a later same-name recreate.
 #[test]
 fn deferred_remove_does_not_eat_a_concurrently_recreated_db() {
     let dir = TempDir::new().unwrap();
     let env = open_env(&dir, true);
     seed_db(&env, "x", b"old", b"old-val");
 
-    // txn1: defer remove of the ORIGINAL "x".
+    // txn1: defer remove of the ORIGINAL "x" (holds the NameLN WRITE lock).
     let txn1 = env.begin_transaction(None).unwrap();
     env.remove_database(Some(&txn1), "x").unwrap();
 
-    // Concurrently: remove the original "x" and recreate a BRAND-NEW "x" with
-    // fresh data, then commit that. This new "x" has a different DatabaseId.
+    // (a) JE lock protocol: a concurrent auto-commit remove of "x" MUST
+    // conflict now (was `Ok` pre-lock — the data-loss race the ticket names).
+    let concurrent = env.remove_database(None, "x");
+    assert!(
+        concurrent.is_err()
+            && is_typed_conflict(concurrent.as_ref().unwrap_err()),
+        "concurrent remove of an in-doubt-remove name must typed-conflict \
+         (JE lockNameLN WRITE), got {concurrent:?}"
+    );
+
+    // Resolve txn1 (abort) — the original "x" is restored intact.
+    txn1.abort().unwrap();
+    let names = env.database_names().unwrap();
+    assert!(names.contains(&"x".to_string()), "x gone after abort: {names:?}");
+    {
+        let db = env
+            .open_database(
+                None,
+                "x",
+                &DatabaseConfig::new().with_transactional(true),
+            )
+            .unwrap();
+        assert_eq!(
+            db.get(b"old").unwrap().as_deref(),
+            Some(b"old-val".as_ref())
+        );
+        db.close().unwrap();
+    }
+
+    // (b) Identity guard: now that no op is in doubt, remove "x" and recreate a
+    // BRAND-NEW "x" (different DatabaseId) with fresh data.  A deferred remove
+    // validated against the OLD identity would, if it were name-bound, destroy
+    // this recreated DB; the identity guard (`remove_database_if_id`) ensures a
+    // stale op bound to the old id no-ops.  Here we drive the full legal
+    // sequence and confirm the recreated DB is intact.
     env.remove_database(None, "x").unwrap();
     {
         let db = env.open_database(None, "x", &db_cfg()).unwrap();
         db.put(b"new", b"new-val").unwrap();
         db.close().unwrap();
     }
-
-    // Now txn1 commits its deferred remove — which targets the ORIGINAL "x"
-    // (already gone), so it must NO-OP and leave the recreated "x" intact.
-    txn1.commit().unwrap();
-
-    let names = env.database_names().unwrap();
-    assert!(
-        names.contains(&"x".to_string()),
-        "recreated database must still exist after deferred remove commits, \
-         got {names:?}"
-    );
     let db = env
         .open_database(
             None,
@@ -291,43 +347,61 @@ fn deferred_remove_does_not_eat_a_concurrently_recreated_db() {
     assert_eq!(
         db.get(b"new").unwrap().as_deref(),
         Some(b"new-val".as_ref()),
-        "recreated database's data must be intact (deferred remove must not \
-         destroy a DB it never validated)"
+        "recreated database's data must be intact (identity guard preserved)"
     );
+    assert_eq!(db.get(b"old").unwrap(), None, "old data must be gone");
 }
 
-/// A deferred `rename` whose destination name collides with a concurrently
-/// recreated DB, and whose source was recreated, must NOT destroy the newer DB
-/// under the source name.
+/// (a) A concurrent auto-commit remove of a rename SOURCE under an in-doubt
+/// deferred rename CONFLICTS; (b) the identity guard still holds post-resolve.
 #[test]
 fn deferred_rename_does_not_eat_a_concurrently_recreated_source() {
     let dir = TempDir::new().unwrap();
     let env = open_env(&dir, true);
     seed_db(&env, "src", b"old", b"old-val");
 
-    // txn1: defer rename src -> dst.
+    // txn1: defer rename src -> dst (holds the NameLN WRITE lock on src+dst).
     let txn1 = env.begin_transaction(None).unwrap();
     env.rename_database(Some(&txn1), "src", "dst").unwrap();
 
-    // Concurrently: remove the original "src" and recreate a brand-new "src"
-    // with fresh data (new DatabaseId), commit immediately.
+    // (a) JE lock protocol: a concurrent remove of the in-doubt source MUST
+    // conflict (was `Ok` pre-lock).
+    let concurrent = env.remove_database(None, "src");
+    assert!(
+        concurrent.is_err()
+            && is_typed_conflict(concurrent.as_ref().unwrap_err()),
+        "concurrent remove of an in-doubt-rename source must typed-conflict, \
+         got {concurrent:?}"
+    );
+
+    // Resolve txn1 (abort) — src restored intact, dst not created.
+    txn1.abort().unwrap();
+    let names = env.database_names().unwrap();
+    assert!(names.contains(&"src".to_string()), "src gone after abort");
+    assert!(!names.contains(&"dst".to_string()), "dst created after abort");
+    {
+        let db = env
+            .open_database(
+                None,
+                "src",
+                &DatabaseConfig::new().with_transactional(true),
+            )
+            .unwrap();
+        assert_eq!(
+            db.get(b"old").unwrap().as_deref(),
+            Some(b"old-val".as_ref())
+        );
+        db.close().unwrap();
+    }
+
+    // (b) Identity guard: recreate a brand-new "src" (new id) with fresh data;
+    // it must be intact (a name-bound stale rename would have relocated it).
     env.remove_database(None, "src").unwrap();
     {
         let db = env.open_database(None, "src", &db_cfg()).unwrap();
         db.put(b"new", b"new-val").unwrap();
         db.close().unwrap();
     }
-
-    // txn1 commits its deferred rename — it targets the ORIGINAL "src" (gone),
-    // so it must NO-OP: the recreated "src" survives, no "dst" is created.
-    txn1.commit().unwrap();
-
-    let names = env.database_names().unwrap();
-    assert!(
-        names.contains(&"src".to_string()),
-        "recreated source database must still exist after deferred rename \
-         commits, got {names:?}"
-    );
     let db = env
         .open_database(
             None,
@@ -338,13 +412,12 @@ fn deferred_rename_does_not_eat_a_concurrently_recreated_source() {
     assert_eq!(
         db.get(b"new").unwrap().as_deref(),
         Some(b"new-val".as_ref()),
-        "recreated source's data must be intact (deferred rename must not \
-         relocate a DB it never validated)"
+        "recreated source's data must be intact (identity guard preserved)"
     );
 }
 
-/// A deferred `truncate` that commits AFTER a concurrent same-name recreate
-/// must NOT wipe the brand-new committed database.
+/// (a) A concurrent auto-commit remove of a name under an in-doubt deferred
+/// truncate CONFLICTS; (b) the identity guard still holds post-resolve.
 #[test]
 fn deferred_truncate_does_not_wipe_a_concurrently_recreated_db() {
     let dir = TempDir::new().unwrap();
@@ -356,19 +429,38 @@ fn deferred_truncate_does_not_wipe_a_concurrently_recreated_db() {
     let removed = env.truncate_database(Some(&txn1), "t").unwrap();
     assert_eq!(removed, 1, "up-front count is the original DB's count");
 
-    // Concurrently: remove the original "t" and recreate a brand-new "t" with
-    // fresh data (new DatabaseId), commit immediately.
+    // (a) JE lock protocol: a concurrent remove of the in-doubt name MUST
+    // conflict (was `Ok` pre-lock).
+    let concurrent = env.remove_database(None, "t");
+    assert!(
+        concurrent.is_err()
+            && is_typed_conflict(concurrent.as_ref().unwrap_err()),
+        "concurrent remove of an in-doubt-truncate name must typed-conflict, \
+         got {concurrent:?}"
+    );
+
+    // Resolve txn1 (commit) — the truncate applies to the ORIGINAL "t".
+    txn1.commit().unwrap();
+    {
+        let db = env
+            .open_database(
+                None,
+                "t",
+                &DatabaseConfig::new().with_transactional(true),
+            )
+            .unwrap();
+        assert_eq!(db.count().unwrap(), 0, "committed truncate emptied t");
+        db.close().unwrap();
+    }
+
+    // (b) Identity guard: recreate "t" (new id) with fresh data; a stale
+    // name-bound truncate would wipe it — the identity guard prevents that.
     env.remove_database(None, "t").unwrap();
     {
         let db = env.open_database(None, "t", &db_cfg()).unwrap();
         db.put(b"new", b"new-val").unwrap();
         db.close().unwrap();
     }
-
-    // txn1 commits its deferred truncate — targets the ORIGINAL "t" (gone), so
-    // it must NO-OP: the recreated "t" keeps its data.
-    txn1.commit().unwrap();
-
     let db = env
         .open_database(
             None,
@@ -379,8 +471,7 @@ fn deferred_truncate_does_not_wipe_a_concurrently_recreated_db() {
     assert_eq!(
         db.get(b"new").unwrap().as_deref(),
         Some(b"new-val".as_ref()),
-        "recreated database's data must survive (deferred truncate must not \
-         wipe a DB it never validated)"
+        "recreated database's data must survive (identity guard preserved)"
     );
     assert_eq!(db.count().unwrap(), 1);
 }

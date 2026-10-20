@@ -1630,15 +1630,16 @@ impl Database {
         // transactional `DeleteLN` and records an abort before-image via the
         // cursor's `finalize_write_lock`, so abort restores every record.
         loop {
-            let status = cursor
-                .get_first()
-                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+            // R-LIVEDDL-711 (S5 cleanup): preserve a typed lock conflict /
+            // timeout from the drain (a deferred truncate under `txn` races
+            // other writers) via `map_read_err`, instead of flattening every
+            // cursor error to a stringy, non-retryable `OperationNotAllowed`.
+            // JE surfaces the typed `LockConflictException` family here.
+            let status = cursor.get_first().map_err(map_read_err)?;
             if status != noxu_dbi::OperationStatus::Success {
                 break;
             }
-            cursor
-                .delete()
-                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+            cursor.delete().map_err(map_read_err)?;
         }
         Ok(())
     }
