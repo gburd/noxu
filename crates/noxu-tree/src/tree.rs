@@ -4443,6 +4443,33 @@ impl Tree {
         false
     }
 
+    /// R-SECREAD-NOTFOUND (Layer B): whether a range/dup seek may step past
+    /// slot `idx` WITHOUT taking a record lock.  Mirrors JE
+    /// `CursorImpl.lockAndGetCurrent`, which skips only `isEntryKnownDeleted`
+    /// (CursorImpl.java:2060-2064); a PENDING-deleted slot is NOT skipped — the
+    /// caller lands on it and locks it (blocking on the in-flight deleter)
+    /// before deciding it is absent.
+    ///
+    /// * `skip_pending_deleted = false` (dup-Set read path, `search_dup`):
+    ///   `slot_scan_skippable` = KNOWN-deleted || TTL-expired, NEVER PD.
+    /// * `skip_pending_deleted = true` (dup `putNoOverwrite` existence
+    ///   pre-/re-check, SetRange, phantom-successor): skip PD too, i.e. the
+    ///   old `!slot_is_live` behaviour.  Those callers take the WRITE lock
+    ///   themselves and re-check under it.
+    #[inline]
+    fn slot_is_skippable_for_seek(
+        &self,
+        bin: &BinStub,
+        idx: usize,
+        skip_pending_deleted: bool,
+    ) -> bool {
+        if skip_pending_deleted {
+            !bin.slot_is_live(idx)
+        } else {
+            bin.slot_scan_skippable(idx)
+        }
+    }
+
     /// Returns the key and data of the first BIN entry at or after `key`.
     ///
     /// Descends with the tree's key comparator (same path as `search()`), then
@@ -4509,7 +4536,7 @@ impl Tree {
                 }
                 drop(guard);
                 return self
-                    .first_live_slot_after_bin(key)
+                    .first_live_slot_after_bin(key, true)
                     .map(|(k, d, _, lsn, _)| (k, d, lsn));
             }
 
@@ -4548,9 +4575,15 @@ impl Tree {
     /// (Cursor.java:4288-4293, :4523-4550), skipping defunct slots
     /// (CursorImpl.java:2062-2064) across BINs.  The caller must hold no
     /// latch.  The returned BIN is not pinned (as on the floor-BIN path).
+    ///
+    /// R-SECREAD-NOTFOUND (Layer B): `skip_pending_deleted` forwards the
+    /// floor-BIN seek's skip policy — `false` lands on a PENDING-deleted slot
+    /// (so the dup-Set caller can lock+block on the deleter), `true` skips PD
+    /// too (the existing SetRange / phantom-successor behaviour).
     fn first_live_slot_after_bin(
         &self,
         key: &[u8],
+        skip_pending_deleted: bool,
     ) -> Option<(
         Vec<u8>,
         Vec<u8>,
@@ -4564,8 +4597,13 @@ impl Tree {
             let (_, arc) = self.get_next_bin_pinned(&anchor)?;
             let step = match &*arc.read() {
                 TreeNode::Bottom(bin) => {
-                    match (0..bin.entries.len()).find(|&i| bin.slot_is_live(i))
-                    {
+                    match (0..bin.entries.len()).find(|&i| {
+                        !self.slot_is_skippable_for_seek(
+                            bin,
+                            i,
+                            skip_pending_deleted,
+                        )
+                    }) {
                         Some(i) => Ok((
                             bin.get_full_key(i).unwrap_or_default(),
                             bin.entries[i]
@@ -4616,9 +4654,22 @@ impl Tree {
     /// existing key.  Mirrors JE `Tree.searchSubTree` / `Tree.search`
     /// which hold the latch across the `is_bin()` test and the subsequent
     /// entry lookup.
+    ///
+    /// R-SECREAD-NOTFOUND (Layer B): when `skip_pending_deleted` is `false`
+    /// the seek LANDS ON a PENDING-deleted slot (skipping only KNOWN-deleted /
+    /// TTL-expired slots, per JE `CursorImpl.lockAndGetCurrent`'s
+    /// `isEntryKnownDeleted` skip, CursorImpl.java:2060-2064) so the dup-Set
+    /// read caller (`search_dup`) can LOCK the slot (blocking on an in-flight
+    /// deleter) via `revalidate_scanned_slot_rc` (JE `lockLNAndCheckDefunct`)
+    /// before deciding it is absent — closing the via-secondary NOTFOUND hole
+    /// where a reader skipped the uncommitted-deleted dup slot without
+    /// blocking.  When `true` (the dup `putNoOverwrite` existence pre-/re-check
+    /// callers) a PD slot is skipped as before: those callers take the WRITE
+    /// lock separately and re-check existence under it.
     pub fn first_entry_at_or_after_with_index(
         &self,
         key: &[u8],
+        skip_pending_deleted: bool,
     ) -> Option<(
         Vec<u8>,
         Vec<u8>,
@@ -4641,11 +4692,20 @@ impl Tree {
                         Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
                         None => bin.find_entry_compressed(key),
                     };
-                    // TREE-F1: skip non-live slots (known_deleted /
-                    // TTL-expired) at/after the floor index
-                    // (CursorImpl.java:2062-2064).
+                    // Skip non-live slots at/after the floor index.  R-SECREAD
+                    // Layer B: the scan-advance skip predicate is
+                    // `slot_scan_skippable` (KNOWN-deleted || TTL-expired,
+                    // NEVER pending-deleted) unless the caller asked to skip PD
+                    // too — a PD slot is LANDED ON and locked, not skipped
+                    // (JE CursorImpl.java:2060-2064).
                     let mut idx = idx;
-                    while idx < bin.entries.len() && !bin.slot_is_live(idx) {
+                    while idx < bin.entries.len()
+                        && self.slot_is_skippable_for_seek(
+                            bin,
+                            idx,
+                            skip_pending_deleted,
+                        )
+                    {
                         idx += 1;
                     }
                     if idx < bin.entries.len() {
@@ -4667,7 +4727,10 @@ impl Tree {
                         return Some((full_key, data, idx, lsn, bin_arc));
                     } else {
                         drop(guard);
-                        return self.first_live_slot_after_bin(key);
+                        return self.first_live_slot_after_bin(
+                            key,
+                            skip_pending_deleted,
+                        );
                     }
                 }
                 return None;

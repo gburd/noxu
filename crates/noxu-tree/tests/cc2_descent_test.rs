@@ -61,7 +61,7 @@ fn test_split_boundary_key_found() {
     // Every inserted key must be found by first_entry_at_or_after_with_index.
     for i in 0u64..20 {
         let key = format!("key{:03}", i).into_bytes();
-        let result = tree.first_entry_at_or_after_with_index(&key);
+        let result = tree.first_entry_at_or_after_with_index(&key, true);
         assert!(
             result.is_some(),
             "key{:03} not found — check-then-lock gap would cause this",
@@ -86,7 +86,7 @@ fn test_key_at_exact_split_point_found() {
 
     // All keys must be reachable.
     for key in &keys {
-        let r = tree.first_entry_at_or_after_with_index(key);
+        let r = tree.first_entry_at_or_after_with_index(key, true);
         assert!(r.is_some(), "key {:?} not found after split", key);
         let (found, ..) = r.unwrap();
         assert_eq!(&found, key);
@@ -105,7 +105,7 @@ fn test_returned_index_matches_slot() {
     }
 
     for key in &keys {
-        let r = tree.first_entry_at_or_after_with_index(key);
+        let r = tree.first_entry_at_or_after_with_index(key, true);
         assert!(r.is_some(), "key {:?} not found", key);
         let (found_key, found_data, idx, _lsn, arc) = r.unwrap();
         assert_eq!(&found_key, key);
@@ -180,7 +180,10 @@ fn test_stress_concurrent_splits() {
             for _ in 0..200 {
                 for i in 0u64..8 {
                     let key = format!("s{:04}", i).into_bytes();
-                    if tree.first_entry_at_or_after_with_index(&key).is_none() {
+                    if tree
+                        .first_entry_at_or_after_with_index(&key, true)
+                        .is_none()
+                    {
                         errors2.fetch_add(1, Ordering::Relaxed);
                     }
                 }
