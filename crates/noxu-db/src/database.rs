@@ -1057,14 +1057,36 @@ impl Database {
             // locker for a transactional db (so a reader cannot see the
             // primary without its matching secondary at RC / RR — JE reads
             // old data inside `putNoNotify` under the write locker), or `None`
-            // for a non-transactional db (the public `get_bytes` rejects a
-            // `Transaction` on a non-txnal database; JE ThreadLocker reads
-            // without a txn there).  `get_bytes(at, …)` self-locks on `at`,
-            // so no self-conflict with the primary write under `pt`.
+            // JE Option B / `Cursor.putNotify` (Cursor.java:2779-2805): the
+            // secondary-maintenance pre-image is read UNDER the primary's
+            // WRITE lock (the old LN is read inside the locked slot in
+            // `putNoNotify`), so a concurrent writer of the same key is
+            // serialised before the before-image is taken.
+            //
+            // NEW-SECMAINT-OLDDATA-TOCTOU: the former code read old data via
+            // `get_bytes(at, key)` BEFORE the primary put took its WRITE lock.
+            // For an UPDATE of an existing key that read-locked the slot and
+            // was safe (it blocked on an uncommitted writer and read the
+            // committed value — no orphan, proved by `sec_orphan_witness`).
+            // But two concurrent inserters of the SAME brand-new key both read
+            // `old_data = None` (no slot to read-lock), so the loser re-inserts
+            // the identical (sec_key, pri_key) dup and raises a spurious
+            // `SecondaryIntegrityException` (the `multi_read_insert` failure).
+            // Taking the WRITE lock on the key's slot FIRST — the synthetic
+            // key-coordination lock for a brand-new key, held until commit on
+            // the primary locker `pt` — makes the second writer block until the
+            // first commits, then read the first's committed value as the
+            // before-image, exactly as JE does.  The lock is on the SAME
+            // locker the `cursor.put` below uses, so no extra/duplicate lock.
             let old_data_for_secondaries: Option<Vec<u8>> = if !need_old_data {
                 None
             } else {
-                self.get_bytes(at, key_bytes)?.map(|b| b.to_vec())
+                let lock_cursor = self.make_cursor_opt(pt);
+                let (old, _exists) = lock_cursor
+                    .lock_key_and_read_before_image(key_bytes)
+                    .map_err(NoxuError::from)?;
+                drop(lock_cursor);
+                old
             };
 
             // Primary put under the primary locker.

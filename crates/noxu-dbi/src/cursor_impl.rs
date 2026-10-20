@@ -1057,6 +1057,36 @@ impl CursorImpl {
     /// abort before-image reflects the locked slot.  On a non-txn (lock
     /// manager only) cursor the lock is released by the caller via
     /// `release_bare_write_locks` after the slot update, exactly as before.
+    /// R-SECREAD / NEW-SECMAINT-OLDDATA-TOCTOU: acquire the WRITE lock on
+    /// `key`'s slot (the synthetic key-coordination lock for a brand-new key,
+    /// held until commit/abort on a txn cursor) and return the authoritative
+    /// UNDER-LOCK before-image `(old_data, exists)`.
+    ///
+    /// This is the public entry `Database::put` uses to read the secondary
+    /// maintenance pre-image the JE-faithful way — UNDER the primary write
+    /// lock, as `Cursor.putNotify` does (Cursor.java:2779-2805; the old LN is
+    /// read inside the locked slot in `putNoNotify`).  Taking the lock FIRST
+    /// serialises two concurrent writers of the SAME key (including two
+    /// inserters of the same brand-new key, which block on the shared
+    /// synthetic key lock): the second reads the first's COMMITTED value as
+    /// the before-image, so `updateSecondary(old, new)` deletes the stale sec
+    /// key before inserting the new one and never re-inserts an identical
+    /// (sec_key, pri_key) dup (the spurious `SecondaryIntegrityException`).
+    ///
+    /// The lock is on the SAME txn locker the subsequent `put` will use, so it
+    /// is a held lock, not an extra one — the `put`'s own `lock_slot_current_lsn`
+    /// re-observes it as already owned (`Existing`), no double-lock, no
+    /// deadlock.  On a non-txn (lock-manager-only) cursor the brand-new-key
+    /// synthetic lock is released immediately by `lock_slot_current_lsn` (the
+    /// legacy auto-commit path), matching the pre-existing put behaviour.
+    pub fn lock_key_and_read_before_image(
+        &self,
+        key: &[u8],
+    ) -> Result<(Option<Vec<u8>>, bool), DbiError> {
+        let (data, _lsn, exists) = self.lock_slot_current_lsn(key)?;
+        Ok((data, exists))
+    }
+
     fn lock_slot_current_lsn(
         &self,
         key: &[u8],

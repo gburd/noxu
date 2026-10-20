@@ -302,6 +302,15 @@ fn delete_via(
 /// JE `testMultiReadInsert`: KEY is absent initially; 20 readers (initStatus
 /// NOTFOUND, read-until-SUCCESS) + 2 inserters.  After the inserters commit
 /// every reader observes SUCCESS and both inserters SUCCESS.
+///
+/// NEW-SECMAINT-OLDDATA-TOCTOU (fixed): two concurrent inserters of the SAME
+/// brand-new primary key previously both read `old_data = None` (no slot to
+/// lock) and the loser re-inserted the identical (sec_key, pri_key) dup →
+/// spurious `SecondaryIntegrityException`.  `Database::put` now reads the
+/// secondary pre-image UNDER the primary's WRITE lock (JE `Cursor.putNotify`),
+/// so the second inserter blocks on the shared synthetic key lock, sees the
+/// first's committed record as `old_data`, and correctly does a no-op/update
+/// instead of a duplicate insert.
 #[test]
 fn je_secondary_multi_test_test_multi_read_insert() {
     const RTHREADS: usize = 20;
