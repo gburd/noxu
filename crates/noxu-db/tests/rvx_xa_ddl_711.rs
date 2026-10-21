@@ -217,8 +217,7 @@ fn rvx4_resolve_vs_concurrent_open() {
         read_flag_suffix(&p, "rvx4_before_inuse_").unwrap_or_default();
     let opened_ok = read_flag_suffix(&p, "rvx4_opened_ok_").unwrap_or_default();
     let other = read_flag_suffix(&p, "rvx4_other_").unwrap_or_default();
-    let notfound =
-        read_flag_suffix(&p, "rvx4_notfound_").unwrap_or_default();
+    let notfound = read_flag_suffix(&p, "rvx4_notfound_").unwrap_or_default();
     eprintln!(
         "RVX4 before_inuse={before_inuse} opened_ok={opened_ok} \
          other={other} notfound={notfound}"
