@@ -16,6 +16,71 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+## [7.11.2]
+
+v7.11.2 is a **patch release** from v7.11.1: two JE-fidelity behaviour
+corrections, no on-disk format change (`LOG_VERSION` stays 3), no new log
+entry type, and no *breaking* public API change in the nine Stable /
+Stable-foundational crates (`cargo-semver-checks`: 9/9 "no semver update
+required"). Two **additive, patch-safe** inherent methods are added on
+`Environment` (see *Added*).
+
+### Changed (behaviour — JE fidelity)
+
+- **Non-transactional databases no longer fsync on every write**
+  (FID-NONTXN-SYNC-FSYNC). A write to a non-transactional database is now
+  logged without a commit-time fsync, exactly as Berkeley DB JE's
+  `ThreadLocker`/`BasicLocker` path does (`LN.logInternal` logs
+  `flushRequired=false, fsyncRequired=false`; `LogParams.java:42,53`,
+  `LN.java:636`; `BasicLocker.operationEnd` only releases locks). Durability
+  of a non-transactional write now comes from a checkpoint, the new
+  `Environment::sync()` / `Environment::flush_log()`, a subsequent
+  transactional SYNC commit that drains the buffer, or closing the
+  environment — not from the write itself. See the advisory below.
+
+- **A cursor opened with no transaction on a *transactional* database is now
+  read-only** (FID-CURSOR-AUTOCOMMIT). Its reads are allowed, but `put` /
+  `delete` / `put` with `Put::Current` return `NoxuError::OperationNotAllowed`
+  ("Write operation is not allowed because a Transaction was not supplied to
+  openCursor and the Database is transactional."), matching JE's
+  `Cursor.updateOperationsProhibited` (`Cursor.java:333-338`, `:5340-5367`).
+  Cursor writes on a *non-transactional* database are unchanged. (Note: a
+  no-transaction `SecondaryCursor::delete` on a transactional secondary still
+  auto-commits its cascade — a pre-existing, test-pinned Noxu behaviour
+  (Wave 1B / audit F5) that JE would refuse; tracked separately.)
+
+### Added
+
+- `Environment::sync()` — flushes dirty data and runs a forced checkpoint,
+  making all preceding writes durable (JE `Environment.sync()`;
+  `Environment.java:1603`). Additive, patch-safe.
+- `Environment::flush_log(fsync: bool)` — writes buffered log data and
+  optionally fsyncs (JE `Environment.flushLog()`; `Environment.java:1644`).
+  Use after non-transactional writes to make them durable. Additive,
+  patch-safe.
+
+### Security / Data-Integrity Advisory — v7.11.2
+
+> **Non-transactional durability change.** Before 7.11.2, writing to a
+> non-transactional database under the default (SYNC) durability fsynced each
+> write at operation end. As of 7.11.2 it does not — matching Berkeley DB JE,
+> where a non-transactional write is never fsynced per operation. **If your
+> application relied on each non-transactional write being durable the instant
+> it returned, you must either (a) call `Environment::sync()` (or
+> `Environment::flush_log(true)`) after the writes you need durable, or (b)
+> use a transactional database and commit with SYNC durability.** A checkpoint
+> and environment close still make non-transactional writes durable, as
+> before. No on-disk format changed; existing environments open and recover
+> unchanged.
+>
+> **Cursor-write change.** A cursor opened with no transaction
+> (`db.open_cursor(None)`) on a **transactional** database can no longer write.
+> See the [cursors guide](docs/src/getting-started/cursors.md) for the
+> migration recipe (open the cursor under an explicit transaction, or use
+> `Database::put`). Cursor writes on a non-transactional database are
+> unaffected.
+
+
 ## [7.11.1] - 2026-10-20
 
 v7.11.1 is a **patch release** from v7.11.0: bug fixes only, with no on-disk
