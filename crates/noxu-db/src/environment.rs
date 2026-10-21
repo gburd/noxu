@@ -980,13 +980,51 @@ impl Environment {
         // (`LockConflict`, JE `DatabasePreemptedException`) rather than opening
         // a handle on a database about to vanish.  An open under the SAME txn
         // that holds the WRITE (e.g. a transactional truncate opening the db)
-        // shares its own lock and does not conflict.  A transactional CREATE
-        // routes its own NameLN WRITE through `open_database_transactional`, so
-        // it is excluded here.  The probe is released immediately after the
-        // open for the auto-commit locker; for `Some(txn)` the READ is held by
-        // the txn (JE's handle lock lives for the handle's life).
+        // shares its own lock and does not conflict.  The probe is released
+        // immediately after the open for the auto-commit locker; for
+        // `Some(txn)` the lock is held by the txn (JE's handle lock lives for
+        // the handle's life, and a create's NameLN WRITE lives to txn end).
         let open_probe_guard: Option<AutoNameLockGuard<'_>> =
             if is_transactional_create {
+                // XDB-711 #2b: a TRANSACTIONAL create MUST take the catalog
+                // NameLN lock under its own txn BEFORE binding the name, held
+                // to commit -- JE `DbTree.doCreateDb` takes `lockNameLN(WRITE)`
+                // under the creating locker before `nameCursor.insertRecord`
+                // (DbTree.java:586-609) and holds it until the txn ends.  Prior
+                // to this fix the create took NO name lock (this arm set
+                // `open_probe_guard = None`), so a transactional create of a
+                // name could bind it concurrently with a rename-to (or another
+                // create) of the SAME name: two committed bindings for one
+                // name, and recovery's latest-NameLN-wins scan cross-bound them
+                // (XDB-711 #2b).  LOCK FIRST, then `open_database_transactional`
+                // re-checks existence under the held lock and binds or reopens.
+                //
+                // JE `Environment.setupDatabase`: `getDb` takes a READ on the
+                // NameLN, and only `createDb` (name absent) upgrades to WRITE.
+                // Mirror that WRITE/READ split off the committed-existence
+                // decision so a transactional REOPEN of an existing db takes a
+                // shared READ (no mutual blocking between concurrent openers)
+                // and only a fresh CREATE (name absent) takes WRITE.  Taking
+                // WRITE unconditionally (the earlier WIP) serialized every
+                // reopen and was the source of the ~5x same-name slowdown;
+                // distinct-name creates still take WRITE (one record lock per
+                // DDL, JE's inherent cost).  Blocking (JE's create blocks
+                // behind an in-doubt holder); the txn's `release_all_locks`
+                // frees it at commit/abort -- no extra teardown.
+                //
+                // SAFETY: is_transactional_create implies txn.is_some().
+                let t = txn
+                    .expect("invariant: txn is Some for transactional create");
+                let want_write = {
+                    let env_impl = self.env_impl.lock();
+                    !env_impl.database_exists(name)
+                };
+                self.lock_name_record_under_txn_typed(
+                    t,
+                    name,
+                    if want_write { LockType::Write } else { LockType::Read },
+                    /*non_blocking=*/ false,
+                )?;
                 None
             } else if let Some(t) = txn {
                 // Probe under the opener's own txn so a truncate/remove that holds
@@ -1657,6 +1695,25 @@ impl Environment {
                 // blocks/typed-conflicts until `txn` resolves.
                 self.lock_name_record_under_txn(txn, old_name)?;
                 self.lock_name_record_under_txn(txn, new_name)?;
+                // XDB-711 #2b: the destination-free check in
+                // `can_rename_database` ran at the TOP of this method, BEFORE
+                // the `new_name` WRITE lock was taken -- a TOCTOU window in
+                // which a concurrent transactional create (or rename-to) of
+                // `new_name` could bind it between our validation and our lock.
+                // RE-VALIDATE the destination is still free now that the
+                // `new_name` WRITE lock is HELD (JE `DbTree.doRenameDb` holds
+                // the dest NameLN WRITE across the existence check +
+                // insert, so whoever is second finds the key live and fails).
+                // A rename onto an existing name -> `DatabaseAlreadyExists`
+                // (JE `DbTree.dbRename` NameLN create fails on a live key).
+                {
+                    let env_impl = self.env_impl.lock();
+                    if env_impl.database_exists(new_name) {
+                        return Err(NoxuError::DatabaseAlreadyExists(
+                            new_name.to_string(),
+                        ));
+                    }
+                }
                 // BUG-DDL-DURABILITY-1: log the rename's NameLN entries
                 // (delete old + create new) as ordinary TRANSACTIONAL LNs
                 // inside the user txn BEFORE commit (JE DbTree.dbRename re-logs

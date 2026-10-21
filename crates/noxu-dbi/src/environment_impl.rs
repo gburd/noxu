@@ -3150,6 +3150,28 @@ impl EnvironmentImpl {
         // C-6: do NOT write a second NameLN here.  The NameLNTxn was
         // already written inside the transaction; the TxnCommit record
         // (written by Transaction::commit) is the durability marker.
+        //
+        // XDB-711 #2b precommit debug assert: at the moment a committed
+        // transactional CREATE publishes `name -> db_id`, the destination name
+        // must be ABSENT from `name_map` (a fresh create) or already bound to
+        // THIS db_id (an idempotent republish) -- never bound to a DIFFERENT
+        // id.  A different id here would mean TWO committed DDLs bound one name
+        // (the defect-#2b cross-bind signature) and the create held its NameLN
+        // WRITE lock to commit precisely so no concurrent binder could reach
+        // this point.  DEBUG-only (a mid-flight rename could in principle leave
+        // a transient view, though the held WRITE lock forbids it here); the
+        // relog injectivity diagnostic + RELEASE fail-safe remain the
+        // production defence in depth.
+        debug_assert!(
+            match self.name_map.read().get(name).copied() {
+                None => true,
+                Some(cur) => cur == db_id,
+            },
+            "XDB-711: commit_pending_database({name}) publishing id {} but \
+             name_map already binds {:?} (two committed bindings for one name)",
+            db_id.id(),
+            self.name_map.read().get(name).map(|i| i.id())
+        );
         self.name_map.write().insert(name.to_string(), db_id);
         // Release pending write lock only after name_map is updated.
         drop(pending);
