@@ -301,6 +301,20 @@ impl<'txn> Cursor<'txn> {
         db_open: Arc<AtomicBool>,
         auto_sync: Option<(Arc<LogManager>, noxu_txn::Durability)>,
     ) -> Self {
+        // FID-TXN-FIX3A: a bare auto-commit writable cursor must make its LN
+        // durable BEFORE releasing the per-record write lock (JE's
+        // release-after-durable ordering).  Push the auto-commit durability
+        // into the inner `CursorImpl` so `release_bare_write_locks` performs
+        // the sync inline before dropping the lock, closing the early-release
+        // isolation window on the `open_cursor(None)` write path.  (The outer
+        // `auto_commit_sync` below then short-circuits via the durable-
+        // watermark fast path, so there is no double fsync.)
+        let inner = match &auto_sync {
+            Some((_, durability)) => {
+                inner.with_auto_commit_durability(*durability)
+            }
+            None => inner,
+        };
         Self {
             inner,
             state: CursorState::NotInitialized,

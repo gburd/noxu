@@ -34,6 +34,12 @@ pub mod fsync_probe {
     pub static COMPLETED: AtomicU64 = AtomicU64::new(0);
     /// When non-zero, the probe is armed.
     pub(super) static ARMED: AtomicU64 = AtomicU64::new(0);
+    /// Test-only (FID-TXN-FIX3A W2): when non-zero, the next probed fdatasync
+    /// returns an `EIO`-shaped error instead of syncing, so a committer's
+    /// `flush_sync_if_needed` fails and the environment is invalidated — the
+    /// deterministic in-process analogue of an fsync hardware failure.  One
+    /// shot: consumed by the failing fsync.
+    pub(super) static FAIL_NEXT: AtomicU64 = AtomicU64::new(0);
 
     /// Arm the probe: sleep `delay_us` at the start of each fdatasync and
     /// track the completed-fdatasync EOF watermark.  Test-only.
@@ -53,6 +59,19 @@ pub mod fsync_probe {
     /// Whether the probe is armed.
     pub(super) fn is_armed() -> bool {
         ARMED.load(Ordering::Relaxed) != 0
+    }
+
+    /// Test-only (FID-TXN-FIX3A W2): arm a one-shot fsync FAILURE.  Must be
+    /// called while the probe is armed (`arm`).  The next probed fdatasync
+    /// returns an error (sets the log's `io_invalid`) instead of syncing.
+    pub fn fail_next() {
+        FAIL_NEXT.store(1, Ordering::SeqCst);
+    }
+
+    /// Test-only: consume the one-shot fail flag; `true` if this fsync must
+    /// fail.
+    pub(super) fn take_fail() -> bool {
+        FAIL_NEXT.swap(0, Ordering::SeqCst) != 0
     }
 }
 
@@ -174,6 +193,12 @@ impl FileHandle {
                 if crate::faultdisk::on_fsync() {
                     drop(file_guard);
                     crate::faultdisk::power_cut();
+                } else if fsync_probe::take_fail() {
+                    // FID-TXN-FIX3A W2: deterministic in-process fsync EIO.
+                    drop(file_guard);
+                    return Err(LogError::WriteFailed(
+                        "fsync_probe injected fsync failure (EIO)".to_string(),
+                    ));
                 } else {
                     file.sync_data()?;
                 }

@@ -268,6 +268,13 @@ pub struct CursorImpl {
     /// Write-ahead log manager for recording data operations.
     /// None for read-only cursors or cursors created outside a real env.
     log_manager: Option<Arc<LogManager>>,
+    /// FID-TXN-FIX3A: auto-commit durability for a BARE (non-txn) writable
+    /// cursor.  When `Some`, a bare auto-commit write makes its LN durable to
+    /// this policy (via the `log_manager`) BEFORE `release_bare_write_locks`
+    /// drops the per-record write lock — JE's "release only after durable"
+    /// ordering for the `ThreadLocker`/`BasicLocker` write path.  `None` for
+    /// a txn-bound cursor (the txn owns durability) or a non-syncing cursor.
+    auto_commit_durability: Option<noxu_txn::Durability>,
     /// Cached environment-invalidity flag (X-13).
     ///
     /// Cloned from `EnvironmentImpl::is_invalid_flag()` at cursor open time
@@ -641,6 +648,7 @@ impl CursorImpl {
             op_read_uncommitted: false,
             current_bin_arc: None,
             log_manager: None,
+            auto_commit_durability: None,
             env_invalid: None,
             replica_write_screen: None,
             lock_manager: None,
@@ -679,6 +687,7 @@ impl CursorImpl {
             op_read_uncommitted: false,
             current_bin_arc: None,
             log_manager: Some(log_manager),
+            auto_commit_durability: None,
             env_invalid: None,
             replica_write_screen: None,
             lock_manager: None,
@@ -1519,6 +1528,31 @@ impl CursorImpl {
         if self.txn_ref.is_some() {
             return;
         }
+        // FID-TXN-FIX3A: for a bare auto-commit writable cursor, make the
+        // just-logged LN durable to the cursor's auto-commit policy BEFORE
+        // releasing the per-record write lock, so a concurrent reader that
+        // acquires the just-released lock can never observe a value whose
+        // commit has not reached its required durability.  This is JE's
+        // "release only after durable" ordering (`Txn.commit` /
+        // `BasicLocker.operationEnd` run after the LN's durability is
+        // established); Noxu's bare-cursor write previously released the lock
+        // here and fsynced afterwards in `noxu_db::Cursor::auto_commit_sync`,
+        // which reopened the early-lock-release isolation hole for the
+        // `open_cursor(None)` write path.
+        if let (Some(dur), Some(lm)) =
+            (self.auto_commit_durability, self.log_manager.as_ref())
+            && new_lsn.as_u64() != noxu_util::NULL_LSN.as_u64()
+        {
+            match dur {
+                noxu_txn::Durability::CommitSync => {
+                    let _ = lm.flush_sync_if_needed(new_lsn);
+                }
+                noxu_txn::Durability::CommitWriteNoSync => {
+                    let _ = lm.flush_no_sync();
+                }
+                noxu_txn::Durability::CommitNoSync => {}
+            }
+        }
         if let Some(lm) = &self.lock_manager {
             let null = noxu_util::NULL_LSN.as_u64();
             for lsn in [old_lsn, new_lsn.as_u64()] {
@@ -1527,6 +1561,19 @@ impl CursorImpl {
                 }
             }
         }
+    }
+
+    /// Builder: set the auto-commit durability for a bare (non-txn) writable
+    /// cursor so [`Self::release_bare_write_locks`] makes the write durable
+    /// BEFORE releasing the record lock (FID-TXN-FIX3A).  `#[doc(hidden)]`:
+    /// an internal wiring hook, not a public API.
+    #[doc(hidden)]
+    pub fn with_auto_commit_durability(
+        mut self,
+        durability: noxu_txn::Durability,
+    ) -> Self {
+        self.auto_commit_durability = Some(durability);
+        self
     }
 
     /// Returns true if the underlying database uses sorted duplicates.

@@ -248,14 +248,15 @@ pub struct Txn {
     group_commit: Option<Arc<dyn GroupCommit>>,
 }
 
-/// Outcome of the commit *append* phase (Fix 3a): the LSN to report to the
+/// Outcome of the commit *append* phase: the LSN to report to the
 /// caller plus the fsync still owed by the *durable* phase.  Threading this
-/// between the two phases lets `commit_with_durability` release the write
-/// locks after the WAL append but before the fsync.
+/// between the two phases keeps the WAL append separate from the durable
+/// barrier; the write locks are released only AFTER the durable phase
+/// (FID-TXN-FIX3A, the JE `Txn.commit` ordering).
 struct PendingCommit {
     /// LSN returned to the caller (`NULL_LSN` when nothing was logged).
     assigned_lsn: Lsn,
-    /// The durability barrier still owed after the write locks are released.
+    /// The durability barrier owed before the write locks are released.
     pending_sync: PendingSync,
     /// Obsolete abort-LSNs collected while `self.write_locks` was still
     /// intact (TXN-1), to be merged into the shared `UtilizationTracker`
@@ -616,14 +617,16 @@ impl Txn {
                 );
             }
         }
-        // The commit is split into two phases so the write locks can be
-        // released between the WAL append and the fsync (Fix 3a).  Phase 1
-        // (append) can fail with `?`; on Err the epilogue drains the still-held
-        // write locks rather than leaking them to environment close, and flips
-        // the txn to `MustAbort` so a caller who ignores the error and re-calls
-        // commit() hits `check_state` (a clear `InvalidTransaction` Err)
-        // instead of silently writing a second TxnCommit record.
-        // ── Phase 1: append the commit record to the WAL buffer ──────────
+        // The commit is split into two phases: Phase 1 appends the commit
+        // record to the WAL buffer; Phase 2 (below) is the durable barrier,
+        // AFTER which the write locks are released (FID-TXN-FIX3A, JE's
+        // release-after-durable ordering).  Phase 1 (append) can fail with
+        // `?`; on Err the epilogue drains the still-held write locks rather
+        // than leaking them to environment close, and flips the txn to
+        // `MustAbort` so a caller who ignores the error and re-calls commit()
+        // hits `check_state` (a clear `InvalidTransaction` Err) instead of
+        // silently writing a second TxnCommit record.
+        // Phase 1: append the commit record to the WAL buffer.
         // Marshals + appends the TxnCommit entry under the log-write latch
         // (LSN assigned + buffer slot reserved), but does NOT yet fsync.  On
         // any `?` failure here the write locks are still held, so the epilogue
@@ -639,50 +642,58 @@ impl Txn {
             };
         self.commit_lsn = assigned_lsn.as_u64();
 
-        // ── Fix 3a: release write locks BEFORE the commit fsync ──────────
+        // Phase 2: durability barrier (JE-faithful ordering).
         //
-        // The commit record is already durably in the WAL *buffer* with a
-        // monotonically-assigned LSN (Phase 1 above); the fsync barrier is
-        // still ahead of us and we still wait on it (Phase 2 below) before
-        // returning success to the caller.  Releasing the write locks here —
-        // between WAL append and fsync — shrinks the lock-hold window from the
-        // whole fsync syscall (100µs–2ms) to microseconds, dissolving the
-        // hot-key convoy under high contention.
+        // FID-TXN-FIX3A: the commit record's durability (per the txn's policy)
+        // is established BEFORE any write lock is released, exactly as JE's
+        // `Txn.commit` does: `logCommitEntry(localSync)` -- which for SYNC
+        // fsyncs inside `LogManager.log`, for WRITE_NO_SYNC write()s to the OS,
+        // and for NO_SYNC only buffers -- runs first, and only AFTER it returns
+        // does JE call `setDeletedDatabaseState(true)` then `releaseWriteLocks`
+        // (txn/Txn.java:766-796).  So no other locker can acquire a
+        // just-released record lock and observe this txn's new value until the
+        // value has reached the durability the policy requires.
         //
-        // ISOLATION + DURABILITY INVARIANT (why this is safe on Noxu's WAL):
-        //   "Locks guard *logical* conflict; durability is a *separate*
-        //    barrier the committer still waits on before returning success."
+        // On Noxu the durable barrier is `commit_durable_phase`:
+        //   * SYNC          -- `flush_sync_if_needed(commit_lsn)` blocks (via
+        //     the group-commit fsync manager) until `commit_lsn` is covered by
+        //     the monotonic durable watermark `LogManager::last_synced_lsn`;
+        //     i.e. the fdatasync that makes this commit durable has completed.
+        //   * WRITE_NO_SYNC -- `flush_no_sync()` pwrites the buffer to the OS
+        //     page cache (survives a process crash, not a power loss), which
+        //     is JE's WRITE_NO_SYNC contract; there is no fsync to wait on.
+        //   * NO_SYNC       -- nothing: the record is in the WAL buffer only,
+        //     and JE's NO_SYNC caller already accepts loss on a crash.
+        // In every case the write locks are released only after the barrier
+        // the policy demands, so a reader of early-released data can never
+        // observe a value whose commit has not reached its required durability
+        // (the early-lock-release isolation requirement JE enforces by order).
+        if let Err(e) = self.commit_durable_phase(durability, pending_sync) {
+            // The WAL append already succeeded but the durability step failed
+            // (e.g. fsync EIO); noxu-log has set `io_invalid` and the
+            // environment is invalidated.  The write locks are STILL HELD
+            // here (we have not released them yet), so no reader can have
+            // observed this non-durable value.  Drain the still-held locks via
+            // `release_all_locks`, flip to MustAbort, and surface the error:
+            // the commit is NOT durable and MUST NOT be reported as committed.
+            self.release_all_locks();
+            self.state = TxnState::MustAbort;
+            return Err(e);
+        }
+
+        // Release write locks AFTER the durable barrier (JE releaseWriteLocks).
         //
-        // A second txn may now acquire a just-released record lock and commit
-        // *before* this txn's fsync completes.  That is safe because Noxu has
-        // a single WAL with a single monotonic durable watermark
-        // (`LogManager::last_synced_lsn`, advanced only by the fsync leader
-        // after a successful fdatasync):
-        //   * LSN assignment is serialized under the log-write latch, so the
-        //     second txn's commit record gets a strictly-higher LSN than ours
-        //     (its append happens-after ours).
-        //   * A single fdatasync drains the whole buffer, so making LSN Y
-        //     durable implies every LSN < Y (including ours) is durable — the
-        //     durable point is monotonic (`flush_sync_if_needed` /
-        //     `flush_sync` in noxu-log/log_manager.rs).
-        // Therefore a dependent write can never become durable *ahead of* the
-        // write it depends on: if our commit is lost to a crash/fsync-failure,
-        // any later (higher-LSN) commit that read our released lock is lost
-        // too, and recovery replays in LSN order.  No torn/inconsistent state.
+        // The commit record is now durable to the policy's requirement; a txn
+        // that now acquires a just-released record lock (read-committed reader
+        // or writer) observes a value whose commit is already durable -- JE's
+        // "release only after the commit is durable" contract.  Read locks
+        // were drained pre-append; repeatable-read / serializable readers hold
+        // their own read locks and are unaffected.
         //
-        // Read locks were already drained pre-append.  Repeatable-read /
-        // serializable readers hold their own read locks (or a snapshot) and
-        // are unaffected.  Read-committed is the case this protects: a reader
-        // that acquires the released lock observes the new value, whose commit
-        // is ordered before the reader's own commit in the same monotonic WAL.
-        //
-        // DEVIATION FROM JE (documented, not JE-faithful): JE releases write
-        // locks AFTER the commit fsync — its `Txn.commit` calls
-        // `logCommitEntry(SYNC)` (which fsyncs inside `LogManager.log`) and
-        // only then `releaseWriteLocks()` (Txn.java).  Noxu deliberately
-        // reorders these two steps to cut tail latency on hot-contention
-        // workloads; the durability guarantee to the caller is unchanged
-        // (success is still returned only after the fsync in Phase 2).
+        // (DDL catalog visibility -- JE `setDeletedDatabaseState(true)`, run
+        // between the durable write and the lock release -- is handled by the
+        // dbi/engine catalog path, not here; keeping the release after the
+        // durable barrier preserves that "visible-then-released" ordering.)
         for lsn in self.write_locks.keys().copied().collect::<Vec<_>>() {
             if let Err(e) = self.lock_manager.release(lsn, self.id) {
                 log::error!(
@@ -698,31 +709,20 @@ impl Txn {
         // the shared UtilizationTracker now that the per-record write locks
         // are released. This is the ordering fix that removes the convoy
         // between a hot per-record lock and the contended global tracker
-        // mutex — see `docs/src/internal/space-amplification-2026-09.md`
+        // mutex -- see `docs/src/internal/space-amplification-2026-09.md`
         // Phase 4 and `Self::collect_obsolete_abort_lsns`'s doc comment.
+        // (Still AFTER the write-lock release, as TXN-1 requires; the durable
+        // barrier moved above it does not change that relationship.)
         self.merge_obsolete_lsns(&obsolete_lsns);
 
-        // ── Phase 2: durability barrier ─────────────────────────────────
-        // The committer STILL blocks here until the fsync makes the commit
-        // record durable — success is returned to the caller only after this.
-        // Locks are already released (above), so this wait no longer holds up
-        // any waiter on the hot key.
-        if let Err(e) = self.commit_durable_phase(durability, pending_sync) {
-            // The WAL append already succeeded but the fsync failed; the log
-            // is now invalidated (noxu-log sets `io_invalid`).  Locks are
-            // already released; flip to MustAbort and surface the error.  The
-            // commit is NOT durable and MUST NOT be reported as committed.
-            self.state = TxnState::MustAbort;
-            return Err(e);
-        }
-
         // Real txn-end (commit-success path): this path drains read + write
-        // locks INLINE (Fix 3a splits the write-lock release across the fsync
-        // barrier) and never calls `release_all_locks`, so the preempted flag
-        // must be cleared here too.  (Abort and every commit ERROR path route
-        // through `release_all_locks`, which clears it there.)  JE `Locker`
-        // close -> preemptedCause reset; without this a committed victim on a
-        // steal-heavy replica would leak its flag and a reused id inherit it.
+        // locks INLINE (the write-lock release is after the durable barrier,
+        // FID-TXN-FIX3A) and never calls `release_all_locks`, so the preempted
+        // flag must be cleared here too.  (Abort and every commit ERROR path
+        // route through `release_all_locks`, which clears it there.)  JE
+        // `Locker` close -> preemptedCause reset; without this a committed
+        // victim on a steal-heavy replica would leak its flag and a reused id
+        // inherit it.
         self.lock_manager.clear_preempted(self.id);
         self.state = TxnState::Committed;
         Ok(assigned_lsn)
@@ -730,9 +730,10 @@ impl Txn {
 
     /// Phase 1 of commit: append the TxnCommit record to the WAL buffer and
     /// decide (via GroupCommit) whether a fsync is still owed.  Does NOT fsync
-    /// — that is [`Self::commit_durable_phase`], which runs AFTER write locks
-    /// are released (Fix 3a).  Any `?` failure leaves write locks held so the
-    /// caller's epilogue can drain them.
+    /// — that is [`Self::commit_durable_phase`], which runs BEFORE the write
+    /// locks are released (FID-TXN-FIX3A, JE's release-after-durable order).
+    /// Any `?` failure leaves write locks held so the caller's epilogue can
+    /// drain them.
     ///
     /// Also COLLECTS (but does not yet merge) the obsolete abort-LSNs this
     /// commit makes reclaimable (TXN-1): see `PendingCommit::obsolete_lsns`.
@@ -820,9 +821,11 @@ impl Txn {
         }
     }
 
-    /// Phase 2 of commit: the durability barrier.  Runs AFTER write locks are
-    /// released (Fix 3a) but BEFORE `commit_with_durability` returns success,
-    /// so the caller never observes a committed result that is not durable.
+    /// Phase 2 of commit: the durability barrier.  Runs BEFORE the write
+    /// locks are released (FID-TXN-FIX3A, JE's release-after-durable order)
+    /// and BEFORE `commit_with_durability` returns success, so neither the
+    /// caller nor any reader of a just-released lock can observe a committed
+    /// result that has not reached its required durability.
     fn commit_durable_phase(
         &mut self,
         durability: Durability,
@@ -1191,7 +1194,8 @@ impl Txn {
     /// Split from the actual merge (see [`Self::merge_obsolete_lsns`]) so the
     /// caller can collect while `self.write_locks` is still intact and defer
     /// the shared-tracker-mutex acquisition to AFTER the per-record write
-    /// locks are released (Fix 3a's ordering) — see
+    /// locks are released (TXN-1 ordering, preserved after the durable
+    /// barrier moved ahead of the release for FID-TXN-FIX3A) — see
     /// `docs/src/internal/space-amplification-2026-09.md` Phase 4 for why
     /// that ordering matters: without it, a hot per-record lock is held for
     /// the full duration of a contended global-mutex wait, which is the
@@ -2254,7 +2258,8 @@ mod tests {
     /// BLOCKER 1 probe (clear-at-end, COMMIT): a locker whose lock is stolen
     /// (importunate HA-replay steal marks it preempted) has its preempted flag
     /// CLEARED by the real txn-end path.  `Txn::commit` ->
-    /// `commit_with_durability` drains its locks INLINE (Fix 3a) rather than
+    /// `commit_with_durability` drains its locks INLINE (after the durable
+    /// barrier, FID-TXN-FIX3A) rather than
     /// via `release_all_locks`, so the clear fires at the commit-success
     /// terminal — NOT via `release_all_for_locker`, which the commit path never
     /// calls.  Before this fix the flag leaked forever.
