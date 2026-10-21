@@ -328,6 +328,19 @@ impl Txn {
         lock_manager: Arc<LockManager>,
         txn_flags: u8,
     ) -> Self {
+        // JE Locker.getInitialLockTimeout -> envImpl.getLockTimeout()
+        // (Locker.java:130/157-159): a locker starts with the environment's
+        // lock timeout, which the lock manager carries. Previously this was a
+        // hard-coded 500 ms, so EnvironmentConfig::with_lock_timeout reached no
+        // Txn (only a per-txn TransactionConfig::with_lock_timeout did).
+        // The lock manager default is still 500 ms, so a bare
+        // LockManager::new() Txn is unchanged.
+        let lock_timeout_ms = lock_manager.get_lock_timeout_ms();
+        // JE Locker ctor (Locker.java:136): txnTimeoutMillis =
+        // envImpl.getTxnTimeout(). A new Txn inherits the environment-level
+        // txn timeout (0 == none); a per-txn setTxnTimeout overrides it. The
+        // lock manager carries this env default (set at env-open).
+        let txn_timeout_ms = lock_manager.get_default_txn_timeout_ms();
         Txn {
             id,
             lock_manager,
@@ -339,8 +352,8 @@ impl Txn {
             first_lsn: NULL_LSN.as_u64(),
             first_active_sink: None,
             cursor_count: AtomicI32::new(0),
-            lock_timeout_ms: 500, // default 500ms
-            txn_timeout_ms: 0,    // no timeout
+            lock_timeout_ms, // JE: inherits envImpl.getLockTimeout()
+            txn_timeout_ms,  // JE: inherits envImpl.getTxnTimeout()
             txn_start: Instant::now(),
             read_uncommitted_default: false,
             importunate: false,

@@ -2129,14 +2129,14 @@ impl Environment {
         }
         if let Some(ms) = cfg.txn_timeout_ms {
             self.config.txn_timeout_ms = ms;
-            // The TxnManager does not currently track a default txn
-            // timeout (each Txn snapshots the value at `begin_txn` from
-            // its own TransactionConfig).  We record the new env-level
-            // default here so that future `begin_transaction` calls that
-            // rely on the env default pick it up; live txns keep their
-            // original timeout.  Tracked under transaction-env F7
-            // residual; pushing into running txns requires a TxnManager
-            // API change beyond Wave 2C-4.
+            // Push the new env-level txn-timeout default to the live
+            // LockManager so future `begin_transaction` / auto-commit Txns
+            // inherit it (JE Locker ctor: txnTimeoutMillis =
+            // envImpl.getTxnTimeout(), Locker.java:136). Live txns keep their
+            // original timeout (they snapshot it at `Txn::new`); mirrors the
+            // lock-timeout path just above and the EnvConfigObserver pattern.
+            let env_impl = self.env_impl.lock();
+            env_impl.get_lock_manager().set_default_txn_timeout(ms);
         }
         // DBI-10 / JE EnvConfigObserver: push the mutable cleaner
         // minUtilization to the running cleaner (noxu.cleaner.minUtilization

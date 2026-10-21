@@ -754,6 +754,11 @@ impl EnvironmentImpl {
         let mut lock_manager_inner =
             LockManager::with_config(cfg.lock_timeout_ms, cfg.n_lock_tables);
         lock_manager_inner.set_memory_counter(Arc::clone(&lock_memory_counter));
+        // JE Locker ctor (Locker.java:136): every Locker inherits the
+        // environment-level txn timeout. Carry it on the LockManager so all
+        // locker creation sites (explicit Txn, auto-commit Txn) pick it up;
+        // a per-txn setTxnTimeout overrides it. 0 == no txn timeout.
+        lock_manager_inner.set_default_txn_timeout(cfg.txn_timeout_ms);
         let lock_manager = Arc::new(lock_manager_inner);
         let mut txn_manager_inner = TxnManager::new(lock_manager.clone());
         txn_manager_inner.set_memory_counter(Arc::clone(&txn_memory_counter));

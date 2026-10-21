@@ -121,6 +121,13 @@ pub struct LockManager {
     ///
     lock_timeout_ms: AtomicU64,
 
+    /// Default *transaction*-level timeout (ms) a new `Txn` inherits, mirroring
+    /// JE `Locker.getInitialTxnTimeout -> envImpl.getTxnTimeout()`
+    /// (Locker.java:136). `0` means no transaction-level timeout. Set once at
+    /// env-open by `EnvironmentImpl` via `set_default_txn_timeout`; a per-txn
+    /// `Transaction.setTxnTimeout` overrides the inherited value.
+    default_txn_timeout_ms: AtomicU64,
+
     /// Locker sharing registry: maps locker_id → share_group_id.
     ///
     /// ThreadLockers register their thread_id (as i64) as the group_id.
@@ -299,6 +306,7 @@ impl LockManager {
                 lock_timeouts: AtomicU64::new(0),
             },
             lock_timeout_ms: AtomicU64::new(timeout_ms),
+            default_txn_timeout_ms: AtomicU64::new(0),
             share_registry: RwLock::new(HashMap::new()),
             share_registry_nonempty: AtomicBool::new(false),
             waiter_graph: Mutex::new(HashMap::new()),
@@ -408,6 +416,21 @@ impl LockManager {
     /// Returns the current default lock timeout in milliseconds.
     pub fn get_lock_timeout_ms(&self) -> u64 {
         self.lock_timeout_ms.load(Ordering::Relaxed)
+    }
+
+    /// Sets the default transaction-level timeout (ms) new `Txn`s inherit.
+    ///
+    /// JE: a Locker's `txnTimeoutMillis` defaults to `envImpl.getTxnTimeout()`
+    /// (Locker.java:136). Called once at env-open by `EnvironmentImpl` after
+    /// reading `EnvironmentConfig.txn_timeout_ms`.
+    pub fn set_default_txn_timeout(&self, timeout_ms: u64) {
+        self.default_txn_timeout_ms.store(timeout_ms, Ordering::Relaxed);
+    }
+
+    /// Returns the default transaction-level timeout (ms) new `Txn`s inherit
+    /// (`0` = none). JE `envImpl.getTxnTimeout()`.
+    pub fn get_default_txn_timeout_ms(&self) -> u64 {
+        self.default_txn_timeout_ms.load(Ordering::Relaxed)
     }
 
     /// Acquires a lock on the given LSN for the given locker, blocking the

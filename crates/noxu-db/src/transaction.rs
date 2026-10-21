@@ -1387,10 +1387,17 @@ impl Transaction {
 
     /// Set the lock timeout for this transaction.
     ///
+    /// Applies to every later lock wait of this transaction.  JE
+    /// `Transaction.setLockTimeout` -> `Locker.setLockTimeout`
+    /// (Transaction.java:769-775, Locker.java:210-221).
+    ///
     /// # Arguments
-    /// * `timeout_ms` - Lock timeout in milliseconds (0 = use environment default)
+    /// * `timeout_ms` - Lock timeout in milliseconds (0 = no lock timeout)
     pub fn set_lock_timeout(&self, timeout_ms: u64) {
         *self.lock_timeout_ms.lock().unwrap() = timeout_ms;
+        if let Some(inner) = &self.inner_txn {
+            inner.lock().unwrap().set_lock_timeout(timeout_ms);
+        }
     }
 
     /// Returns the lock timeout for this transaction.
@@ -1400,10 +1407,17 @@ impl Transaction {
 
     /// Set the transaction timeout.
     ///
+    /// Bounds every later lock wait of this transaction by the time left
+    /// until the deadline.  JE `Transaction.setTxnTimeout` ->
+    /// `Locker.setTxnTimeout` (Locker.java:231-243).
+    ///
     /// # Arguments
-    /// * `timeout_ms` - Transaction timeout in milliseconds (0 = use environment default)
+    /// * `timeout_ms` - Transaction timeout in milliseconds (0 = no timeout)
     pub fn set_txn_timeout(&self, timeout_ms: u64) {
         *self.txn_timeout_ms.lock().unwrap() = timeout_ms;
+        if let Some(inner) = &self.inner_txn {
+            inner.lock().unwrap().set_txn_timeout(timeout_ms);
+        }
     }
 
     /// Returns the transaction timeout for this transaction.
