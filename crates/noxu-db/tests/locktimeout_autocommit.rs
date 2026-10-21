@@ -15,10 +15,10 @@
 //! DID reach it (no gap).
 
 use noxu_db::{
-    Database, DatabaseConfig, Environment, EnvironmentConfig, Durability,
+    Database, DatabaseConfig, Durability, Environment, EnvironmentConfig,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -32,9 +32,7 @@ fn env_cfg(p: &std::path::Path) -> EnvironmentConfig {
         .with_lock_timeout(CONFIGURED_TIMEOUT_MS)
 }
 fn db_cfg() -> DatabaseConfig {
-    DatabaseConfig::new()
-        .with_allow_create(true)
-        .with_transactional(true)
+    DatabaseConfig::new().with_allow_create(true).with_transactional(true)
 }
 
 #[test]

@@ -23,12 +23,16 @@ use noxu_db::{
     Database, DatabaseConfig, Durability, Environment, EnvironmentConfig,
     NoxuError,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-fn env_cfg(p: &std::path::Path, lock_ms: u64, txn_ms: u64) -> EnvironmentConfig {
+fn env_cfg(
+    p: &std::path::Path,
+    lock_ms: u64,
+    txn_ms: u64,
+) -> EnvironmentConfig {
     EnvironmentConfig::new(p.to_path_buf())
         .with_allow_create(true)
         .with_transactional(true)
@@ -37,9 +41,7 @@ fn env_cfg(p: &std::path::Path, lock_ms: u64, txn_ms: u64) -> EnvironmentConfig 
         .with_txn_timeout(txn_ms)
 }
 fn db_cfg() -> DatabaseConfig {
-    DatabaseConfig::new()
-        .with_allow_create(true)
-        .with_transactional(true)
+    DatabaseConfig::new().with_allow_create(true).with_transactional(true)
 }
 
 /// (1) A per-txn `Transaction::set_lock_timeout` override (called AFTER
@@ -102,8 +104,7 @@ fn per_txn_override_beats_env_default() {
     // the 1500 ms hold (and succeed). A dropped override (base) gives up at the
     // inner Txn's 500 ms default (or the 100 ms env value) with an Err well
     // before 1500 ms.
-    let dropped_override =
-        res.is_err() && waited < Duration::from_millis(1200);
+    let dropped_override = res.is_err() && waited < Duration::from_millis(1200);
     assert!(
         !dropped_override,
         "per-txn override (4000ms) was dropped: the waiter gave up at ~{}ms \
@@ -211,7 +212,8 @@ fn env_txn_timeout_inherited_by_auto_commit() {
 fn nontxn_cursor_honours_env_lock_timeout() {
     let dir = TempDir::new().unwrap();
     // env lock timeout 1500 ms; env txn timeout 0.
-    let env = Arc::new(Environment::open(env_cfg(dir.path(), 1500, 0)).unwrap());
+    let env =
+        Arc::new(Environment::open(env_cfg(dir.path(), 1500, 0)).unwrap());
     let db: Arc<Database> =
         Arc::new(env.open_database(None, "t", &db_cfg()).unwrap());
     db.put(b"k", b"v0").unwrap();
@@ -248,7 +250,8 @@ fn nontxn_cursor_honours_env_lock_timeout() {
     // at ~500 ms (before the holder releases at ~900 ms). Honouring the
     // configured 1500 ms, it blocks until the holder commits (~900 ms) and
     // then succeeds.
-    let timed_out_at_default = res.is_err() && waited < Duration::from_millis(800);
+    let timed_out_at_default =
+        res.is_err() && waited < Duration::from_millis(800);
     assert!(
         !timed_out_at_default,
         "the non-txn cursor timed out at ~{}ms (the 500ms default) despite \
