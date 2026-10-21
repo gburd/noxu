@@ -52,6 +52,18 @@ required"). Two **additive, patch-safe** inherent methods are added on
   writes on a *non-transactional* database (primary or secondary) are
   unchanged.
 
+- **`Database::sync()` is now supported only for deferred-write databases**
+  (FID-DATABASE-SYNC-NONDW). Calling `Database::sync()` on a
+  non-deferred-write database previously flushed the log and returned
+  `Ok(())`; it now returns `NoxuError::OperationNotAllowed` with the JE
+  message ("Database.sync() is only supported for deferred-write databases"),
+  matching JE's `DatabaseImpl.sync` (`DatabaseImpl.java:1389-1395`). Deferred-
+  write `Database::sync()` is unchanged. **Migration:** to make a
+  non-transactional / non-deferred-write write durable, call
+  `Environment::flush_log(true)` (fsync the buffered log) or
+  `Environment::sync()` (a forced checkpoint) instead of `Database::sync()`,
+  or commit a transaction with SYNC durability.
+
 ### Added
 
 - `Environment::sync()` — flushes dirty data and runs a forced checkpoint,

@@ -2200,39 +2200,56 @@ impl Database {
         }
     }
 
-    /// Flushes all pending writes for this database to stable storage.
+    /// Flushes a **deferred-write** database's dirty tree to stable storage.
     ///
-    /// Implements `Database.sync()` — issues an fdatasync on the log file,
-    /// ensuring that all writes made by non-transactional or deferred-sync
-    /// operations are durable before returning.
+    /// Implements `Database.sync()` — which JE supports **only** for a
+    /// deferred-write database (`DatabaseImpl.sync(true)`,
+    /// DatabaseImpl.java:1389-1395).  For a deferred-write db it flushes the
+    /// db's dirty BINs/INs bottom-up and fsyncs, making its records durable.
     ///
-    /// # Returns
-    /// `Ok(())` on success. Acts as a no-op for non-transactional /
-    /// in-memory environments where no log manager is configured.
+    /// For a non-deferred-write database this is **not supported** (as in JE):
+    /// make a non-transactional / non-DW write durable with
+    /// [`Environment::sync`] (a forced checkpoint) or
+    /// [`Environment::flush_log`] with `fsync = true`, or commit a
+    /// transaction with SYNC durability.
+    ///
+    /// [`Environment::sync`]: crate::Environment::sync
+    /// [`Environment::flush_log`]: crate::Environment::flush_log
     ///
     /// # Errors
-    /// Returns an error if the database is closed or the underlying
-    /// log-manager flush fails.
+    /// Returns [`NoxuError::OperationNotAllowed`] if the database is not
+    /// deferred-write (with the JE message "Database.sync() is only supported
+    /// for deferred-write databases"), if the database is closed, or if the
+    /// underlying flush fails.
     pub fn sync(&self) -> Result<()> {
         self.check_open()?;
+        // JE `Database.sync()` -> `DatabaseImpl.sync(true)`: a sync is only
+        // supported for a deferred-write database.  `DatabaseImpl.sync` throws
+        // `UnsupportedOperationException("Database.sync() is only supported for
+        // deferred-write databases")` when the db is not durable-deferred-write
+        // (DatabaseImpl.java:1389-1395), BEFORE touching the tree.  Noxu maps
+        // that to `OperationNotAllowed` with the JE-exact message.  A
+        // non-transactional / non-DW write is made durable through
+        // `Environment::sync()` (a forced checkpoint, JE `Environment.sync()`)
+        // or `Environment::flush_log(true)` (JE `Environment.flushLog`) — not
+        // through `Database::sync()`.
+        if !self.db_impl.read().is_deferred_write() {
+            return Err(NoxuError::OperationNotAllowed(
+                "Database.sync() is only supported for deferred-write databases"
+                    .to_string(),
+            ));
+        }
         // BUG-DW-SYNC-1 fix: a DEFERRED-WRITE DB defers LOGGING of its tree, so
         // flushing the log buffer alone makes nothing durable — the dirty
-        // BINs/INs were never logged.  JE `Database.sync()` ->
-        // `DatabaseImpl.sync(true)` -> `Checkpointer.syncDatabase(dbImpl)`
-        // (Checkpointer.java:950-988) flushes THIS db's dirty tree bottom-up
-        // (ckptStart=NULL) then flushSync.  Route a deferred-write sync through
-        // the per-DB checkpointer path so synced records survive a crash.
-        if self.db_impl.read().is_deferred_write() {
-            let env_impl = self.env_impl.lock();
-            env_impl
-                .sync_database(self.id)
-                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
-            return Ok(());
-        }
-        if let Some(lm) = &self.log_manager {
-            lm.flush_sync()
-                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
-        }
+        // BINs/INs were never logged.  JE `DatabaseImpl.sync(true)` ->
+        // `Checkpointer.syncDatabase(dbImpl)` (Checkpointer.java:950-988)
+        // flushes THIS db's dirty tree bottom-up (ckptStart=NULL) then
+        // flushSync.  Route the deferred-write sync through the per-DB
+        // checkpointer path so synced records survive a crash.
+        let env_impl = self.env_impl.lock();
+        env_impl
+            .sync_database(self.id)
+            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
         Ok(())
     }
 
@@ -3206,14 +3223,20 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_on_open_database_succeeds() {
-        let (_tmp, _env, db) = temp_env_and_db();
+    fn test_sync_on_non_deferred_write_database_is_refused() {
+        // JE `Database.sync()` is supported only for deferred-write databases
+        // (`DatabaseImpl.sync` throws otherwise, DatabaseImpl.java:1389-1395).
+        // `temp_env_and_db()` opens a plain (non-DW) transactional db, so sync
+        // must be refused; the supported durability path is `env.flush_log`.
+        let (_tmp, env, db) = temp_env_and_db();
         db.put(
             DatabaseEntry::from_bytes(b"key"),
             DatabaseEntry::from_bytes(b"val"),
         )
         .unwrap();
-        assert!(db.sync().is_ok());
+        assert!(matches!(db.sync(), Err(NoxuError::OperationNotAllowed(_))));
+        // The supported non-DW durability path still works.
+        env.flush_log(true).unwrap();
     }
 
     #[test]
