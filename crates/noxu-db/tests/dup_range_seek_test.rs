@@ -34,9 +34,10 @@ fn env(dir: &Path) -> Environment {
 }
 
 fn dup_db(e: &Environment) -> noxu_db::Database {
+    // FID-CURSOR-AUTOCOMMIT: non-txn cursor put/delete is JE's ThreadLocker
+    // path -> a non-transactional db.
     let c = DatabaseConfig::new()
         .with_allow_create(true)
-        .with_transactional(true)
         .with_sorted_duplicates(true);
     e.open_database(None, "dups", &c).unwrap()
 }

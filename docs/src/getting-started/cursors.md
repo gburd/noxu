@@ -49,12 +49,45 @@ cursor.close()?;
 The first argument is an optional transaction. The second is an optional `CursorConfig`. Both are
 typically `None` for simple use cases.
 
-The transaction argument **is honoured** in v1.5: passing
-`Some(&txn)` causes the cursor's reads and writes to acquire locks on
-behalf of `txn`, and the cursor must be closed before `txn.commit()` /
-`txn.abort()`. Passing `None` opens an auto-commit cursor whose writes
-still go through the lock manager but whose locks are
-released per-operation.
+The transaction argument **is honoured**: passing `Some(&txn)` causes the
+cursor's reads and writes to acquire locks on behalf of `txn`, and the cursor
+must be closed before `txn.commit()` / `txn.abort()`.
+
+Passing `None` opens an auto-commit cursor. On a **transactional** database
+such a cursor is **read-only**: its reads are allowed, but every update
+(`put`, `delete`, `put` with `Put::Current`) returns
+`NoxuError::OperationNotAllowed` — "a Transaction was not supplied to
+openCursor and the Database is transactional". This matches Berkeley DB JE
+(`Cursor.updateOperationsProhibited`): to write through a cursor on a
+transactional database, open it with `open_cursor_in(&txn, …)` under an
+explicit transaction (or use `Database::put` / `Database::delete`, which
+auto-commit). On a **non-transactional** database, a `None` cursor's writes
+*are* allowed; like all non-transactional writes they are **not fsynced per
+operation** — call `Environment::sync()` (or `Environment::flush_log(true)`,
+a checkpoint, or close) to make them durable.
+
+> **Migration note.** Earlier releases let an `open_cursor(None)` write to a
+> *transactional* database (auto-committing per write). That is no longer
+> allowed (it never matched JE). Replace
+>
+> ```rust
+> let mut cursor = db.open_cursor(None)?; // db is transactional
+> cursor.put(&key, &data, Put::Overwrite)?;
+> ```
+>
+> with an explicit transaction:
+>
+> ```rust
+> let txn = env.begin_transaction(None)?;
+> {
+>     let mut cursor = db.open_cursor_in(&txn, None)?;
+>     cursor.put(&key, &data, Put::Overwrite)?;
+>     cursor.close()?;
+> }
+> txn.commit()?;
+> ```
+>
+> — or use `db.put(key, data)` (auto-commit) for a single write.
 
 Cursors must be closed before the database they belong to is closed. Failing to close cursors
 before closing a database returns an error.

@@ -143,10 +143,24 @@ fn auto_commit_cursor_put_is_refused() {
     let mut cur = db.open_cursor(None).unwrap();
     let key = noxu_db::DatabaseEntry::from_bytes(b"ck");
     let val = noxu_db::DatabaseEntry::from_bytes(b"cv");
-    assert_refused(
-        cur.put(&key, &val, Put::Overwrite),
-        "auto-commit cursor.put",
-    );
+    // FID-CURSOR-AUTOCOMMIT: a cursor opened with no txn on a transactional db
+    // refuses updates (OperationNotAllowed) BEFORE the write can reach the
+    // replica-refusal layer.  Either refusal upholds the S1 invariant that a
+    // user write on a replica is never silently accepted.
+    match cur.put(&key, &val, Put::Overwrite) {
+        Err(NoxuError::ReplicationNotSupported { reason }) => {
+            assert!(!reason.is_empty(), "auto-commit cursor.put: empty reason");
+        }
+        Err(NoxuError::OperationNotAllowed(m)) => {
+            assert!(
+                m.contains("a Transaction was not supplied to openCursor"),
+                "auto-commit cursor.put: unexpected OperationNotAllowed: {m}",
+            );
+        }
+        other => panic!(
+            "auto-commit cursor.put: expected the write to be refused, got {other:?}"
+        ),
+    }
     drop(cur);
     let _ = db.close();
     let _ = env.close();
@@ -333,13 +347,18 @@ fn standalone_env_all_paths_unaffected() {
     db.put(b"k", b"v").expect("standalone auto-commit put must work");
     assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
     assert!(db.delete(b"k").unwrap(), "standalone delete must work");
-    // cursor put
-    let mut cur = db.open_cursor(None).unwrap();
-    let key = noxu_db::DatabaseEntry::from_bytes(b"ck");
-    let val = noxu_db::DatabaseEntry::from_bytes(b"cv");
-    cur.put(&key, &val, Put::Overwrite)
-        .expect("standalone cursor put must work");
-    drop(cur);
+    // cursor put (FID-CURSOR-AUTOCOMMIT: a cursor write on a transactional db
+    // needs a transactional locker; open under an explicit auto-commit txn).
+    {
+        let ctxn = env.begin_transaction(None).unwrap();
+        let mut cur = db.open_cursor_in(&ctxn, None).unwrap();
+        let key = noxu_db::DatabaseEntry::from_bytes(b"ck");
+        let val = noxu_db::DatabaseEntry::from_bytes(b"cv");
+        cur.put(&key, &val, Put::Overwrite)
+            .expect("standalone cursor put must work");
+        cur.close().unwrap();
+        ctxn.commit().unwrap();
+    }
     assert_eq!(db.get(b"ck").unwrap().as_deref(), Some(&b"cv"[..]));
     // explicit txn commit
     let txn = env.begin_transaction(None).unwrap();

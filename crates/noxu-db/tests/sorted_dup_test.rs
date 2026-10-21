@@ -224,14 +224,17 @@ fn test_dup_delete_specific_value() {
     db.put(&key, DatabaseEntry::from_bytes(b"v2")).unwrap();
     db.put(&key, DatabaseEntry::from_bytes(b"v3")).unwrap();
 
+    // FID-CURSOR-AUTOCOMMIT: cursor delete on a transactional db needs a txn.
+    let txn = env.begin_transaction(None).unwrap();
     // Position on v2 using SearchBoth and delete it.
-    let mut cursor = db.open_cursor(None).unwrap();
+    let mut cursor = db.open_cursor_in(&txn, None).unwrap();
     let mut kout = DatabaseEntry::from_bytes(b"k");
     let mut dout = DatabaseEntry::from_bytes(b"v2");
     let s = cursor.get(&mut kout, &mut dout, Get::SearchBoth, None).unwrap();
     assert_eq!(s, OperationStatus::Success, "should find (k, v2)");
     cursor.delete().unwrap();
     cursor.close().unwrap();
+    txn.commit().unwrap();
 
     // count() should now be 2.
     let mut cursor2 = db.open_cursor(None).unwrap();
@@ -409,8 +412,10 @@ fn test_put_no_dup_data_rejects_exact_duplicate() {
     let data = DatabaseEntry::from_bytes(b"v");
     db.put(&key, &data).unwrap();
 
+    // FID-CURSOR-AUTOCOMMIT: cursor put on a transactional db needs a txn.
+    let txn = env.begin_transaction(None).unwrap();
     // Second insert with the same (key, data) pair using NoDupData.
-    let mut cursor = db.open_cursor(None).unwrap();
+    let mut cursor = db.open_cursor_in(&txn, None).unwrap();
     let s = cursor.put(&key, &data, Put::NoDupData).unwrap();
     assert_eq!(s, OperationStatus::KeyExists);
 
@@ -420,6 +425,7 @@ fn test_put_no_dup_data_rejects_exact_duplicate() {
     assert_eq!(s2, OperationStatus::Success);
 
     cursor.close().unwrap();
+    txn.commit().unwrap();
     let _ = env.close();
 }
 

@@ -1659,10 +1659,17 @@ impl Database {
     /// (review P0-1: returns `Cursor<'_>`; review P0-2: auto-commit is the
     /// unadorned form, the transactional form is [`Self::open_cursor_in`]).
     ///
-    /// In auto-commit mode each cursor write is its own transaction.  On a
-    /// **non-transactional** database cursor writes are NOT fsynced per write
-    /// (JE's `ThreadLocker` path, FID-NONTXN-SYNC-FSYNC); call
-    /// [`crate::Environment::sync`] to make them durable.
+    /// On a **transactional** database a cursor opened with no transaction is
+    /// READ-ONLY: its reads are allowed but every update (`put`, `delete`)
+    /// returns [`NoxuError::OperationNotAllowed`], matching JE
+    /// `Cursor.updateOperationsProhibited` (Cursor.java:333-338/5340-5367) —
+    /// "a Transaction was not supplied to openCursor and the Database is
+    /// transactional".  To write through a cursor on a transactional db, open
+    /// it with [`Self::open_cursor_in`] under an explicit transaction, or use
+    /// [`Self::put`] / [`Self::delete`] (auto-commit).  On a
+    /// **non-transactional** database cursor writes are allowed (JE's
+    /// `ThreadLocker` path) and are NOT fsynced per write (FID-NONTXN-SYNC-FSYNC);
+    /// call [`crate::Environment::sync`] to make them durable.
     ///
     /// # Arguments
     /// * `config` - Optional cursor configuration
@@ -1673,7 +1680,7 @@ impl Database {
         &self,
         config: Option<&CursorConfig>,
     ) -> Result<Cursor<'static>> {
-        self.open_cursor_internal(None, config)
+        self.open_cursor_user(None, config)
     }
 
     /// Opens a cursor bound to an explicit transaction (review P0-1/P0-2).
@@ -1699,7 +1706,36 @@ impl Database {
         txn: &'txn Transaction,
         config: Option<&CursorConfig>,
     ) -> Result<Cursor<'txn>> {
-        self.open_cursor_internal(Some(txn), config)
+        self.open_cursor_user(Some(txn), config)
+    }
+
+    /// User-facing cursor open (JE `Database.openCursor`).  Wraps
+    /// [`Self::open_cursor_internal`] and, for a cursor opened WITHOUT a
+    /// transaction on a TRANSACTIONAL database, marks its updates prohibited —
+    /// JE `Cursor.init` sets `updateOperationsProhibited =
+    /// (databaseImpl.isTransactional() && !locker.isTransactional())`
+    /// (Cursor.java:333-338), and `checkUpdatesAllowed` throws for such a
+    /// cursor (Cursor.java:5340-5367).  FID-CURSOR-AUTOCOMMIT.
+    ///
+    /// Internal engine cursors (secondary-index maintenance, iterators,
+    /// `noxu-collections` / `noxu-persist` / XA / cleaner / recovery) call
+    /// [`Self::open_cursor_internal`] directly and are NOT prohibited — in JE
+    /// those run under an auto-commit *transactional* locker so their writes
+    /// are allowed.
+    pub(crate) fn open_cursor_user<'txn>(
+        &self,
+        txn: Option<&'txn Transaction>,
+        config: Option<&CursorConfig>,
+    ) -> Result<Cursor<'txn>> {
+        let mut cursor = self.open_cursor_internal(txn, config)?;
+        // JE Cursor.updateOperationsProhibited: a user cursor whose database
+        // is transactional but whose locker is NOT transactional (no txn
+        // supplied) prohibits all updates.
+        if self.config.transactional && txn.is_none() && !cursor.is_read_only()
+        {
+            cursor.set_writes_prohibited(true);
+        }
+        Ok(cursor)
     }
 
     /// Shared cursor-open used by [`Self::open_cursor`] /

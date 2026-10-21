@@ -53,9 +53,10 @@ fn do_key_scan(dups: bool) {
             .open_database(
                 None,
                 "foo",
+                // FID-CURSOR-AUTOCOMMIT: cursor write with no txn is JE's
+                // ThreadLocker path -> non-transactional db.
                 &DatabaseConfig::new()
                     .with_allow_create(true)
-                    .with_transactional(true)
                     .with_sorted_duplicates(dups),
             )
             .unwrap();
