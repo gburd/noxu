@@ -356,6 +356,29 @@ impl Transaction {
         self.commit_callbacks.lock().unwrap().push(Box::new(f));
     }
 
+    /// XDB-711: register a catalog-visibility callback on the inner `Txn` that
+    /// runs AFTER the durable TxnCommit barrier but BEFORE the write/name-
+    /// record locks are released (JE `setDeletedDatabaseState(true)` ordering).
+    /// A transactional remove/rename uses this to publish its `name_map` swap
+    /// while the name WRITE lock is still held, so the checkpoint relog cannot
+    /// observe a stale-vs-committed divergence and the F-DDL-1 identity guard
+    /// sees the still-current binding.  The callback must do fast map updates
+    /// only (no `DatabaseImpl` teardown, no `env_impl` lock on a path that can
+    /// hold a `DatabaseImpl` guard under `env_impl`).  Dropped without running
+    /// on abort / non-durable commit.  If there is no inner `Txn` (should not
+    /// happen for a real DDL txn) the callback is dropped.
+    pub fn register_precommit_catalog_callback<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + Sync + 'static,
+    {
+        if let Some(inner) = &self.inner_txn {
+            inner
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .register_precommit_catalog_callback(f);
+        }
+    }
+
     /// Record that a triggered database was modified under this transaction
     /// (DB-TRIG).
     ///

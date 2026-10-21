@@ -239,6 +239,21 @@ pub struct Txn {
     ///
     post_commit_hook: Option<Box<dyn Fn(Lsn) + Send + Sync>>,
 
+    /// XDB-711: catalog-visibility callbacks run AFTER the durable TxnCommit
+    /// barrier but BEFORE the write (and name-record) locks are released --
+    /// JE `Txn.commit`'s `setDeletedDatabaseState(true)` ordering, which runs
+    /// between `logCommitEntry` and `releaseWriteLocks` (Txn.java:760-812).
+    /// A transactional remove/rename registers its `name_map` swap here so the
+    /// authoritative committed catalog is published while the name WRITE lock
+    /// is STILL held: the per-checkpoint relog (non-blocking READ on the name
+    /// lock) is thus DENIED for the whole window and can never observe a
+    /// stale-vs-committed divergence, and the F-DDL-1 identity guard sees the
+    /// still-current binding (no commit-window TOCTOU no-op).  Drained in
+    /// commit order; cleared on abort without running (abort leaves `name_map`
+    /// unchanged).
+    #[allow(clippy::type_complexity)]
+    precommit_catalog_callbacks: Vec<Box<dyn FnOnce() + Send + Sync>>,
+
     /// Optional group-commit handler (Master or Replica).
     ///
     /// When `Some` and enabled, `commit()` calls `buffer_commit()` after
@@ -367,6 +382,7 @@ impl Txn {
             abort_lsn: NULL_LSN.as_u64(),
             pre_commit_hook: None,
             post_commit_hook: None,
+            precommit_catalog_callbacks: Vec::new(),
             group_commit: None,
         }
     }
@@ -703,10 +719,26 @@ impl Txn {
         // were drained pre-append; repeatable-read / serializable readers hold
         // their own read locks and are unaffected.
         //
-        // (DDL catalog visibility -- JE `setDeletedDatabaseState(true)`, run
-        // between the durable write and the lock release -- is handled by the
-        // dbi/engine catalog path, not here; keeping the release after the
-        // durable barrier preserves that "visible-then-released" ordering.)
+        // XDB-711 (JE `setDeletedDatabaseState(true)`): the commit is now
+        // durable; run the catalog-VISIBILITY callbacks (the `name_map` swap
+        // for a transactional remove/rename) HERE -- after the durable barrier
+        // and BEFORE the write (and name-record) locks are released -- exactly
+        // JE's `logCommitEntry` -> `setDeletedDatabaseState(true)` ->
+        // `releaseWriteLocks` order (Txn.java:760-812).  Publishing the
+        // committed catalog while the name WRITE lock is still held means the
+        // per-checkpoint relog's non-blocking READ on that name is DENIED for
+        // the whole window (so it can never log a stale-vs-committed binding),
+        // and the F-DDL-1 identity guard sees the still-current binding (no
+        // commit-window TOCTOU no-op).  These callbacks do FAST map updates
+        // only (`name_map` / `pending_ddl_names`); heavy `DatabaseImpl`
+        // teardown stays in the post-release commit callbacks (JE
+        // `cleanupDatabaseImpls` outside the sync block).  They run ONLY on a
+        // durable commit -- the durable-phase failure path above returns
+        // before reaching here, leaving the catalog unchanged.
+        for cb in self.precommit_catalog_callbacks.drain(..) {
+            cb();
+        }
+
         for lsn in self.write_locks.keys().copied().collect::<Vec<_>>() {
             if let Err(e) = self.lock_manager.release(lsn, self.id) {
                 log::error!(
@@ -911,6 +943,23 @@ impl Txn {
         F: Fn(Lsn) + Send + Sync + 'static,
     {
         self.post_commit_hook = Some(Box::new(hook));
+    }
+
+    /// XDB-711: register a catalog-visibility callback that runs AFTER the
+    /// durable TxnCommit barrier but BEFORE the write/name-record locks are
+    /// released (JE `setDeletedDatabaseState(true)` ordering).  The callback
+    /// must do FAST, non-blocking catalog map updates only (`name_map` /
+    /// `pending_ddl_names`); it must NOT take `env_impl` if any path can hold
+    /// a `DatabaseImpl` guard while taking `env_impl`, and must NOT perform
+    /// `DatabaseImpl` teardown (leave that to a post-release commit callback).
+    /// Callbacks run in registration order on a durable commit only; on abort
+    /// or a durable-phase failure they are dropped without running (the
+    /// catalog stays as it was).
+    pub fn register_precommit_catalog_callback<F>(&mut self, cb: F)
+    where
+        F: FnOnce() + Send + Sync + 'static,
+    {
+        self.precommit_catalog_callbacks.push(Box::new(cb));
     }
 
     /// Returns the current transaction state.
@@ -1667,6 +1716,12 @@ impl Txn {
     /// lock-manager entry, but losing the *whole* drain leaks every
     /// lock the txn ever held until the environment is closed.
     pub fn release_all_locks(&mut self) {
+        // XDB-711: a txn reaching `release_all_locks` did NOT complete a durable
+        // commit (this is the abort / commit-error path -- the success path
+        // releases write locks inline after draining these callbacks).  Drop
+        // any registered catalog-visibility callbacks WITHOUT running them so
+        // an aborted / failed remove/rename never mutates `name_map`.
+        self.precommit_catalog_callbacks.clear();
         for lsn in self.write_locks.keys().copied().collect::<Vec<_>>() {
             if let Err(e) = self.lock_manager.release(lsn, self.id) {
                 log::error!(

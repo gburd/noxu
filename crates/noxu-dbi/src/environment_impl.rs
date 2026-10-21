@@ -2158,6 +2158,11 @@ impl EnvironmentImpl {
             let comparators_for_relog = Arc::clone(&recovered_comparators);
             let fanouts_for_relog = Arc::clone(&recovered_fanouts);
             let pending_ddl_for_relog = Arc::clone(&pending_ddl_names);
+            // XDB-711: the relog takes the R-LIVEDDL name record lock
+            // (non-blocking READ) and mints a throwaway locker for it, so it
+            // needs the shared LockManager + TxnManager.
+            let lock_manager_for_relog = Arc::clone(&lock_manager);
+            let txn_manager_for_relog = Arc::clone(&txn_manager);
             ckpt.set_catalog_relog_fn(Arc::new(move || {
                 relog_live_catalog_impl(
                     &lm_for_relog,
@@ -2166,6 +2171,9 @@ impl EnvironmentImpl {
                     &comparators_for_relog,
                     &fanouts_for_relog,
                     &pending_ddl_for_relog,
+                    &lock_manager_for_relog,
+                    &txn_manager_for_relog,
+                    &|| {}, // production: no witness seam
                 );
             }));
         }
@@ -3061,32 +3069,61 @@ impl EnvironmentImpl {
             // recovered_db_id.is_some(): db already in name_map from recovery;
             // name_map insertion is a no-op and no new WAL entry is needed.
         } else {
-            // Non-transactional path (or reopening a recovered db): insert
-            // into name_map immediately, as before.
-            self.name_map.write().insert(name.to_string(), db_id);
+            // Non-transactional path (a fresh auto-commit create, or a reopen
+            // reconstructing a db evicted / recovered-not-opened).
+            //
+            // XDB-711: the name_map INSERT here must be serialized against a
+            // concurrent catalog op (esp. a rename moving this name's id to a
+            // different name).  The caller (`Environment::open_database`) now
+            // holds the name record lock (WRITE for a fresh create, blocking
+            // READ for an open of an existing name) taken BEFORE `env_impl`
+            // and latch-free (v8 Rule 2b: never block on the lock manager
+            // while holding `env_impl`), so a concurrent rename's WRITE lock
+            // is serialized against this registration -- JE holds the NameLN
+            // lock across `getDb`/`createDb`.  As defence in depth (and for
+            // the internal-DB / recovery callers that do not route through the
+            // noxu-db lock), re-validate under the `name_map` write guard: a
+            // REOPEN re-inserts only if the name still maps to `db_id` (a
+            // concurrent rename-away leaves the id live under the NEW name, so
+            // the stale old name must NOT be resurrected); a fresh CREATE
+            // inserts only if the name is still absent.
+            let mut nm = self.name_map.write();
+            let do_insert = match (recovered_db_id, nm.get(name).copied()) {
+                (Some(_), Some(cur)) if cur == db_id => true,
+                (Some(_), _) => false,
+                (None, None) => true,
+                (None, Some(_)) => false,
+            };
+            if do_insert {
+                nm.insert(name.to_string(), db_id);
+                drop(nm);
 
-            // Persist the name → id mapping to the WAL (only for new
-            // creations and writable environments) so that subsequent
-            // reopens can reconstruct name_map.
-            if recovered_db_id.is_none()
-                && let Some(lm) = &self.log_manager
-            {
-                let _ = Self::log_name_ln(
-                    lm,
-                    name,
-                    db_id.id() as u64,
-                    config
-                        .btree_comparator
-                        .as_ref()
-                        .map(|c| c.identity.as_str()),
-                    config
-                        .duplicate_comparator
-                        .as_ref()
-                        .map(|c| c.identity.as_str()),
-                    // NEW-5: persist the DB's effective fanout.
-                    Some(config.node_max_entries),
-                );
+                // Persist the name → id mapping to the WAL (only for new
+                // creations and writable environments) so that subsequent
+                // reopens can reconstruct name_map.
+                if recovered_db_id.is_none()
+                    && let Some(lm) = &self.log_manager
+                {
+                    let _ = Self::log_name_ln(
+                        lm,
+                        name,
+                        db_id.id() as u64,
+                        config
+                            .btree_comparator
+                            .as_ref()
+                            .map(|c| c.identity.as_str()),
+                        config
+                            .duplicate_comparator
+                            .as_ref()
+                            .map(|c| c.identity.as_str()),
+                        // NEW-5: persist the DB's effective fanout.
+                        Some(config.node_max_entries),
+                    );
+                }
             }
+            // else: the name was rebound/removed by a concurrent committed op
+            // while we reconstructed -- refuse the stale re-register (the
+            // `nm` guard drops here).
         }
 
         Ok((db, name_ln_lsn))
@@ -3304,7 +3341,53 @@ impl EnvironmentImpl {
             &self.recovered_comparators,
             &self.recovered_fanouts,
             &self.pending_ddl_names,
+            &self.lock_manager,
+            &self.txn_manager,
+            &|| {}, // production: no witness seam
         );
+    }
+
+    /// XDB-711 deterministic-witness entry point (`#[doc(hidden)]`, test-only
+    /// cross-crate seam, no stable-tier API surface).
+    ///
+    /// Returns a self-contained closure that captures CLONES of the relog's
+    /// shared state (`Arc`s only -- never a borrow of `self`).  The witness
+    /// locks the `Mutex<EnvironmentImpl>` just long enough to obtain the
+    /// closure, DROPS the guard, then invokes the closure passing a hook that
+    /// commits a rename/remove on a snapshotted name in the window between the
+    /// relog's `name_map` snapshot and its first per-name append.  Because the
+    /// closure holds no `self` borrow, the hook is free to re-enter
+    /// `env_impl.lock()` to run that DDL -- no re-entrant deadlock.
+    ///
+    /// Never called in production; `relog_live_catalog` is the real entry
+    /// point.  The closure performs exactly what the checkpointer callback
+    /// does, plus the one `after_snapshot` call.
+    #[doc(hidden)]
+    #[allow(clippy::type_complexity)]
+    pub fn relog_snapshot_hook_runner(
+        &self,
+    ) -> Option<Box<dyn Fn(&dyn Fn()) + Send + Sync>> {
+        let lm = Arc::clone(self.log_manager.as_ref()?);
+        let name_map = Arc::clone(&self.name_map);
+        let db_map = Arc::clone(&self.db_map);
+        let comparators = Arc::clone(&self.recovered_comparators);
+        let fanouts = Arc::clone(&self.recovered_fanouts);
+        let pending = Arc::clone(&self.pending_ddl_names);
+        let lock_manager = Arc::clone(&self.lock_manager);
+        let txn_manager = Arc::clone(&self.txn_manager);
+        Some(Box::new(move |after_snapshot: &dyn Fn()| {
+            relog_live_catalog_impl(
+                &lm,
+                &name_map,
+                &db_map,
+                &comparators,
+                &fanouts,
+                &pending,
+                &lock_manager,
+                &txn_manager,
+                after_snapshot,
+            );
+        }))
     }
 
     /// R-RELOG (S1): re-log the committed NameLN for `name` ONE time as a live
@@ -4008,15 +4091,94 @@ impl EnvironmentImpl {
         self.check_open()?;
         match self.name_map.read().get(name).copied() {
             Some(id) if id == expected_id => {}
-            // Name gone, or now bound to a different (recreated) database:
-            // the validated target is already gone/replaced -> no-op.
-            _ => return Ok(false),
+            other => {
+                // F-DDL-1 (see remove_database_make_visible_if_id): a
+                // concurrent committed catalog op on this name may have moved
+                // the current binding off the validated id.  NO-OP (do not
+                // destroy the other incarnation); debug-logged, not asserted.
+                log::debug!(
+                    "XDB-711: remove_database_if_id({name}): expected {} but \
+                     name_map has {:?} (concurrent DDL won); no-op",
+                    expected_id.id(),
+                    other.map(|i| i.id())
+                );
+                return Ok(false);
+            }
         }
         // BUG-DDL-DURABILITY-1: the NameLN-delete tombstone was already logged
         // transactionally at operation time; the commit callback only does the
         // physical cleanup.
         self.apply_deferred_remove_database(name)?;
         Ok(true)
+    }
+
+    /// XDB-711: the catalog-VISIBILITY half of a deferred remove -- publish the
+    /// `name_map` removal ONLY (plus the recovered-metadata / evicted-state
+    /// bookkeeping the relog reads), NO `DatabaseImpl` teardown and NO
+    /// obsolete counting.  Run as a precommit catalog callback (name WRITE
+    /// lock still held, JE `setDeletedDatabaseState(true)`), so the
+    /// per-checkpoint relog's non-blocking READ on the name is denied for the
+    /// window and recovery honours the committed removal.  The heavy
+    /// `DatabaseImpl` teardown + obsolete counting run post-release via
+    /// [`Self::remove_database_finish_cleanup`] (JE `cleanupDatabaseImpls`
+    /// outside the sync block).  Identity-guarded (F-DDL-1); with the lock
+    /// held the guard must match (asserted).  Returns the removed `db_id` so
+    /// the caller can schedule the cleanup, or `None` on a (should-not-happen)
+    /// no-op.
+    pub fn remove_database_make_visible_if_id(
+        &self,
+        name: &str,
+        expected_id: DatabaseId,
+    ) -> Result<Option<DatabaseId>, DbiError> {
+        self.check_open()?;
+        match self.name_map.read().get(name).copied() {
+            Some(id) if id == expected_id => {}
+            other => {
+                // F-DDL-1: a concurrent committed remove/rename on this name
+                // (its own precommit ran first and already republished
+                // `name_map`) can leave the current binding different from the
+                // id this txn validated.  That is the identity guard doing its
+                // job -- NO-OP, do not destroy the other incarnation.  Logged
+                // at debug level (not asserted: it is a legitimate concurrent
+                // outcome, not an invariant violation).
+                log::debug!(
+                    "XDB-711: remove_database_make_visible_if_id({name}): \
+                     expected {} but name_map has {:?} (concurrent DDL won); \
+                     no-op",
+                    expected_id.id(),
+                    other.map(|i| i.id())
+                );
+                return Ok(None);
+            }
+        }
+        // Publish the removal to the authoritative in-memory catalog.  No
+        // `DatabaseImpl` guard is taken here (teardown is deferred), so the
+        // callback cannot participate in an env_impl <-> DatabaseImpl cycle.
+        self.name_map.write().remove(name);
+        self.recovered_comparators.write().remove(name);
+        self.recovered_fanouts.write().remove(name);
+        self.evicted_db_state.write().remove(name);
+        Ok(Some(expected_id))
+    }
+
+    /// XDB-711: the CLEANUP half of a deferred remove -- the heavy
+    /// `DatabaseImpl` teardown, deferred-write deregistration and obsolete
+    /// counting for a `db_id` whose `name_map` entry was already published
+    /// removed by [`Self::remove_database_make_visible_if_id`].  Runs
+    /// POST-release (ordinary commit callback), outside the name lock, mirror
+    /// of JE `cleanupDatabaseImpls` after `releaseWriteLocks`.  Idempotent.
+    pub fn remove_database_finish_cleanup(&self, db_id: DatabaseId) {
+        if let Some(db) = self.db_map.write().remove(&db_id) {
+            db.write().start_delete();
+            db.write().finish_delete();
+        }
+        if let Ok(mut dw) = self.deferred_write_dbs.lock() {
+            dw.remove(&(db_id.id() as u64));
+        }
+        // NEW-CLEANER-DBOBSOLETE: count the removed DB's footprint obsolete so
+        // the cleaner reclaims its files (JE finishDeleteProcessing ->
+        // countObsoleteDb).
+        self.count_database_obsolete(db_id);
     }
 
     /// BUG-DDL-DURABILITY-1: log a TRANSACTIONAL NameLN-delete tombstone for a
@@ -4057,7 +4219,19 @@ impl EnvironmentImpl {
         self.check_open()?;
         match self.name_map.read().get(old_name).copied() {
             Some(id) if id == expected_id => {}
-            _ => return Ok(false),
+            other => {
+                // F-DDL-1: a concurrent committed catalog op on `old_name`
+                // moved the binding off the validated id.  NO-OP (do not
+                // relocate the other incarnation); debug-logged, not asserted.
+                log::debug!(
+                    "XDB-711: rename_database_if_id({old_name}->{new_name}): \
+                     expected {} but name_map has {:?} (concurrent DDL won); \
+                     no-op",
+                    expected_id.id(),
+                    other.map(|i| i.id())
+                );
+                return Ok(false);
+            }
         }
         // BUG-DDL-DURABILITY-1: the NameLN delete(old)+create(new) entries were
         // already logged transactionally at operation time; the commit callback
@@ -4283,6 +4457,15 @@ impl EnvironmentImpl {
         self.name_map.read().keys().cloned().collect()
     }
 
+    /// XDB-711: whether `name` currently resolves to a database -- committed
+    /// (`name_map`) or pending a transactional create (`pending_names`).  Used
+    /// by the auto-commit open path to decide WRITE (fresh create) vs blocking
+    /// READ (open of an existing name) for the name record lock.
+    pub fn database_exists(&self, name: &str) -> bool {
+        self.name_map.read().contains_key(name)
+            || self.pending_names.read().contains_key(name)
+    }
+
     // Transaction operations
 
     /// Begins a new transaction.
@@ -4348,13 +4531,14 @@ impl EnvironmentImpl {
         non_blocking: bool,
     ) -> Result<(), DbiError> {
         let lock_id = noxu_util::Lsn::name_lock_id(name);
-        match self.lock_manager.lock(
+        let r = self.lock_manager.lock(
             lock_id,
             locker_id,
             lock_type,
             non_blocking,
             false, // jumpAheadOfWaiters: ordinary locker (JE Locker.java:503)
-        ) {
+        );
+        match r {
             Ok(LockGrantType::Denied) => {
                 // Non-blocking request denied by a conflicting holder -- JE
                 // `acquireHandleLock` nonblocking READ DENIED -> preempted.
@@ -4568,20 +4752,24 @@ impl EnvironmentImpl {
                     }
                 }
                 RecoveredDdlAction::Remove { name, db_id } => {
-                    self.clear_pending_ddl(&name);
                     if commit {
                         // Live commit callback: physical removal,
-                        // identity-guarded.
+                        // identity-guarded.  XDB-711 ORDER (mirror of the relog
+                        // read order): publish `name_map` (the physical
+                        // removal) FIRST, THEN clear `pending_ddl_names`, so a
+                        // relog that sees the mark cleared also sees `name_map`
+                        // updated -- it can never re-log the stale binding.
                         self.remove_database_if_id(&name, db_id)?;
                     }
-                    // Abort: nothing -- the name stays live (relog resumes once
-                    // the mark is cleared), exactly as the live abort callback.
+                    // Abort: name_map unchanged (the name stays live), so just
+                    // clear the mark; relog resumes with the current binding.
+                    self.clear_pending_ddl(&name);
                 }
                 RecoveredDdlAction::Rename { old_name, new_name, db_id } => {
-                    self.clear_pending_ddl(&old_name);
                     if commit {
                         // Live commit callback: swap old->new,
-                        // identity-guarded.
+                        // identity-guarded.  XDB-711 ORDER: publish `name_map`
+                        // (the swap) FIRST, THEN clear `pending_ddl_names`.
                         self.rename_database_if_id(
                             &old_name, &new_name, db_id,
                         )?;
@@ -4589,6 +4777,7 @@ impl EnvironmentImpl {
                         // Abort: drop the in-doubt NEW name; OLD name survives.
                         self.abort_pending_database(&new_name);
                     }
+                    self.clear_pending_ddl(&old_name);
                 }
             }
         }
@@ -5295,6 +5484,7 @@ impl EnvironmentImpl {
 /// `Arc<Mutex<EnvironmentImpl>>` that the manual / close checkpoint paths hold
 /// while calling `do_checkpoint` (that would deadlock).  See the
 /// `Checkpointer::catalog_relog_fn` field docs for the full rationale.
+#[allow(clippy::too_many_arguments)]
 fn relog_live_catalog_impl(
     lm: &Arc<LogManager>,
     name_map: &Arc<RwLock<HashMap<String, DatabaseId>>>,
@@ -5304,6 +5494,15 @@ fn relog_live_catalog_impl(
     >,
     recovered_fanouts: &Arc<RwLock<HashMap<String, i32>>>,
     pending_ddl_names: &Arc<RwLock<hashbrown::HashMap<String, DatabaseId>>>,
+    lock_manager: &Arc<LockManager>,
+    txn_manager: &Arc<TxnManager>,
+    // XDB-711 deterministic-witness seam: invoked exactly once AFTER the
+    // `name_map` snapshot is taken and BEFORE the first per-name append, so a
+    // test can force the hazard interleaving "relog snapshots (name,old_id) ->
+    // a DDL on `name` COMMITS (re-binds / removes) -> relog appends".  In
+    // production every caller passes a no-op `&|| {}` (one indirect call of an
+    // empty closure per checkpoint relog, no behaviour change).
+    after_snapshot: &dyn Fn(),
 ) {
     // Snapshot (name, id) pairs so we do not hold the name_map lock across
     // WAL writes (which can block on the log write latch).
@@ -5314,59 +5513,250 @@ fn relog_live_catalog_impl(
         return;
     }
 
+    // XDB-711 (debug diagnostic): `name_map` SHOULD be injective -- no two
+    // live names binding one DatabaseId.  Two names on one id is the defect-#2
+    // signature.  A transient overlap is possible mid-flight under concurrent
+    // rename, so this is a logged diagnostic (not a hard assert that would
+    // abort a legitimate race); the RELEASE fail-safe below is the actual
+    // protection (it refuses to relog any shared id).
+    #[cfg(debug_assertions)]
+    {
+        let mut seen: HashMap<DatabaseId, &str> = HashMap::new();
+        for (n, id) in &names {
+            if let Some(prev) = seen.insert(*id, n) {
+                log::debug!(
+                    "XDB-711: name_map not injective at relog: {prev:?} and \
+                     {n:?} both bind DatabaseId {}",
+                    id.id()
+                );
+            }
+        }
+    }
+    // RELEASE fail-safe (D-ADDITIVE-SAFETY #18 defence in depth): the set of
+    // ids bound by MORE THAN ONE name.  If the writer-side fixes ever regress
+    // and leave two names on one id, the relog must NOT log either binding
+    // (logging one would cross-bind on recovery); it logs an error instead and
+    // skips both, keeping the prior durable catalog rather than a corrupt one.
+    let shared_ids: std::collections::HashSet<DatabaseId> = {
+        let mut counts: HashMap<DatabaseId, u32> = HashMap::new();
+        for (_n, id) in &names {
+            *counts.entry(*id).or_insert(0) += 1;
+        }
+        counts.into_iter().filter(|(_, c)| *c > 1).map(|(id, _)| id).collect()
+    };
+    if !shared_ids.is_empty() {
+        log::error!(
+            "XDB-711 fail-safe: {} DatabaseId(s) bound by >1 name in name_map; \
+             relog skips them to avoid a cross-bind on recovery",
+            shared_ids.len()
+        );
+    }
+
+    // XDB-711 witness seam (no-op in production): let a test commit a DDL on a
+    // snapshotted name here, so the per-name loop below observes the
+    // snapshot-vs-committed divergence the guard must reject.
+    after_snapshot();
+
     for (name, db_id) in &names {
-        // R-RELOG (S1): a name with a pending transactional remove/rename-away
-        // by an active txn is still in `name_map` (the physical removal is
-        // deferred to the commit callback), but its NameLN-delete tombstone is
-        // already in the log.  Re-logging a fresh LIVE NameLN here would land
-        // AFTER the tombstone; recovery's latest-NameLN-per-name rule then
-        // clears the pending delete and resurrects the removed/renamed-away
-        // name after a commit + crash.  Skip it — exactly as JE's cleaner
-        // skips a NameLN write-locked by the pending DDL txn
-        // (`FileProcessor.processFoundLN` nonBlockingLock DENIED ->
-        // addPendingLN -> not migrated, retried later; `FileProcessor.java:
-        // 1354-1369`).  The committed tombstone is the DDL txn's first log
-        // entry and is protected by the first-active-txn clamp (R-FIRSTLSN)
-        // while the txn is open, so recovery honours it; the stale pre-DDL
-        // live NameLN copy is never needed on commit, and on abort the DDL
-        // txn's own undo restores the name.
-        if pending_ddl_names.read().contains_key(name) {
+        // XDB-711 RELEASE fail-safe: never relog a name whose id is shared by
+        // another name (see `shared_ids`) -- logging it would cross-bind on
+        // recovery.  Skip both; the prior durable catalog stands.
+        if shared_ids.contains(db_id) {
             continue;
         }
-        // Comparator identities: prefer the open DatabaseImpl (authoritative
-        // for databases created in this session), else the identities
-        // recovered from the prior NameLN.  Both empty for the common
-        // byte-ordered case, preserving the pre-DBI-14 wire format.
-        let (btree_id, dup_id): (Option<String>, Option<String>) =
-            if let Some(db) = db_map.read().get(db_id) {
-                let g = db.read();
-                (
-                    g.btree_comparator_id().map(|s| s.to_string()),
-                    g.duplicate_comparator_id().map(|s| s.to_string()),
-                )
-            } else if let Some(ids) = recovered_comparators.read().get(name) {
-                ids.clone()
+        // XDB-711 (S1, D-ADDITIVE-SAFETY #18 extension): the snapshot above
+        // records `name -> db_id` as the committed binding AT SNAPSHOT TIME.
+        // By the time THIS iteration appends the live NameLN, a concurrent or
+        // already-committed DDL on `name` (rename / remove / recreate) may have
+        // re-bound `name` to a DIFFERENT id.  Re-logging the stale
+        // `name -> db_id` here lands it at a HIGHER LSN than that committed
+        // DDL's NameLN, and recovery's latest-NameLN-per-name rule then binds
+        // `name` to the stale id -- one database's records surface under
+        // another name and the real database's records are lost (the XDB-711
+        // cross-db resurrection).
+        //
+        // Close it with JE's exact mechanism: take the R-LIVEDDL name record
+        // lock (`Lsn::name_lock_id(name)`) NON-BLOCKING READ, exactly as JE's
+        // cleaner takes a non-blocking READ on a NameLN before migrating it
+        // (`FileProcessor.processFoundLN` -> `nonBlockingLock(treeLsn, READ)`,
+        // `FileProcessor.java:1353-1370`):
+        //   * DENIED (a DDL txn holds the WRITE lock on this name) -> SKIP,
+        //     exactly as JE's cleaner returns the LN to the pending queue and
+        //     retries later (`addPendingLN`); the relog runs inside the
+        //     checkpointer, so a blocking wait here would stall the checkpoint
+        //     under its latches -- hence non-blocking + skip.
+        //   * GRANTED -> re-read `name_map[name]` UNDER the lock and log ONLY
+        //     if it still equals the snapshot id.
+        //
+        // READ-ORDER (load-bearing, mirrors the commit side): (1) check
+        // `pending_ddl_names`, THEN (2) re-read `name_map` and compare.  The
+        // DDL-resolution side is the mirror -- it publishes `name_map` FIRST,
+        // THEN clears `pending_ddl_names` -- so the acquire/release of the name
+        // lock plus the two RwLocks give a happens-before chain: a relog that
+        // observes `pending` cleared also observes the updated `name_map`, and
+        // one that observes the old `name_map` also observes `pending` still
+        // set (and skips).  (See the remove/rename commit+abort callbacks,
+        // `resolve_recovered_prepared_ddl`, and the auto-commit RAII name lock.)
+        let relog_locker = txn_manager.allocate_locker_id();
+        let granted = match lock_manager.lock(
+            noxu_util::Lsn::name_lock_id(name),
+            relog_locker,
+            LockType::Read,
+            true,  // non_blocking: DENIED -> skip (never wait in a ckpt)
+            false, // jumpAheadOfWaiters: ordinary locker
+        ) {
+            // Granted immediately (New / already-held Existing) or no lock
+            // needed -> we hold (or need not hold) the READ lock; proceed.
+            Ok(g) => g.is_granted() || g == LockGrantType::NoneNeeded,
+            // DENIED (a DDL txn holds the WRITE lock) or the lock manager's
+            // no-wait error -> treat as not granted and skip.
+            Err(_) => false,
+        };
+        if !granted {
+            // The name's WRITE lock is held by an in-flight catalog op.  Two
+            // cases:
+            //   * a REMOVE / RENAME-away (the name is in `pending_ddl_names`):
+            //     the committed binding is being superseded, so re-logging the
+            //     snapshot would resurrect it -- SKIP, exactly as JE's cleaner
+            //     skips a NameLN write-locked by a pending DDL txn
+            //     (`FileProcessor.processFoundLN` nonBlockingLock DENIED ->
+            //     addPendingLN, retried later; `FileProcessor.java:1354-1369`).
+            //     The R-RELOG pre-tombstone copy + first-active clamp keep the
+            //     file alive for the open-txn window.
+            //   * a TRUNCATE (or a create/open) that holds the WRITE lock but
+            //     does NOT change the name->id binding (truncate keeps the
+            //     SAME DatabaseId and logs no NameLN; it is NOT in
+            //     `pending_ddl_names`): the snapshot is still the authoritative
+            //     binding, and skipping it would drop the ONLY live NameLN copy
+            //     (no clamp anchors a truncate), losing the database on
+            //     recovery.  So for a non-pending held name, log the snapshot
+            //     binding (it cannot be superseded -- the holder is not
+            //     rebinding the name).
+            let superseding = pending_ddl_names.read().contains_key(name);
+            lock_manager.unregister_locker_label(relog_locker);
+            if superseding {
+                continue;
+            }
+            // Non-superseding holder (truncate/create): re-log the snapshot
+            // binding.  `name_map` still maps `name -> db_id` (the holder is
+            // not rebinding), so this is the current committed binding.
+            if let Some(cur) = name_map.read().get(name).copied()
+                && cur == *db_id
+                && !shared_ids.contains(db_id)
+            {
+                let (btree_id, dup_id): (Option<String>, Option<String>) =
+                    if let Some(db) = db_map.read().get(db_id) {
+                        let g = db.read();
+                        (
+                            g.btree_comparator_id().map(|s| s.to_string()),
+                            g.duplicate_comparator_id().map(|s| s.to_string()),
+                        )
+                    } else if let Some(ids) =
+                        recovered_comparators.read().get(name)
+                    {
+                        ids.clone()
+                    } else {
+                        (None, None)
+                    };
+                let fanout: Option<i32> =
+                    if let Some(db) = db_map.read().get(db_id) {
+                        Some(db.read().max_tree_entries_per_node())
+                    } else {
+                        recovered_fanouts.read().get(name).copied()
+                    };
+                let _ = EnvironmentImpl::log_name_ln(
+                    lm,
+                    name,
+                    db_id.id() as u64,
+                    btree_id.as_deref(),
+                    dup_id.as_deref(),
+                    fanout,
+                );
+            }
+            continue;
+        }
+        // Scope the re-read and the log under the held READ lock, releasing it
+        // on EVERY exit path (skip or logged) via this closure.
+        let relog_one = || {
+            // R-RELOG (S1): a name with a pending transactional
+            // remove/rename-away by an active txn is still in `name_map` (the
+            // physical removal is deferred to the commit callback), but its
+            // NameLN-delete tombstone is already in the log.  Re-logging a
+            // fresh LIVE NameLN here would land AFTER the tombstone;
+            // recovery's latest-NameLN-per-name rule then clears the pending
+            // delete and resurrects the removed/renamed-away name after a
+            // commit + crash.  Skip it — exactly as JE's cleaner skips a
+            // NameLN write-locked by the pending DDL txn
+            // (`FileProcessor.processFoundLN` nonBlockingLock DENIED ->
+            // addPendingLN -> not migrated, retried later;
+            // `FileProcessor.java:1354-1369`).  The committed tombstone is the
+            // DDL txn's first log entry and is protected by the
+            // first-active-txn clamp (R-FIRSTLSN) while the txn is open, so
+            // recovery honours it; the stale pre-DDL live NameLN copy is never
+            // needed on commit, and on abort the DDL txn's own undo restores
+            // the name.
+            //
+            // STEP (1) of the load-bearing read order (see above): check
+            // `pending_ddl_names` BEFORE re-reading `name_map`.
+            if pending_ddl_names.read().contains_key(name) {
+                return;
+            }
+            // STEP (2): re-read the AUTHORITATIVE committed binding under the
+            // held name lock.  XDB-711: if `name` no longer maps to the
+            // snapshot `db_id` (a committed rename/remove/recreate re-bound it,
+            // or removed it), the snapshot is stale -- re-logging it would land
+            // a stale live NameLN past the committed DDL's NameLN and bind the
+            // name to the wrong id on recovery.  The authoritative current
+            // binding (if still live) will be relogged under ITS own name /
+            // this same loop's entry for the new id.  Skip the stale copy.
+            match name_map.read().get(name).copied() {
+                Some(cur) if cur == *db_id => {}
+                _ => return,
+            }
+            // Comparator identities: prefer the open DatabaseImpl
+            // (authoritative for databases created in this session), else the
+            // identities recovered from the prior NameLN.  Both empty for the
+            // common byte-ordered case, preserving the pre-DBI-14 wire format.
+            let (btree_id, dup_id): (Option<String>, Option<String>) =
+                if let Some(db) = db_map.read().get(db_id) {
+                    let g = db.read();
+                    (
+                        g.btree_comparator_id().map(|s| s.to_string()),
+                        g.duplicate_comparator_id().map(|s| s.to_string()),
+                    )
+                } else if let Some(ids) = recovered_comparators.read().get(name)
+                {
+                    ids.clone()
+                } else {
+                    (None, None)
+                };
+
+            // NEW-5: fanout — prefer the open DatabaseImpl (authoritative),
+            // else the fanout recovered from the prior NameLN.  `None` for a
+            // DB that never overrode the fanout, preserving the pre-NEW-5 wire
+            // format.
+            let fanout: Option<i32> = if let Some(db) = db_map.read().get(db_id)
+            {
+                Some(db.read().max_tree_entries_per_node())
             } else {
-                (None, None)
+                recovered_fanouts.read().get(name).copied()
             };
 
-        // NEW-5: fanout — prefer the open DatabaseImpl (authoritative), else
-        // the fanout recovered from the prior NameLN.  `None` for a DB that
-        // never overrode the fanout, preserving the pre-NEW-5 wire format.
-        let fanout: Option<i32> = if let Some(db) = db_map.read().get(db_id) {
-            Some(db.read().max_tree_entries_per_node())
-        } else {
-            recovered_fanouts.read().get(name).copied()
+            let _ = EnvironmentImpl::log_name_ln(
+                lm,
+                name,
+                db_id.id() as u64,
+                btree_id.as_deref(),
+                dup_id.as_deref(),
+                fanout,
+            );
         };
-
-        let _ = EnvironmentImpl::log_name_ln(
-            lm,
-            name,
-            db_id.id() as u64,
-            btree_id.as_deref(),
-            dup_id.as_deref(),
-            fanout,
-        );
+        relog_one();
+        // Release the throwaway relog READ lock on this name (every exit path
+        // of `relog_one` leaves the lock held; release it exactly once here).
+        let _ = lock_manager
+            .release(noxu_util::Lsn::name_lock_id(name), relog_locker);
+        lock_manager.unregister_locker_label(relog_locker);
     }
 
     // Ensure the re-logged NameLNs reach the log before the checkpoint's

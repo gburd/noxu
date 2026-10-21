@@ -999,21 +999,43 @@ impl Environment {
                 )?;
                 None
             } else {
-                // Auto-commit open: throwaway locker takes the READ probe,
-                // released by the RAII guard after the open regardless of
-                // outcome — including an unwind if the open panics
-                // (R-LIVEDDL-711 S3).
-                let (auto_id, res) = {
+                // Auto-commit open/create.  XDB-711 + R-LIVEDDL-711: serialize
+                // this registration against a concurrent catalog op on the
+                // same name by holding the name record lock across the whole
+                // open (JE holds the NameLN lock across `getDb`/`createDb`):
+                //   * a fresh CREATE (allow_create && name absent) takes WRITE;
+                //   * an open of an existing name takes a blocking READ.
+                // The lock is taken BLOCKING but LATCH-FREE -- we clone the
+                // `LockManager` + mint the locker id under a BRIEF `env_impl`
+                // lock, DROP `env_impl`, then block on the lock manager with no
+                // env/structural latch held (v8 Rule 2b: never wait on the lock
+                // manager while holding `env_impl`; the remover/renamer needs
+                // `env_impl` in its precommit to resolve and release this
+                // lock).  A concurrent uncommitted remove/rename holding the
+                // name's WRITE lock makes an open block until that txn resolves
+                // (then NotFound on commit, or the handle on abort) or time out
+                // with `LockTimeout` -- JE's blocking `getDb` semantics,
+                // resolving the former fail-fast `FID-711-OPEN-FAILFAST`
+                // deviation.
+                let want_write = config.allow_create && {
                     let env_impl = self.env_impl.lock();
-                    let auto_id = env_impl.next_auto_locker_id();
-                    let res = env_impl.lock_name_record(
-                        name,
-                        LockType::Read,
-                        auto_id,
-                        /*non_blocking=*/ true,
-                    );
-                    (auto_id, res)
+                    !env_impl.database_exists(name)
                 };
+                let (lm, auto_id) = {
+                    let env_impl = self.env_impl.lock();
+                    (
+                        env_impl.get_lock_manager().clone(),
+                        env_impl.next_auto_locker_id(),
+                    )
+                };
+                // Latch-free blocking acquire (no env_impl held here).
+                let res = lm.lock(
+                    noxu_util::Lsn::name_lock_id(name),
+                    auto_id,
+                    if want_write { LockType::Write } else { LockType::Read },
+                    /*non_blocking=*/ false,
+                    false,
+                );
                 // Arm the guard before checking `res` so a failed acquire still
                 // drops the throwaway locker's label (idempotent release).
                 let guard = AutoNameLockGuard {
@@ -1022,7 +1044,7 @@ impl Environment {
                     locker_id: auto_id,
                 };
                 if let Err(e) = res {
-                    return Err(map_dbi_err(name)(e));
+                    return Err(map_dbi_err(name)(noxu_dbi::DbiError::from(e)));
                 }
                 Some(guard)
             };
@@ -1103,7 +1125,17 @@ impl Environment {
             txn_ref.register_abort_callback(move || {
                 env_impl_arc.lock().abort_pending_database(&db_name_abort);
             });
-            txn_ref.register_commit_callback(move || {
+            // XDB-711: publish a committed transactional CREATE to `name_map`
+            // as a PRECOMMIT catalog callback -- after the durable TxnCommit
+            // but BEFORE the create's locks are released (JE
+            // `setDeletedDatabaseState`-side ordering, mirror of the
+            // remove/rename visibility).  The old post-commit callback
+            // published AFTER lock release, widening the window in which a
+            // checkpoint relog / `database_names()` could observe the catalog
+            // between a durable create-commit and its `name_map` publish.
+            // `commit_pending_database` is a fast `pending_names`->`name_map`
+            // move (no `DatabaseImpl` teardown), safe under the barrier.
+            txn_ref.register_precommit_catalog_callback(move || {
                 env_impl_arc2.lock().commit_pending_database(&db_name_commit);
             });
         }
@@ -1197,11 +1229,12 @@ impl Environment {
             return Ok(());
         };
         let lock_id = noxu_util::Lsn::name_lock_id(name);
-        match inner.lock().unwrap_or_else(|p| p.into_inner()).lock(
+        let r = inner.lock().unwrap_or_else(|p| p.into_inner()).lock(
             lock_id,
             lock_type,
             non_blocking,
-        ) {
+        );
+        match r {
             Ok(_) => Ok(()),
             // A non-blocking denial surfaces as LockNotAvailable from the
             // Txn/lock-manager; present it as the catalog name-conflict error
@@ -1397,7 +1430,6 @@ impl Environment {
                 }
                 let env_impl_arc = Arc::clone(&self.env_impl);
                 let databases_arc = Arc::clone(&self.databases);
-                let name_owned = name.to_string();
                 // R-RELOG (S1): clear the pending-DDL marker on BOTH commit and
                 // abort so relog resumes once the txn resolves.
                 let env_impl_abort = Arc::clone(&self.env_impl);
@@ -1405,15 +1437,43 @@ impl Environment {
                 txn.register_abort_callback(move || {
                     env_impl_abort.lock().clear_pending_ddl(&name_abort);
                 });
-                txn.register_commit_callback(move || {
-                    let mut databases = databases_arc.lock();
-                    let env = env_impl_arc.lock();
-                    env.clear_pending_ddl(&name_owned);
-                    if let Ok(true) =
-                        env.remove_database_if_id(&name_owned, db_id)
+                // XDB-711: PRECOMMIT catalog-visibility callback -- runs after
+                // the durable TxnCommit barrier but BEFORE the inner Txn
+                // releases the name WRITE lock (JE `setDeletedDatabaseState`).
+                // Publishes the `name_map` removal (and the noxu-db handle-map
+                // removal) while the name lock is still held, so the
+                // per-checkpoint relog's non-blocking READ on the name is
+                // DENIED for the whole window and the F-DDL-1 identity guard
+                // sees the still-current binding (no commit-window TOCTOU
+                // no-op).  Fast map updates only -- no `DatabaseImpl`
+                // teardown.  Order mirrors the relog read order: publish
+                // `name_map` FIRST, then clear `pending_ddl_names`.
+                let env_impl_vis = Arc::clone(&self.env_impl);
+                let databases_vis = Arc::clone(&self.databases);
+                let name_vis = name.to_string();
+                let did_remove: Arc<AtomicBool> =
+                    Arc::new(AtomicBool::new(false));
+                let did_remove_vis = Arc::clone(&did_remove);
+                txn.register_precommit_catalog_callback(move || {
+                    let mut databases = databases_vis.lock();
+                    let env = env_impl_vis.lock();
+                    if let Ok(Some(_id)) =
+                        env.remove_database_make_visible_if_id(&name_vis, db_id)
                     {
-                        databases.remove(&name_owned);
+                        databases.remove(&name_vis);
+                        did_remove_vis.store(true, Ordering::SeqCst);
                     }
+                    env.clear_pending_ddl(&name_vis);
+                });
+                // Post-release: the heavy `DatabaseImpl` teardown + obsolete
+                // counting, OUTSIDE the name lock (JE `cleanupDatabaseImpls`).
+                txn.register_commit_callback(move || {
+                    if did_remove.load(Ordering::SeqCst) {
+                        env_impl_arc
+                            .lock()
+                            .remove_database_finish_cleanup(db_id);
+                    }
+                    let _ = &databases_arc;
                 });
                 Ok(())
             }
@@ -1653,10 +1713,19 @@ impl Environment {
                 txn.register_abort_callback(move || {
                     env_impl_abort.lock().clear_pending_ddl(&old_abort);
                 });
-                txn.register_commit_callback(move || {
+                // XDB-711: PRECOMMIT catalog-visibility callback -- publish the
+                // rename's `name_map` swap AFTER the durable TxnCommit but
+                // BEFORE the name WRITE lock is released (JE
+                // `setDeletedDatabaseState`), so the relog cannot observe a
+                // stale old->id live after the committed rename and the
+                // F-DDL-1 identity guard sees the still-current binding.  The
+                // rename swap is a fast map update (no `DatabaseImpl`
+                // teardown), so it is safe to run while the name lock is held.
+                // Order mirrors the relog read order: publish `name_map`
+                // FIRST, then clear `pending_ddl_names`.
+                txn.register_precommit_catalog_callback(move || {
                     let mut databases = databases_arc.lock();
                     let env = env_impl_arc.lock();
-                    env.clear_pending_ddl(&old_owned);
                     // F-DDL-1: bind to the validated source identity.
                     if let Ok(true) =
                         env.rename_database_if_id(&old_owned, &new_owned, db_id)
@@ -1664,6 +1733,7 @@ impl Environment {
                     {
                         databases.insert(new_owned.clone(), handle);
                     }
+                    env.clear_pending_ddl(&old_owned);
                 });
                 Ok(())
             }
@@ -2739,6 +2809,31 @@ impl Environment {
         &self,
     ) -> Arc<Mutex<noxu_dbi::EnvironmentImpl>> {
         Arc::clone(&self.env_impl)
+    }
+
+    /// XDB-711 deterministic-witness seam (`#[doc(hidden)]`, test-only): drive
+    /// one catalog relog, invoking `after_snapshot` in the window between the
+    /// relog's `name_map` snapshot and its first per-name NameLN append.
+    ///
+    /// Obtains a self-contained relog closure (cloned `Arc`s) while briefly
+    /// holding `env_impl.lock()`, then DROPS the guard before running the
+    /// relog, so `after_snapshot` may itself perform a DDL (which re-enters
+    /// `env_impl.lock()`) without deadlocking.  This forces the exact XDB-711
+    /// hazard interleaving: relog snapshots `(name, old_id)` -> `after_snapshot`
+    /// COMMITS a rename/remove on `name` -> relog appends.  With the fix the
+    /// relog refuses to re-log the now-stale binding.
+    #[doc(hidden)]
+    pub fn relog_live_catalog_with_snapshot_hook_for_test(
+        &self,
+        after_snapshot: &dyn Fn(),
+    ) {
+        let runner = {
+            let g = self.env_impl.lock();
+            g.relog_snapshot_hook_runner()
+        };
+        if let Some(runner) = runner {
+            runner(after_snapshot);
+        }
     }
 
     /// Test seam for the JE cleaner `FileSelectionTest` port: force-clean
