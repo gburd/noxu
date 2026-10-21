@@ -44,10 +44,13 @@ required"). Two **additive, patch-safe** inherent methods are added on
   ("Write operation is not allowed because a Transaction was not supplied to
   openCursor and the Database is transactional."), matching JE's
   `Cursor.updateOperationsProhibited` (`Cursor.java:333-338`, `:5340-5367`).
-  Cursor writes on a *non-transactional* database are unchanged. (Note: a
-  no-transaction `SecondaryCursor::delete` on a transactional secondary still
-  auto-commits its cascade — a pre-existing, test-pinned Noxu behaviour
-  (Wave 1B / audit F5) that JE would refuse; tracked separately.)
+  This also covers a no-transaction `SecondaryCursor::delete` on a
+  transactional secondary, which previously auto-committed its cascade — a
+  Noxu deviation (Wave 1B / audit F5) that JE refuses: a `SecondaryCursor`
+  opened with no transaction on a transactional db has a non-transactional
+  locker, so JE throws before cascading the delete to the primary. Cursor
+  writes on a *non-transactional* database (primary or secondary) are
+  unchanged.
 
 ### Added
 
