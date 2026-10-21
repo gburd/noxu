@@ -1369,13 +1369,14 @@ impl Environment {
 
         // Validate up front (existence + not-in-use) so the caller gets a
         // synchronous error, mirroring JE's `DbTree.lockNameLN` check at
-        // operation time.  Capture the validated `DatabaseId` so a deferred
-        // remove binds to the specific database identity (F-DDL-1), not the
-        // name.  `remove_database` itself re-validates.
-        let db_id = {
+        // operation time.  The authoritative `db_id` the deferred remove binds
+        // to is RE-captured under the held WRITE lock in the `Some(txn)` arm
+        // (XDB-711 #2b -- the up-front value is pre-lock and may be stale);
+        // the auto-commit `None` path re-validates inside `remove_database`.
+        {
             let env_impl = self.env_impl.lock();
-            env_impl.can_remove_database(name).map_err(map_dbi_err(name))?
-        };
+            env_impl.can_remove_database(name).map_err(map_dbi_err(name))?;
+        }
 
         match txn {
             None => {
@@ -1410,7 +1411,26 @@ impl Environment {
                 // resolves, so an abort can no longer lose records a
                 // concurrent remove/truncate destroyed in the race window.
                 self.lock_name_record_under_txn(txn, name)?;
-                // BUG-DDL-DURABILITY-1: log the NameLN-delete tombstone as an
+                // XDB-711 #2b: the up-front `can_remove_database` validated
+                // `db_id` BEFORE this WRITE lock was taken -- a concurrent
+                // committed rename/remove/recreate could have re-bound `name`
+                // in that window, so the validated `db_id` may be stale.  A
+                // stale `db_id` makes the precommit identity guard
+                // (`remove_database_make_visible_if_id`) NO-OP, leaving the
+                // durable committed NameLN-delete tombstone logged below
+                // UNPUBLISHED in `name_map` -- then a later relog keeps logging
+                // the live binding past the committed tombstone and recovery
+                // resurrects the removed db (the XDB-711 #2b residual).
+                // RE-VALIDATE under the HELD lock so `db_id` is lock-stable:
+                // the WRITE lock we now hold forbids any concurrent rebind, so
+                // the precommit guard will always match and publish.  JE
+                // validates the NameLN AFTER `lockNameLN` (DbTree.java:952+).
+                let db_id = {
+                    let env_impl = self.env_impl.lock();
+                    env_impl
+                        .can_remove_database(name)
+                        .map_err(map_dbi_err(name))?
+                };
                 // ordinary TRANSACTIONAL LN inside the user txn BEFORE commit
                 // (JE DbTree.doRemoveDb deletes the NameLN through a cursor
                 // under the user txn, DbTree.java:1182-1206), and record its
@@ -1656,15 +1676,17 @@ impl Environment {
         }
 
         // Validate up front so the caller gets a synchronous error (JE
-        // `DbTree.lockNameLN` locks/validates at operation time).  Capture
-        // the validated source `DatabaseId` so a deferred rename binds to the
-        // specific identity (F-DDL-1), not the name.
-        let db_id = {
+        // `DbTree.lockNameLN` locks/validates at operation time).  The
+        // authoritative source `DatabaseId` the deferred rename binds to is
+        // RE-captured under the held source WRITE lock in the `Some(txn)` arm
+        // (XDB-711 #2b -- the up-front value is pre-lock and may be stale);
+        // the auto-commit `None` path re-validates inside `rename_database`.
+        {
             let env_impl = self.env_impl.lock();
             env_impl
                 .can_rename_database(old_name, new_name)
-                .map_err(map_rename_err(old_name, new_name))?
-        };
+                .map_err(map_rename_err(old_name, new_name))?;
+        }
 
         match txn {
             None => {
@@ -1695,25 +1717,33 @@ impl Environment {
                 // blocks/typed-conflicts until `txn` resolves.
                 self.lock_name_record_under_txn(txn, old_name)?;
                 self.lock_name_record_under_txn(txn, new_name)?;
-                // XDB-711 #2b: the destination-free check in
-                // `can_rename_database` ran at the TOP of this method, BEFORE
-                // the `new_name` WRITE lock was taken -- a TOCTOU window in
-                // which a concurrent transactional create (or rename-to) of
-                // `new_name` could bind it between our validation and our lock.
-                // RE-VALIDATE the destination is still free now that the
-                // `new_name` WRITE lock is HELD (JE `DbTree.doRenameDb` holds
-                // the dest NameLN WRITE across the existence check +
-                // insert, so whoever is second finds the key live and fails).
-                // A rename onto an existing name -> `DatabaseAlreadyExists`
-                // (JE `DbTree.dbRename` NameLN create fails on a live key).
-                {
+                // XDB-711 #2b: RE-VALIDATE the source + capture the
+                // authoritative `db_id` UNDER the held source WRITE lock (the
+                // up-front `can_rename_database` ran pre-lock and its `db_id`
+                // may be stale after a concurrent committed rebind).  A stale
+                // `db_id` makes the precommit `rename_database_if_id` NO-OP,
+                // leaving the durable committed rename NameLNs UNPUBLISHED in
+                // `name_map`, which a later relog then re-logs past the
+                // committed rename and recovery resurrects the old name /
+                // cross-binds (the #2b residual).  The held WRITE lock forbids
+                // any concurrent rebind, so the re-captured `db_id` is
+                // lock-stable and the precommit guard always matches.  Also
+                // RE-VALIDATE the destination is still free under the HELD
+                // new-name WRITE lock (closing the `can_rename_database`
+                // dest-TOCTOU): a rename onto a name a concurrent op bound in
+                // the window -> `DatabaseAlreadyExists` (JE `DbTree.doRenameDb`
+                // holds the dest NameLN WRITE across the check + insert).
+                let db_id = {
                     let env_impl = self.env_impl.lock();
                     if env_impl.database_exists(new_name) {
                         return Err(NoxuError::DatabaseAlreadyExists(
                             new_name.to_string(),
                         ));
                     }
-                }
+                    env_impl
+                        .can_rename_database(old_name, new_name)
+                        .map_err(map_rename_err(old_name, new_name))?
+                };
                 // BUG-DDL-DURABILITY-1: log the rename's NameLN entries
                 // (delete old + create new) as ordinary TRANSACTIONAL LNs
                 // inside the user txn BEFORE commit (JE DbTree.dbRename re-logs

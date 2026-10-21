@@ -217,15 +217,27 @@ fn rvx4_resolve_vs_concurrent_open() {
         read_flag_suffix(&p, "rvx4_before_inuse_").unwrap_or_default();
     let opened_ok = read_flag_suffix(&p, "rvx4_opened_ok_").unwrap_or_default();
     let other = read_flag_suffix(&p, "rvx4_other_").unwrap_or_default();
+    let notfound =
+        read_flag_suffix(&p, "rvx4_notfound_").unwrap_or_default();
     eprintln!(
-        "RVX4 before_inuse={before_inuse} opened_ok={opened_ok} other={other}"
+        "RVX4 before_inuse={before_inuse} opened_ok={opened_ok} \
+         other={other} notfound={notfound}"
     );
-    // No opener ever obtained a live handle on the removed db; no unexpected
-    // error type; and while in doubt at least one open was refused.
-    // R-LIVEDDL-711: the refusal is now a typed `LockConflict` (the real
-    // NameLN READ lock the in-doubt branch's WRITE lock denies -- JE
-    // `DatabasePreemptedException`), counted in the same "refused" bucket as
-    // the former `DatabaseInUse`; after resolution opens fail `NotFound`.
+    // XDB-711 #2b (FID-711-OPEN-FAILFAST resolved): a concurrent open of an
+    // in-doubt name now takes a BLOCKING NameLN READ lock and WAITS behind the
+    // in-doubt branch's WRITE lock -- JE `DbTree.getDb` blocks behind the
+    // NameLN WRITE lock rather than failing fast (the former non-blocking
+    // fail-fast `LockConflict` was the retired `FID-711-OPEN-FAILFAST`
+    // deviation).  So the correct oracle is no longer "at least one open is
+    // refused WHILE in doubt" (an open blocks instead of being refused, and
+    // whether it times out depends on the lock timeout vs the in-doubt
+    // window): it is (1) NO opener ever gets a live handle on the removed /
+    // in-doubt db, (2) every failure is a typed, expected error
+    // (LockConflict / LockTimeout / InUse / NotFound), never a surprise, and
+    // (3) after the branch resolves (committed remove), opens see the removed
+    // state -- a typed `NotFound`, or a `LockTimeout` for an opener whose wait
+    // exceeded the lock timeout before resolution.  A race-through (the bug
+    // this guards) would surface as `opened_ok=1` or an `other` error.
     assert_eq!(
         opened_ok, "0",
         "RVX-4: no concurrent open may ever get a live handle on the in-doubt \
@@ -233,13 +245,18 @@ fn rvx4_resolve_vs_concurrent_open() {
     );
     assert_eq!(
         other, "0",
-        "RVX-4: every refusal must be a typed LockConflict/InUse/NotFound, \
-         never a surprising error (other={other})"
+        "RVX-4: every refusal must be a typed LockConflict/InUse/LockTimeout/\
+         NotFound, never a surprising error (other={other})"
     );
-    assert_eq!(
-        before_inuse, "1",
-        "RVX-4: while in doubt a concurrent open must be refused \
-         (LockConflict/InUse) (before_inuse={before_inuse})"
+    // At least one open must have been refused SOMEHOW -- blocked past the
+    // lock timeout (LockTimeout, counted in before_inuse) OR seen the removed
+    // state after resolution (NotFound).  Both are JE-correct; what must never
+    // happen is a silent race-through (caught by opened_ok==0 above).
+    assert!(
+        before_inuse == "1" || notfound != "0",
+        "RVX-4: a concurrent open of the in-doubt/removed db must be refused \
+         (blocked->LockTimeout) or see NotFound after resolution \
+         (before_inuse={before_inuse}, notfound={notfound})"
     );
     // Final state: x removed.
     let env = open_env(&p);
