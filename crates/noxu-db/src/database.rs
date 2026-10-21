@@ -462,13 +462,21 @@ impl Database {
             let mut auto_txn =
                 self.txn_manager.begin_auto_txn(self.log_manager.clone());
             auto_txn.set_local_write(!is_replicated);
-            let durability = if self.no_sync {
-                crate::durability::Durability::COMMIT_NO_SYNC
-            } else if self.write_no_sync {
-                crate::durability::Durability::COMMIT_WRITE_NO_SYNC
-            } else {
-                crate::durability::Durability::COMMIT_SYNC
-            };
+            // FID-NONTXN-SYNC-FSYNC: a non-transactional write has NO
+            // commit-time fsync in JE.  `LN.logInternal` logs the LN with the
+            // `LogParams` defaults `flushRequired=false, fsyncRequired=false`
+            // (LN.java:636, LogParams.java:42,53) regardless of the env
+            // durability, and `BasicLocker`/`ThreadLocker.operationEnd`
+            // (BasicLocker.java:198-247) only RELEASES the locks — it never
+            // flushes or fsyncs.  Durability of a non-txnal write comes later,
+            // from a checkpoint / `Environment.sync()` / a subsequent SYNC
+            // commit that drains the buffer / env close.  So this path uses
+            // `COMMIT_NO_SYNC` (neither flush nor fsync) unconditionally; the
+            // per-db `no_sync`/`write_no_sync` knobs do not add a fsync here
+            // because JE never fsyncs a non-txnal LN.  (A non-txn db has no
+            // `Txn`; the inner auto-`Txn` here is only a cursor-wiring/lock
+            // vehicle, not JE's `Txn.createAutoTxn`.)
+            let durability = crate::durability::Durability::COMMIT_NO_SYNC;
             let txn = Transaction::new(
                 0,
                 crate::transaction_config::TransactionConfig::default()
@@ -582,19 +590,22 @@ impl Database {
         }
     }
 
-    /// Durability of an auto-commit write (`txn = None`), from the
-    /// database's `no_sync` / `write_no_sync` config.  Shared by
-    /// [`Self::with_auto_commit_transaction`]'s non-transactional
-    /// (ThreadLocker) path and auto-commit cursors so `db.put` and
-    /// `cursor.put` honour the same policy.
+    /// Durability of an auto-commit write performed through a bare
+    /// `open_cursor(None)` cursor on a NON-transactional database — JE's
+    /// `ThreadLocker`/`BasicLocker` path.
+    ///
+    /// FID-NONTXN-SYNC-FSYNC: a non-transactional LN is logged with
+    /// `flushRequired=false, fsyncRequired=false` (JE `LN.logInternal`,
+    /// `LogParams` defaults; LN.java:636, LogParams.java:42,53) and
+    /// `operationEnd` only releases locks (BasicLocker.java:198-247), so
+    /// there is NO commit-time flush or fsync.  This returns `CommitNoSync`
+    /// unconditionally (durability comes later, from a checkpoint /
+    /// `Environment::sync` / env close).  After FID-CURSOR-AUTOCOMMIT a
+    /// writable `open_cursor(None)` on a *transactional* database is refused
+    /// outright (`writes_prohibited`), so the only writable auto-commit
+    /// cursor that reaches this is on a non-transactional db.
     fn auto_commit_durability(&self) -> Durability {
-        if self.no_sync {
-            Durability::CommitNoSync
-        } else if self.write_no_sync {
-            Durability::CommitWriteNoSync
-        } else {
-            Durability::CommitSync
-        }
+        Durability::CommitNoSync
     }
 
     /// Creates a new database handle.
@@ -1648,8 +1659,10 @@ impl Database {
     /// (review P0-1: returns `Cursor<'_>`; review P0-2: auto-commit is the
     /// unadorned form, the transactional form is [`Self::open_cursor_in`]).
     ///
-    /// In auto-commit mode each cursor write is its own transaction and is
-    /// fsynced before returning.
+    /// In auto-commit mode each cursor write is its own transaction.  On a
+    /// **non-transactional** database cursor writes are NOT fsynced per write
+    /// (JE's `ThreadLocker` path, FID-NONTXN-SYNC-FSYNC); call
+    /// [`crate::Environment::sync`] to make them durable.
     ///
     /// # Arguments
     /// * `config` - Optional cursor configuration

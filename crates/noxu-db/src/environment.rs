@@ -2177,6 +2177,57 @@ impl Environment {
         Ok(())
     }
 
+    /// Synchronously flushes dirty data to the log and performs a
+    /// checkpoint, making all preceding writes durable.
+    ///
+    /// Mirrors JE `Environment.sync()` (Environment.java:1603): it runs a
+    /// forced checkpoint with `minimizeRecoveryTime=true`.  This is the
+    /// supported way to make a **non-transactional** write durable — a
+    /// non-transactional write is logged with no commit-time fsync (JE
+    /// `LN.logInternal` logs `flushRequired=false, fsyncRequired=false`), so
+    /// its durability comes from a checkpoint, a later SYNC commit that
+    /// drains the buffer, env close, or this call.  See FID-NONTXN-SYNC-FSYNC.
+    ///
+    /// # Errors
+    /// Returns an error if the environment is closed, invalidated, or the
+    /// checkpoint fails (e.g. a disk write error).
+    pub fn sync(&self) -> Result<()> {
+        // JE Environment.sync(): CheckpointConfig.setForce(true) +
+        // setMinimizeRecoveryTime(true), then invokeCheckpoint(config, "sync").
+        let cfg = CheckpointConfig::default()
+            .with_force(true)
+            .with_minimize_recovery_time(true);
+        self.checkpoint(Some(&cfg))
+    }
+
+    /// Writes buffered log data to the file system and, when `fsync` is true,
+    /// performs an fsync so the data reaches the physical device.
+    ///
+    /// Mirrors JE `Environment.flushLog(boolean fsync)` (Environment.java:1644):
+    /// it makes durable all preceding non-transactional writes and any
+    /// preceding `NO_SYNC` commits.  Like JE, it does **not** flush unwritten
+    /// data in deferred-write databases — use [`Database::sync`] or a
+    /// checkpoint for those.
+    ///
+    /// # Errors
+    /// Returns an error if the environment is closed, invalidated, or the
+    /// flush fails.
+    pub fn flush_log(&self, fsync: bool) -> Result<()> {
+        self.check_open()?;
+        // JE EnvironmentImpl.flushLog(fsync) -> LogManager.flushNoSync() or
+        // flushSync() depending on `fsync`.
+        if let Some(lm) = &self.log_manager {
+            if fsync {
+                lm.flush_sync()
+                    .map_err(|e| NoxuError::environment(e.to_string()))?;
+            } else {
+                lm.flush_no_sync()
+                    .map_err(|e| NoxuError::environment(e.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Runs a checkpoint.
     ///
     /// Mirrors `Environment.checkpoint(CheckpointConfig)`.  If the environment has
