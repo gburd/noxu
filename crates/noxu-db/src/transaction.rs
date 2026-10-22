@@ -469,6 +469,10 @@ impl Transaction {
     ///   this happens the transaction is still durably committed; the
     ///   error is propagated so the caller can react to the leak.
     pub fn commit_with_durability(&self, durability: Durability) -> Result<()> {
+        // JE `Transaction.commit` calls `checkEnv()` FIRST (before
+        // `checkOpen()` and before the empty-txn fast path): a commit on an
+        // invalidated environment must fail closed, never return Ok.
+        self.check_env()?;
         self.check_open()?;
 
         // Did this txn actually append any LN to the WAL?  Computed once so
@@ -1492,6 +1496,41 @@ impl Transaction {
     /// Get the elapsed time since transaction start.
     pub fn elapsed(&self) -> std::time::Duration {
         self.start_time.elapsed()
+    }
+
+    /// JE `Transaction.checkEnv()` -> `EnvironmentImpl.checkIfInvalid()`
+    /// (`Transaction.java:889`, `EnvironmentImpl.java:1728`).
+    ///
+    /// Every public `Transaction` operation in JE first calls `checkEnv()`,
+    /// which throws `EnvironmentFailureException` if the environment has been
+    /// invalidated by a prior failure — *before* any operation-specific logic
+    /// runs.  In particular `commit(Durability)` runs `checkEnv()` ahead of
+    /// its empty-transaction fast path (`if (updateLoggedForTxn())`), so a
+    /// commit on an invalidated environment always throws and NEVER returns
+    /// success, even when the txn logged nothing.
+    ///
+    /// Noxu mirrors this: a log write / fdatasync error sets the shared
+    /// `LogManager::io_invalid` flag (the fail-stop boundary — see
+    /// `noxu-log/src/log_manager.rs::invalidate_log`), and a daemon
+    /// panic / wedge sets `EnvironmentImpl::is_invalid`.  Both are consulted
+    /// here through `LogManager::is_io_invalid()` and the shared `io_invalid`
+    /// Arc that `EnvironmentImpl::is_valid()` reads, so a commit after ANY
+    /// invalidation fails closed.  This closes ENG-DISKFULL-ACK-1: a
+    /// transactional commit whose own write found the log already invalid
+    /// logged nothing, so without this check the empty-txn path returned Ok —
+    /// an acknowledged-but-not-durable commit.
+    fn check_env(&self) -> Result<()> {
+        if let Some(lm) = &self.log_manager
+            && lm.is_io_invalid()
+        {
+            return Err(NoxuError::environment_with_reason(
+                crate::error::EnvironmentFailureReason::LogWrite,
+                "environment was invalidated by a prior I/O failure; the \
+                 transaction cannot be committed"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Check that the transaction is in Open state.
