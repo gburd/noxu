@@ -60,7 +60,10 @@ fn b965_written_images_cross_engine() {
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(&root)
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.is_dir() && p.file_name().unwrap().to_string_lossy().starts_with("seed-"))
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name().unwrap().to_string_lossy().starts_with("seed-")
+        })
         .collect();
     dirs.sort();
 
