@@ -64,6 +64,28 @@ required"). Two **additive, patch-safe** inherent methods are added on
   `Environment::sync()` (a forced checkpoint) instead of `Database::sync()`,
   or commit a transaction with SYNC durability.
 
+- **`Transaction::commit` and `Transaction::abort` on an invalidated
+  environment now fail closed** (ENG-DISKFULL-ACK-1). A transactional
+  `commit()` on an environment already invalidated by a prior failure now
+  returns an `EnvironmentFailure` instead of a misleading `Ok` — previously an
+  empty transaction (one whose own write found the log already invalid and so
+  logged nothing) took the empty-txn fast path and returned `Ok`, an
+  acknowledged-but-not-durable commit. The check now mirrors
+  `Environment::is_valid()` / JE `Transaction.checkEnv` →
+  `EnvironmentImpl.checkIfInvalid` (`Transaction.java:889`,
+  `EnvironmentImpl.java:1728`): it fails on ANY invalidation source (a log
+  I/O / fdatasync error, a daemon-fatal panic, a recovery checksum failure,
+  a replication rollback), not only a log I/O error. **`Transaction::abort`
+  on an invalidated environment now returns an error, as JE does
+  (`Transaction.abort` → `checkEnv`, `Transaction.java:217`); the
+  transaction's locks are still released** and its registry entry pruned, so
+  the environment can still be closed and reopened for recovery. Aborting an
+  already-closed (committed / aborted) transaction remains a benign no-op,
+  matching JE's `if (txn == null) return;`. (`Transaction::set_txn_timeout` /
+  `set_lock_timeout` are not affected — they remain infallible, a minor,
+  harmless fidelity gap vs JE's `checkEnv` on those setters, since a timeout
+  set on a dead environment is never acted on.)
+
 ### Added
 
 - `Environment::sync()` — flushes dirty data and runs a forced checkpoint,
