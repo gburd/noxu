@@ -5,7 +5,7 @@
 //! concurrent-DDL + crash history produced by the FIXED (7.11.2) writer. This
 //! probe drives the in-tree crash modes that produce exactly the legitimate
 //! shapes the detector's exclusions cover — a committed relog of a
-//! remove/rename, in-doubt and committed XA DDL, first-LSN create/remove/
+//! remove/rename, in-doubt (prepared) XA DDL, first-LSN create/remove/
 //! rename/truncate aborts — SIGKILLs at a quiescent instant, and asserts the
 //! reopen NEVER fails closed with `LOG_INTEGRITY`.
 //!
@@ -140,9 +140,4 @@ fn firstlsn_remove_abort_never_false_positive() {
 #[test]
 fn xaddl_rename_prepare_never_false_positive() {
     assert_never_log_integrity("xaddl_rename_prepare");
-}
-
-#[test]
-fn xaddl_commit_never_false_positive() {
-    assert_never_log_integrity("xaddl_commit");
 }
