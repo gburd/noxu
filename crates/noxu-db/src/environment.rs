@@ -2225,6 +2225,11 @@ impl Environment {
         } else {
             Transaction::new(txn_id, txn_config)
         };
+        // Capture the general env-invalid flag while env_guard is ALREADY held
+        // (no extra lock) so the txn's check_env can fail closed on any
+        // invalidation source — matching EnvironmentImpl::is_valid() / JE
+        // checkIfInvalid().
+        let env_invalid_flag = env_guard.is_invalid_flag();
         drop(env_guard);
 
         let txn =
@@ -2232,7 +2237,9 @@ impl Environment {
 
         // Wire env_impl so Transaction::abort() can apply undo records.
         // Txn environment reference during construction.
-        let txn = txn.with_env_impl(Arc::clone(&self.env_impl));
+        let txn = txn
+            .with_env_impl(Arc::clone(&self.env_impl))
+            .with_env_invalid(env_invalid_flag);
 
         // Wire the active-txns registry so commit/abort can prune their
         // own entry (F1).  Without this, every successful txn left an

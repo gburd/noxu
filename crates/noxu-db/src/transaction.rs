@@ -102,6 +102,16 @@ pub struct Transaction {
     /// which is used by `Txn.undoLNs()` to call
     /// `EnvironmentImpl.getDatabase(dbId).abort(undoLsn, locker)`.
     env_impl: Option<Arc<SyncMutex<EnvironmentImpl>>>,
+    /// Cached clone of `EnvironmentImpl::is_invalid_flag()` (the general
+    /// env-invalid `Arc<AtomicBool>`, flipped by `EnvironmentImpl::invalidate`
+    /// on ANY `EnvironmentFailure` — daemon-fatal, checksum, rep rollback —
+    /// NOT only on a log I/O error).  `check_env()` reads this alongside the
+    /// log manager's `io_invalid` so that it sees exactly what
+    /// `EnvironmentImpl::is_valid()` sees — mirroring JE `checkIfInvalid()`
+    /// (`envState == INVALID` from any source).  Cached at construction (the
+    /// X-13 pattern used by `Database`/`Cursor`) so the commit hot path never
+    /// has to take `env_impl.lock()`.
+    env_invalid: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Shared registry of active transactions on the owning
     /// `Environment`.  When the transaction reaches a terminal state
     /// (`commit`, `commit_with_durability`, or `abort`) we prune our
@@ -174,6 +184,7 @@ impl Transaction {
             log_manager: None,
             inner_txn: None,
             env_impl: None,
+            env_invalid: None,
             active_txns: None,
             replica_coordinator: None,
             replica_ack_timeout: std::time::Duration::from_secs(5),
@@ -209,6 +220,7 @@ impl Transaction {
             log_manager: Some(log_manager),
             inner_txn: None,
             env_impl: None,
+            env_invalid: None,
             active_txns: None,
             replica_coordinator: None,
             replica_ack_timeout: std::time::Duration::from_secs(5),
@@ -229,6 +241,21 @@ impl Transaction {
         env_impl: Arc<SyncMutex<EnvironmentImpl>>,
     ) -> Self {
         self.env_impl = Some(env_impl);
+        self
+    }
+
+    /// Caches the general env-invalid flag (`EnvironmentImpl::is_invalid_flag`)
+    /// so `check_env()` can fail closed on ANY invalidation source — matching
+    /// `EnvironmentImpl::is_valid()` / JE `checkIfInvalid()` — with a single
+    /// relaxed atomic load and no env lock on the commit hot path.  The X-13
+    /// cache pattern (as `Database`/`Cursor` do).  `begin_transaction` passes
+    /// the flag it reads from the env guard it is ALREADY holding, so this
+    /// takes no extra lock.
+    pub(crate) fn with_env_invalid(
+        mut self,
+        env_invalid: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.env_invalid = Some(env_invalid);
         self
     }
 
@@ -794,6 +821,38 @@ impl Transaction {
                     ));
                 }
             }
+        }
+
+        // JE `Transaction.abort` calls `checkEnv()` AFTER the closed-txn check
+        // (Transaction.java:217, comment [#21264]) and BEFORE `txn.abort()`:
+        // aborting an OPEN txn on an invalidated environment throws
+        // `EnvironmentFailureException`.  Mirror that here — but, unlike JE
+        // (where a dying env is torn down by GC), Noxu `Environment::close()`
+        // refuses to close while any txn is still registered in `active_txns`.
+        // So before surfacing the error we must still release this txn's locks
+        // and prune its registry / TxnManager entries, exactly as the normal
+        // abort tail does, or the invalidated env could never be closed (the
+        // operational recovery path the advisory requires).  No WAL write and
+        // no B-tree undo is attempted — the log is gone; this is pure in-memory
+        // teardown.
+        if self.check_env().is_err() {
+            if let Some(inner) = &self.inner_txn {
+                inner
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .release_all_locks();
+            }
+            {
+                let mut state =
+                    self.state.lock().unwrap_or_else(|p| p.into_inner());
+                *state = TransactionState::Aborted;
+            }
+            if let Some(registry) = &self.active_txns {
+                registry.mark_complete(self.id);
+            }
+            self.unregister_inner_txn(false);
+            observe_gauge_dec!("noxu_db_active_transactions");
+            return self.check_env();
         }
 
         // Write TxnAbort to WAL before marking aborted (no fsync needed).
@@ -1509,17 +1568,39 @@ impl Transaction {
     /// commit on an invalidated environment always throws and NEVER returns
     /// success, even when the txn logged nothing.
     ///
-    /// Noxu mirrors this: a log write / fdatasync error sets the shared
-    /// `LogManager::io_invalid` flag (the fail-stop boundary — see
-    /// `noxu-log/src/log_manager.rs::invalidate_log`), and a daemon
-    /// panic / wedge sets `EnvironmentImpl::is_invalid`.  Both are consulted
-    /// here through `LogManager::is_io_invalid()` and the shared `io_invalid`
-    /// Arc that `EnvironmentImpl::is_valid()` reads, so a commit after ANY
-    /// invalidation fails closed.  This closes ENG-DISKFULL-ACK-1: a
-    /// transactional commit whose own write found the log already invalid
-    /// logged nothing, so without this check the empty-txn path returned Ok —
-    /// an acknowledged-but-not-durable commit.
+    /// Noxu mirrors this by reading the SAME two flags that
+    /// `EnvironmentImpl::is_valid()` reads, so `check_env()` fails closed on
+    /// EVERY invalidation source JE's `checkIfInvalid()` (`envState ==
+    /// INVALID`) does:
+    ///
+    /// * `EnvironmentImpl::is_invalid` — the general env-invalid flag, set by
+    ///   `EnvironmentImpl::invalidate` on ANY `EnvironmentFailure` (a
+    ///   daemon-fatal panic / wedge via `Environment::invalidate`, a recovery
+    ///   log-checksum failure, a replication rollback). Read here via the
+    ///   cached `env_invalid` `Arc<AtomicBool>` (X-13 pattern).
+    /// * `LogManager::io_invalid` — the log write / fdatasync fail-stop
+    ///   boundary (see `noxu-log/src/log_manager.rs::invalidate_log`).
+    ///
+    /// This closes ENG-DISKFULL-ACK-1: a transactional commit whose own write
+    /// found the log already invalid logged nothing, so without this check the
+    /// empty-txn fast path returned Ok — an acknowledged-but-not-durable
+    /// commit. Reading BOTH flags (not just `io_invalid`) closes the same hole
+    /// for a non-I/O invalidation (daemon-fatal / checksum), which JE catches
+    /// and the narrower `io_invalid`-only check missed.
     fn check_env(&self) -> Result<()> {
+        // General env-invalid (any EnvironmentFailure source) — what
+        // `EnvironmentImpl::is_valid()` checks first.
+        if let Some(flag) = &self.env_invalid
+            && flag.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(NoxuError::environment_with_reason(
+                crate::error::EnvironmentFailureReason::UnexpectedStateFatal,
+                "environment was invalidated by a prior failure; the \
+                 transaction cannot be committed"
+                    .to_string(),
+            ));
+        }
+        // Log I/O fail-stop (fdatasync / write error).
         if let Some(lm) = &self.log_manager
             && lm.is_io_invalid()
         {

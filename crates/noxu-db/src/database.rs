@@ -410,7 +410,8 @@ impl Database {
                 None => Transaction::new(txn_id, txn_config),
             }
             .with_inner_txn(Arc::new(std::sync::Mutex::new(inner)))
-            .with_env_impl(Arc::clone(&self.env_impl));
+            .with_env_impl(Arc::clone(&self.env_impl))
+            .with_env_invalid(Arc::clone(&self.env_invalid));
 
             // Associations run under the SAME locker (one atomic unit).
             let op_result = op(Some(&txn), Some(&txn));
@@ -483,7 +484,8 @@ impl Database {
                     .with_durability(durability),
             )
             .with_inner_txn(Arc::new(std::sync::Mutex::new(auto_txn)))
-            .with_env_impl(Arc::clone(&self.env_impl));
+            .with_env_impl(Arc::clone(&self.env_impl))
+            .with_env_invalid(Arc::clone(&self.env_invalid));
 
             let op_result = op(Some(&txn), None);
             #[cfg(all(not(noxu_shuttle), any(test, feature = "testing")))]
