@@ -96,15 +96,31 @@ fn metrics_export_emits_je_stat_set() {
 
     // ── Assertions on the JE stat set ────────────────────────────────────
 
-    // Txn (JE Txn group): commits == N, begins >= N.
+    // Txn (JE Txn group): commits == N + 1, begins >= N + 1.
+    //
+    // ENG-AUTODDL: the auto-commit CREATE of the \"metrics\" database
+    // (`open_database(None, ..)` on a transactional env) now runs through an
+    // internal auto-txn, exactly as JE `openDatabase(txn=null)` ->
+    // `DbNameOperation.run()` -> `LockerFactory.getWritableLocker` ->
+    // `Txn.createAutoTxn` does. JE counts that auto-txn in `nCommits`/`nBegins`:
+    // `createAutoTxn` -> `new Txn()` -> `initTxn` -> `TxnManager.registerTxn`
+    // (numBegins++, TxnManager.java:219), and `operationEnd(true)` ->
+    // `close(true)` -> `unRegisterTxn(this, true)` (numCommits++,
+    // TxnManager.java:237) with NO `isAutoCommit` exclusion. So the create
+    // contributes exactly one begin + one commit on top of the N explicit put
+    // txns => commits == N + 1. (Pre-ENG-AUTODDL the create wrote a lazy NameLN
+    // with no txn, so the old expectation was N; the JE-faithful fix makes it
+    // N + 1.)
+    const CREATE_TXNS: u64 = 1;
     assert_eq!(
         m.get("noxu_txn_commits_total").copied(),
-        Some(N as f64),
-        "commits must equal the {N} committed txns; got {m:#?}"
+        Some((N + CREATE_TXNS) as f64),
+        "commits must equal the {N} committed txns + {CREATE_TXNS} auto-commit \
+         create (ENG-AUTODDL, JE createAutoTxn); got {m:#?}"
     );
     assert!(
-        m["noxu_txn_begins_total"] >= N as f64,
-        "begins >= N: {}",
+        m["noxu_txn_begins_total"] >= (N + CREATE_TXNS) as f64,
+        "begins >= N + 1: {}",
         m["noxu_txn_begins_total"]
     );
 
