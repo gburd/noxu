@@ -108,6 +108,7 @@ fn main() {
     if mode.starts_with("firstlsn_")
         || mode.starts_with("xarec_")
         || mode.starts_with("xaddl_")
+        || mode == "kd_truncate_resurrect"
     {
         env_config = env_config
             .with_log_file_max_bytes(1_000_000)
@@ -805,6 +806,84 @@ fn main() {
             } else {
                 txn.abort().expect("abort truncate");
             }
+            flag(&dir, "ddl_done");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        // ENG-FSYNCDROP-RESURRECT-1 (S1): a committed TRANSACTIONAL truncate
+        // of a db whose records were CHECKPOINTED as known-deleted (KD) by an
+        // earlier UNCOMMITTED delete must NOT resurrect those records after a
+        // crash.  Deterministic, NO FaultDisk: force a checkpoint while an
+        // in-flight (uncommitted) delete holds the slots KD, abort it, then
+        // commit a same-id truncate (per-record DeleteLNs at a higher LSN),
+        // crash before the next checkpoint.  On the base, redo of the
+        // committed delete no-ops on the already-KD slot without advancing the
+        // slot LSN, so the undo of the earlier uncommitted delete reverts the
+        // slot to its committed before-image and RESURRECTS the record under
+        // the truncated db (same-id truncate = F1 deviation vs JE's new-id
+        // DbTree.doTruncateDb).  After recovery "test" MUST be EMPTY.
+        "kd_truncate_resurrect" => {
+            use noxu_db::CheckpointConfig;
+            // An always-open EARLIEST txn so first_active_lsn sits BEFORE T1's
+            // deletes (so the undo pass scans them) and the undo pass is not
+            // skipped (an active txn at crash).  Write to a SEPARATE db.
+            let keep_db = env
+                .open_database(
+                    None,
+                    "keep",
+                    &DatabaseConfig::new()
+                        .with_allow_create(true)
+                        .with_transactional(true),
+                )
+                .expect("open keep");
+            let t0 = env.begin_transaction(None).expect("begin t0");
+            keep_db
+                .put_in(
+                    &t0,
+                    DatabaseEntry::from_bytes(b"k0"),
+                    DatabaseEntry::from_bytes(b"v0"),
+                )
+                .expect("t0 put");
+
+            // Seed committed records into "test".
+            for i in 0u32..8 {
+                db.put(
+                    DatabaseEntry::from_bytes(&i.to_be_bytes()),
+                    DatabaseEntry::from_bytes(b"rec"),
+                )
+                .expect("seed put");
+            }
+
+            // T1: delete every key but DO NOT commit -- leave the slots KD.
+            let t1 = env.begin_transaction(None).expect("begin t1");
+            for i in 0u32..8 {
+                db.delete_in(&t1, DatabaseEntry::from_bytes(&i.to_be_bytes()))
+                    .expect("t1 delete");
+            }
+            // Force a checkpoint: flushes the BINs with the KD slots at T1's
+            // delete LSN (the frozen in-flight state).
+            env.checkpoint(Some(&CheckpointConfig::new().with_force(true)))
+                .expect("checkpoint with KD slots");
+            // Abort T1: in memory the slots are restored, but the checkpoint
+            // already logged them KD at T1's LSN.
+            t1.abort().expect("t1 abort");
+
+            // Close the "test" handle so the truncate's reference-count guard
+            // passes, then commit a same-id truncate (per-record DeleteLNs).
+            db.close().expect("close test before truncate");
+            let t2 = env.begin_transaction(None).expect("begin t2");
+            let n = env
+                .truncate_database(Some(&t2), "test")
+                .expect("truncate under t2");
+            assert_eq!(n, 8, "truncate returnCount");
+            t2.commit().expect("commit truncate");
+
+            // Leave t0 open (active at crash) so the undo pass runs and scans
+            // back past T1's deletes.  Leak it so no abort/commit is written.
+            std::mem::forget(t0);
+
             flag(&dir, "ddl_done");
             loop {
                 thread::sleep(Duration::from_millis(50));

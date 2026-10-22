@@ -231,3 +231,34 @@ fn txnal_truncate_abort_keeps_records() {
         );
     });
 }
+
+// --------------------------------------------------------------------------
+// ENG-FSYNCDROP-RESURRECT-1 (S1) — synthetic, FaultDisk-free deterministic
+// witness for the same-id-truncate resurrection (F1).  See the crash_worker
+// mode `kd_truncate_resurrect` for the mechanism.  RED on the base (recovered
+// "test" holds resurrected records); GREEN once truncate assigns a new id.
+// --------------------------------------------------------------------------
+
+/// A committed txnal truncate must leave the db EMPTY after a crash even when
+/// the pre-truncate records were checkpointed as known-deleted by an earlier
+/// uncommitted (then aborted) delete.  On the base the records resurrect.
+#[test]
+fn kd_truncate_resurrect_is_empty_after_crash() {
+    run_ddl_crash("kd_truncate_resurrect", |env| {
+        let present = env.database_names().unwrap().iter().any(|n| n == "test");
+        assert!(present, "truncated DB must still exist after a crash");
+        let db = env
+            .open_database(
+                None,
+                "test",
+                &DatabaseConfig::new().with_transactional(true),
+            )
+            .expect("reopen truncated DB");
+        let n = db.count().unwrap();
+        assert_eq!(
+            n, 0,
+            "a committed truncate must leave the DB empty after a crash — \
+             {n} record(s) RESURRECTED (ENG-FSYNCDROP-RESURRECT-1)"
+        );
+    });
+}
