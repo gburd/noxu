@@ -584,6 +584,40 @@ mitigation.
   serialise catalog DDL on a given database name, or keep all catalog
   operations on that name inside one transaction.
 
+### 14.10 ENG-CLEAN-TOMBSTONE-1 — a removed database can be resurrected by log cleaning (S1 data loss)
+
+- **Affected versions:** v7.11.0 and v7.11.1 (and the v7.11.2 candidate before
+  this fix).
+- **Trigger:** a committed `remove_database` — transactional or
+  auto-commit — or a rename's old-name removal, followed by log cleaning
+  (the background
+  cleaner, or `clean_log()`) that reclaims the log file holding the removal's
+  record while an older surviving file still holds the database's create
+  record. Databases that were never removed/renamed, or environments without
+  cleaning, are unaffected.
+- **Impact:** the cleaner classifies a database-name record (`NameLN`) as
+  obsolete and never migrates it, and the per-checkpoint catalog relog
+  re-materialises only *live* names — never removals. So the reclaimed removal
+  record is lost while an older create record survives, and recovery's
+  latest-record-wins catalog replay picks the stale create: **the removed
+  database (with its records) reappears on reopen**, silently (recovery returns
+  success, `verify` passes).
+- **Fix version:** v7.11.2 (a cleaner retain-guard keeps a removal's file until
+  nothing older can resurrect the name — the same two-checkpoint
+  deletion-barrier mechanism used for a recovered-but-unopened database,
+  §14.1 — bounded so no
+  file is retained indefinitely; owner-approved `D-ADDITIVE-SAFETY`, 7.11.x
+  only, superseded in v8.0.0 by the mapping-tree / MapLN-tombstone model). No
+  on-disk format change; the fix is forward-acting, so a dump/reload is **not**
+  required — once running v7.11.2 a committed remove stays removed. The
+  XDB-711 detector does **not** reliably flag an already-resurrected
+  environment: a
+  resurrection produced purely by this cleaner-reclaim path leaves no surviving
+  stray-relog evidence once the removal's file is gone.
+- **Mitigation on v7.11.0/.1:** force a checkpoint immediately after a committed
+  `remove`/`rename` and keep the database's create file from being cleaned (open
+  the database before cleaning, or avoid aggressive cleaning) until you upgrade.
+
 ---
 
 ## How to tell if you're affected
@@ -597,6 +631,7 @@ mitigation.
 | BUG-DUP-DELETEALL-SPAN | After `delete(k)` on a key with duplicates, a subsequent `get`/cursor scan still returns some duplicate values for `k`. |
 | A5 / BUG-DDL-DURABILITY-1 | After a crash: an aborted transaction's records present, or a committed record missing; a committed DB remove/rename not reflected (old name resurrected / new name lost). |
 | BUG-FEEDER-SCAN-SKIP | A replica missing a contiguous VLSN range that the master committed (a gap in the applied stream), with no feeder error. |
+| ENG-CLEAN-TOMBSTONE-1 | A database you removed (or a rename's old name) reappears on reopen after log cleaning, with its old records; in-memory it was absent before the clean close. No error; `verify` passes. Most likely when a removed name's create record shared a log file with another database's long-lived data while cleaning reclaimed the removal's (lower-utilization) file. |
 
 A clean single-file environment that has never had `cleaner.deletions > 0`, a
 cache that holds the live working set, all-small (≤ 16-byte, embedded) values,
