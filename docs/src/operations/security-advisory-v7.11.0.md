@@ -605,9 +605,14 @@ mitigation.
 - **Fix version:** v7.11.2 (a cleaner retain-guard keeps a removal's file until
   nothing older can resurrect the name — the same two-checkpoint
   deletion-barrier mechanism used for a recovered-but-unopened database,
-  §14.1 — bounded so no
-  file is retained indefinitely; owner-approved `D-ADDITIVE-SAFETY`, 7.11.x
-  only, superseded in v8.0.0 by the mapping-tree / MapLN-tombstone model). No
+  §14.1). The guard retains only a removed name's **latest** on-disk removal
+  record while an older create for that name still survives, so it retains **at
+  most one log file per removed name that still has an older surviving create**
+  — a bound independent of how many times the name was removed and recreated.
+  (This bounds only what the guard itself retains; it does not bound total log
+  size, which is governed by the cleaner's ordinary utilization policy.)
+  Owner-approved `D-ADDITIVE-SAFETY`, 7.11.x
+  only, superseded in v8.0.0 by the mapping-tree / MapLN-tombstone model. No
   on-disk format change; the fix is forward-acting, so a dump/reload is **not**
   required — once running v7.11.2 a committed remove stays removed. The
   XDB-711 detector does **not** reliably flag an already-resurrected
