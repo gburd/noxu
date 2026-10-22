@@ -30,9 +30,10 @@ fn open_env(dir: &TempDir) -> Environment {
 }
 
 fn dup_db(env: &Environment, name: &str) -> noxu_db::Database {
+    // FID-CURSOR-AUTOCOMMIT: non-txn cursor put/delete is JE's ThreadLocker
+    // path -> a non-transactional db.
     let db_cfg = DatabaseConfig::new()
         .with_allow_create(true)
-        .with_transactional(true)
         .with_sorted_duplicates(true);
     env.open_database(None, name, &db_cfg).unwrap()
 }
@@ -205,9 +206,9 @@ fn put_current_equal_dup_data_succeeds_in_place() {
 fn put_current_on_non_dup_db_replaces_data() {
     let dir = TempDir::new().unwrap();
     let env = open_env(&dir);
-    // No sorted_duplicates: plain DB.
-    let db_cfg =
-        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
+    // No sorted_duplicates: plain DB.  FID-CURSOR-AUTOCOMMIT: non-txn cursor
+    // put is JE's ThreadLocker path -> non-transactional db.
+    let db_cfg = DatabaseConfig::new().with_allow_create(true);
     let db = env.open_database(None, "plain", &db_cfg).unwrap();
 
     let key = DatabaseEntry::from_bytes(b"k");
@@ -279,9 +280,9 @@ fn put_current_sort_equal_under_custom_dup_comparator_succeeds() {
         let lb: Vec<u8> = b.iter().map(|c| c.to_ascii_lowercase()).collect();
         la.cmp(&lb)
     });
+    // FID-CURSOR-AUTOCOMMIT: non-txn cursor put -> non-transactional db.
     let db_cfg = DatabaseConfig::new()
         .with_allow_create(true)
-        .with_transactional(true)
         .with_sorted_duplicates(true)
         .with_duplicate_comparator(ci);
     let db = env.open_database(None, "dupputcur_ci", &db_cfg).unwrap();

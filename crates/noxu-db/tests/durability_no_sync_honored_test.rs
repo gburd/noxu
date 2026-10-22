@@ -30,11 +30,18 @@ fn run(durability: Durability, n: u32) -> u64 {
             .with_durability(durability),
     )
     .unwrap();
+    // A TRANSACTIONAL db: an auto-commit `Database::put` on a transactional
+    // db is JE `Txn.createAutoTxn`, which honours the env durability (SYNC
+    // fsyncs per commit, NO_SYNC does not).  A NON-transactional db would
+    // never fsync on either policy (JE ThreadLocker, FID-NONTXN-SYNC-FSYNC),
+    // so it could not show the SYNC-vs-NO_SYNC difference this test checks.
     let db = env
         .open_database(
             None,
             "d",
-            &noxu_db::DatabaseConfig::new().with_allow_create(true),
+            &noxu_db::DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap();
     let before = env.stat_fsync_count();

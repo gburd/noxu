@@ -266,6 +266,20 @@ pub struct Cursor<'txn> {
     /// `Database::put`'s auto-txn commit does.  `None` for txn-bound,
     /// read-only, and unlogged cursors (an explicit txn syncs at commit).
     auto_sync: Option<(Arc<LogManager>, noxu_txn::Durability)>,
+    /// FID-CURSOR-AUTOCOMMIT: a cursor whose database is transactional but
+    /// whose locker is NOT transactional (a non-txn cursor opened on a
+    /// transactional DB via `open_cursor(None)`) must reject every update,
+    /// exactly like JE `Cursor.updateOperationsProhibited`
+    /// (Cursor.java:333-338): `updateOperationsProhibited = ... ||
+    /// (databaseImpl.isTransactional() && !locker.isTransactional()) || ...`,
+    /// and `checkUpdatesAllowed` throws `UnsupportedOperationException`
+    /// (Cursor.java:5340-5367).  Noxu maps that throw to `OperationNotAllowed`.
+    /// Set by `Database::open_cursor_user`; internal engine cursors (secondary
+    /// maintenance, iterators) use `open_cursor_internal` directly and leave
+    /// this `false`, because in JE those run under an auto-commit
+    /// *transactional* locker so their writes are allowed.  Read-only cursors
+    /// are rejected separately via `read_only`.
+    writes_prohibited: bool,
 }
 
 impl<'txn> Cursor<'txn> {
@@ -285,6 +299,7 @@ impl<'txn> Cursor<'txn> {
             sec_maint: None,
             db_open: None,
             auto_sync: None,
+            writes_prohibited: false,
         }
     }
 
@@ -323,7 +338,20 @@ impl<'txn> Cursor<'txn> {
             sec_maint,
             db_open: Some(db_open),
             auto_sync,
+            // Internal engine cursors leave this false (JE: those run under a
+            // transactional auto-commit locker).  `open_cursor_user` sets it
+            // true for a user cursor on a transactional db opened with no txn.
+            writes_prohibited: false,
         }
+    }
+
+    /// Marks this cursor's update operations as prohibited — JE
+    /// `Cursor.updateOperationsProhibited` (Cursor.java:333-338).  Set by
+    /// [`crate::Database::open_cursor_user`] for a non-transactional cursor
+    /// (`open_cursor(None)`) on a transactional database.  Internal engine
+    /// cursors leave it false.
+    pub(crate) fn set_writes_prohibited(&mut self, prohibited: bool) {
+        self.writes_prohibited = prohibited;
     }
 
     /// Makes an auto-commit write durable per the database's auto-commit
@@ -691,6 +719,16 @@ impl<'txn> Cursor<'txn> {
                 "Cannot write with a read-only cursor".to_string(),
             ));
         }
+        // FID-CURSOR-AUTOCOMMIT: JE `Cursor.checkUpdatesAllowed` throws
+        // `UnsupportedOperationException` when the database is transactional
+        // but the cursor's locker is not (a cursor opened with no txn) —
+        // Cursor.java:5340-5367.  Noxu maps that to `OperationNotAllowed`.
+        if self.writes_prohibited {
+            return Err(NoxuError::OperationNotAllowed(
+                "Write operation is not allowed because a Transaction was not supplied to openCursor and the Database is transactional."
+                    .to_string(),
+            ));
+        }
 
         let key_bytes = key.data_opt().unwrap_or(&[]);
         let data_bytes = data.data_opt().unwrap_or(&[]);
@@ -838,6 +876,15 @@ impl<'txn> Cursor<'txn> {
         if self.read_only {
             return Err(NoxuError::OperationNotAllowed(
                 "Cannot delete with a read-only cursor".to_string(),
+            ));
+        }
+        // FID-CURSOR-AUTOCOMMIT: JE `Cursor.checkUpdatesAllowed`
+        // (Cursor.java:5340-5367) — a non-transactional cursor on a
+        // transactional db prohibits all updates.
+        if self.writes_prohibited {
+            return Err(NoxuError::OperationNotAllowed(
+                "Write operation is not allowed because a Transaction was not supplied to openCursor and the Database is transactional."
+                    .to_string(),
             ));
         }
 

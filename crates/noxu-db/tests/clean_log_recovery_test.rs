@@ -93,7 +93,7 @@ fn old_live_records_survive_reclamation(clean: bool) {
     for k in 0u32..2000 {
         db.put(k.to_be_bytes(), value(k, 0)).unwrap();
     }
-    db.sync().unwrap();
+    env.flush_log(true).unwrap();
     let old_files = files();
     assert!(old_files.len() > 2, "old records must span closed files");
 
@@ -246,7 +246,7 @@ fn clean_log_then_reopen_preserves_all_records() {
                 db.put(k.to_be_bytes(), &value).unwrap();
             }
         }
-        db.sync().unwrap();
+        env.flush_log(true).unwrap();
         let reclaimed = env.clean_log().unwrap();
         eprintln!("clean_log reclaimed {reclaimed} files");
         // checkpoint so cleaned state is durable, then close cleanly
@@ -313,7 +313,7 @@ fn clean_log_with_daemons_then_reopen_preserves_all_records() {
                 db.put(k.to_be_bytes(), &value).unwrap();
             }
         }
-        db.sync().unwrap();
+        env.flush_log(true).unwrap();
         let reclaimed = env.clean_log().unwrap();
         eprintln!("[daemons] clean_log reclaimed {reclaimed} files");
         // NO explicit checkpoint — close cleanly and see if recovery is intact
@@ -383,7 +383,7 @@ fn repeated_clean_log_checkpoint_cycles_then_reopen() {
                     db.put(k.to_be_bytes(), &value).unwrap();
                 }
             }
-            db.sync().unwrap();
+            env.flush_log(true).unwrap();
             let r = env.clean_log().unwrap();
             env.checkpoint(None).ok();
             eprintln!("round {round}: clean_log reclaimed {r}");
@@ -461,9 +461,8 @@ fn repeated_clean_log_multiple_databases_all_survive() {
                     }
                 }
             }
-            for db in &dbs {
-                db.sync().unwrap();
-            }
+            // All dbs share one env log; a single flush drains it.
+            env.flush_log(true).unwrap();
             let r = env.clean_log().unwrap();
             env.checkpoint(None).ok();
             eprintln!("[multi-db] round {round}: clean_log reclaimed {r}");
@@ -537,7 +536,7 @@ fn repeated_checkpoint_no_clean_then_reopen() {
                     db.put(k.to_be_bytes(), &value).unwrap();
                 }
             }
-            db.sync().unwrap();
+            env.flush_log(true).unwrap();
             env.checkpoint(None).ok(); // NO clean_log
         }
         db.close().unwrap();

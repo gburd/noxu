@@ -19,8 +19,11 @@ fn open_env_and_db(dir: &TempDir) -> (noxu_db::Environment, noxu_db::Database) {
         .with_allow_create(true)
         .with_transactional(true);
     let env = noxu_db::Environment::open(env_config).unwrap();
-    let db_config =
-        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
+    // FID-CURSOR-AUTOCOMMIT: the cursor tests using this helper open a cursor
+    // with no txn and write through it.  In JE that is the ThreadLocker
+    // (non-transactional) write path, so this db is non-transactional.  The
+    // explicit-transaction cursor tests use `open_env_and_txn_db` instead.
+    let db_config = DatabaseConfig::new().with_allow_create(true);
     let db = env.open_database(None, "cursor_test_db", &db_config).unwrap();
     (env, db)
 }

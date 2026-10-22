@@ -220,16 +220,23 @@ fn cursor_edge_prev_no_dup_with_empty_tree() {
         }
     }
 
-    // Delete every record via cursor.
+    // Delete every record via cursor.  FID-CURSOR-AUTOCOMMIT: a cursor write
+    // on a transactional db needs a transactional locker, so run the
+    // scan+delete under an explicit auto-commit txn (JE beginAutoCommit).
     {
-        let mut c = db.open_cursor(None).unwrap();
-        let mut k = DatabaseEntry::new();
-        let mut d = DatabaseEntry::new();
-        let mut s = c.get(&mut k, &mut d, Get::First, None).unwrap();
-        while s == OperationStatus::Success {
-            c.delete().unwrap();
-            s = c.get(&mut k, &mut d, Get::Next, None).unwrap();
+        let txn = env.begin_transaction(None).unwrap();
+        {
+            let mut c = db.open_cursor_in(&txn, None).unwrap();
+            let mut k = DatabaseEntry::new();
+            let mut d = DatabaseEntry::new();
+            let mut s = c.get(&mut k, &mut d, Get::First, None).unwrap();
+            while s == OperationStatus::Success {
+                c.delete().unwrap();
+                s = c.get(&mut k, &mut d, Get::Next, None).unwrap();
+            }
+            c.close().unwrap();
         }
+        txn.commit().unwrap();
     }
 
     assert_eq!(db.count().unwrap(), 0);

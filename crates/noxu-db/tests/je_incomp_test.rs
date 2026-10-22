@@ -722,7 +722,8 @@ fn empty_bin_left_by_committed_deletes_is_never_pruned() {
     env.compress().unwrap();
     env.checkpoint(Some(&noxu_db::CheckpointConfig::new().with_force(true)))
         .unwrap();
-    db.sync().unwrap();
+    // (A forced checkpoint already flushes + fsyncs; `Database::sync` is now
+    // deferred-write-only, as in JE, so the redundant call is dropped.)
     env.compress().unwrap();
 
     // JE EXPECTATION (now satisfied after NEW-INCOMP-EMPTY-BIN): the empty

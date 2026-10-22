@@ -174,19 +174,23 @@ where
     Outcome { saw_nondurable_v2, saw_v2, saw_v1, completed_at_read }
 }
 
-// ───────────────────────── Path: non-transactional-db auto-commit ──────────
-// The INNER auto-`Txn` owns the fsync (PendingSync::Ln) on this path, so the
-// Fix-3a early release is directly observable.  JE analogue: a non-txn db uses
-// a `ThreadLocker` (BasicLocker) with NO commit-time fsync; Noxu's SYNC adds
-// the fsync and (pre-fix) released the lock before it.  This is the primary
-// RED witness.
+// ───────────────────── Path: transactional-db auto-commit (primary) ────────
+// The INNER auto-`Txn` owns the fsync (PendingSync::Commit/Ln) on this path,
+// so the Fix-3a early release is directly observable.  JE analogue: a
+// transactional-db auto-commit is `Txn.createAutoTxn` — a real txn — which
+// fsyncs for SYNC.  (The *non-transactional*-db path was the original RED
+// witness, but after FID-NONTXN-SYNC-FSYNC a non-txn write has NO commit-time
+// fsync at all — JE's ThreadLocker releases the lock at operation end with no
+// durability barrier to hold across — so there is nothing left for Fix-3a to
+// order there.  The transactional-db auto-commit path is where the inner Txn
+// still owns the SYNC fsync, so that is where this guard now lives.)
 
 #[test]
-fn w_isolation_non_transactional_db_auto_commit_read_committed() {
+fn w_isolation_transactional_db_auto_commit_primary_read_committed() {
     let _serial = PROBE_SERIAL.lock();
     let dir = TempDir::new().unwrap();
-    let env = Arc::new(Environment::open(env_cfg(dir.path(), false)).unwrap());
-    let db = Arc::new(env.open_database(None, "nt", &db_cfg(false)).unwrap());
+    let env = Arc::new(Environment::open(env_cfg(dir.path(), true)).unwrap());
+    let db = Arc::new(env.open_database(None, "nt", &db_cfg(true)).unwrap());
     // Base: k -> V1, durably.
     db.put(b"k", V1).unwrap();
     // Warm the fsync path so file-creation flushes don't confuse COMPLETED.
@@ -341,54 +345,77 @@ fn w_isolation_transactional_db_auto_commit_read_committed() {
 // ───────────────────────── Path: cursor auto (open_cursor(None)) ───────────
 
 #[test]
-fn w_isolation_cursor_auto_read_committed() {
+fn w_isolation_cursor_txn_read_committed() {
     let _serial = PROBE_SERIAL.lock();
     use noxu_db::Put;
-    // NON-transactional db: the JE-legitimate open_cursor(null) write path
-    // (a `ThreadLocker`).  (On 7.11.x a transactional-db open_cursor(None)
-    // write is also permitted -- the separate FID-CURSOR-AUTOCOMMIT deviation
-    // -- but the non-txn db is the path JE sanctions, so the witness targets
-    // it on both lines.)
+    // Cursor write under an EXPLICIT transaction on a transactional db.  After
+    // FID-CURSOR-AUTOCOMMIT a cursor opened with no txn on a transactional db
+    // refuses updates (JE Cursor.updateOperationsProhibited), and after
+    // FID-NONTXN-SYNC-FSYNC a non-txn-db cursor write has no commit-time fsync
+    // at all (JE ThreadLocker) — so the only JE-legal cursor-write path that
+    // still crosses a SYNC durability barrier is an explicit-txn cursor.  That
+    // is what this guard exercises: the txn's write lock must be held across
+    // the commit's SYNC fsync (Fix-3a ordering).
     let dir = TempDir::new().unwrap();
-    let env = Arc::new(Environment::open(env_cfg(dir.path(), false)).unwrap());
-    let db = Arc::new(env.open_database(None, "cu", &db_cfg(false)).unwrap());
-    db.put(b"k", V1).unwrap();
-    db.put(b"warm", V1).unwrap();
+    let env = Arc::new(Environment::open(env_cfg(dir.path(), true)).unwrap());
+    let db = Arc::new(Mutex::new(
+        env.open_database(None, "cu", &db_cfg(true)).unwrap(),
+    ));
+    {
+        let g = db.lock();
+        let t = env.begin_transaction(None).unwrap();
+        g.put_in(&t, b"k", V1).unwrap();
+        t.commit().unwrap();
+        let t = env.begin_transaction(None).unwrap();
+        g.put_in(&t, b"warm", V1).unwrap();
+        t.commit().unwrap();
+    }
 
+    let env_c = Arc::clone(&env);
     let db_c = Arc::clone(&db);
+    let env_r = Arc::clone(&env);
     let db_r = Arc::clone(&db);
     let out = race_window(
         LockMode::ReadCommitted,
         move || {
-            // Writable auto-commit cursor (txn = None): the bare locker holds
-            // the write lock, auto_commit_sync() does the SYNC fsync.
-            let mut c = db_c.open_cursor(None).unwrap();
-            let k = DatabaseEntry::from_bytes(b"k");
-            let v = DatabaseEntry::from_bytes(V2);
-            c.put(&k, &v, Put::Overwrite).unwrap();
-            c.close().unwrap();
+            let t = env_c.begin_transaction(None).unwrap();
+            {
+                let g = db_c.lock();
+                let mut c = g.open_cursor_in(&t, None).unwrap();
+                let k = DatabaseEntry::from_bytes(b"k");
+                let v = DatabaseEntry::from_bytes(V2);
+                c.put(&k, &v, Put::Overwrite).unwrap();
+                c.close().unwrap();
+            }
+            t.commit_with_durability(Durability::COMMIT_SYNC).unwrap();
         },
         move || {
+            use noxu_db::transaction_config::TransactionConfig;
+            let mut cfg = TransactionConfig::new();
+            cfg.set_read_committed(true);
+            let t = env_r.begin_transaction(Some(&cfg)).unwrap();
             let opts =
                 ReadOptions::new().with_lock_mode(LockMode::ReadCommitted);
-            db_r.get_with_options(None, b"k", &opts)
-                .ok()
-                .flatten()
-                .map(|b| b.to_vec())
+            let v = {
+                let g = db_r.lock();
+                g.get_with_options(Some(&t), b"k", &opts).ok().flatten()
+            };
+            let _ = t.commit();
+            v.map(|b| b.to_vec())
         },
     );
 
     eprintln!(
-        "FIX3A cursor-auto RC: saw_v1={} saw_v2={} saw_nondurable_v2={} \
+        "FIX3A cursor-txn RC: saw_v1={} saw_v2={} saw_nondurable_v2={} \
          completed_at_read={}",
         out.saw_v1, out.saw_v2, out.saw_nondurable_v2, out.completed_at_read,
     );
-    db.close().unwrap();
+    db.lock().close().unwrap();
     Arc::try_unwrap(env).ok().unwrap().close().unwrap();
 
     assert!(
         !out.saw_nondurable_v2,
-        "FID-TXN-FIX3A RED (cursor auto): a read-committed reader observed \
+        "FID-TXN-FIX3A RED (cursor under txn): a read-committed reader observed \
          the SYNC-committed V2 before its fsync completed."
     );
 }
@@ -403,9 +430,13 @@ fn w_isolation_cursor_auto_read_committed() {
 #[test]
 fn w2_fsync_eio_invalidates_and_no_nondurable_read() {
     let _serial = PROBE_SERIAL.lock();
+    // TRANSACTIONAL db: the inner auto-`Txn` owns the SYNC fsync (JE
+    // Txn.createAutoTxn).  After FID-NONTXN-SYNC-FSYNC the non-txn path has no
+    // fsync to fail, so this guard moved to the transactional-db auto-commit
+    // path (the surviving path where a SYNC fsync can be made to EIO).
     let dir = TempDir::new().unwrap();
-    let env = Arc::new(Environment::open(env_cfg(dir.path(), false)).unwrap());
-    let db = Arc::new(env.open_database(None, "nt", &db_cfg(false)).unwrap());
+    let env = Arc::new(Environment::open(env_cfg(dir.path(), true)).unwrap());
+    let db = Arc::new(env.open_database(None, "nt", &db_cfg(true)).unwrap());
     db.put(b"k", V1).unwrap();
     db.put(b"warm", V1).unwrap();
     // Make V1 durable BEFORE arming the fsync failure, so the only fsync we
@@ -488,9 +519,9 @@ fn w2_fsync_eio_invalidates_and_no_nondurable_read() {
     if let Ok(env_owned) = Arc::try_unwrap(env) {
         let _ = env_owned.close();
     }
-    match Environment::open(env_cfg(dir.path(), false)) {
+    match Environment::open(env_cfg(dir.path(), true)) {
         Ok(env2) => {
-            if let Ok(db2) = env2.open_database(None, "nt", &db_cfg(false)) {
+            if let Ok(db2) = env2.open_database(None, "nt", &db_cfg(true)) {
                 let after = db2.get(b"k").ok().flatten().map(|b| b.to_vec());
                 eprintln!(
                     "FIX3A W2 after-recovery k = {:?} (V1 => V2 lost; V2 => \
@@ -537,9 +568,13 @@ fn snapshot_image(dir: &Path) -> TempDir {
 #[test]
 fn w1_crash_before_durable_reader_sees_nondurable_then_lost() {
     let _serial = PROBE_SERIAL.lock();
+    // TRANSACTIONAL db: the inner auto-`Txn` owns the SYNC fsync (JE
+    // Txn.createAutoTxn).  After FID-NONTXN-SYNC-FSYNC the non-txn path has no
+    // fsync, so this crash-before-durable guard moved to the transactional-db
+    // auto-commit path.
     let dir = TempDir::new().unwrap();
-    let env = Arc::new(Environment::open(env_cfg(dir.path(), false)).unwrap());
-    let db = Arc::new(env.open_database(None, "nt", &db_cfg(false)).unwrap());
+    let env = Arc::new(Environment::open(env_cfg(dir.path(), true)).unwrap());
+    let db = Arc::new(env.open_database(None, "nt", &db_cfg(true)).unwrap());
     db.put(b"k", V1).unwrap();
     db.put(b"warm", V1).unwrap();
     // Make V1 durable so a crash image always recovers at least V1.
@@ -557,7 +592,7 @@ fn w1_crash_before_durable_reader_sees_nondurable_then_lost() {
     let s2 = Arc::clone(&started);
     let committer = std::thread::spawn(move || {
         s2.store(true, Ordering::SeqCst);
-        // Non-txn auto-commit SYNC put: inner auto-txn owns the fsync.
+        // Transactional-db auto-commit SYNC put: inner auto-txn owns the fsync.
         db_c.put(b"k", V2).unwrap();
     });
     while !started.load(Ordering::SeqCst) {
@@ -584,8 +619,8 @@ fn w1_crash_before_durable_reader_sees_nondurable_then_lost() {
 
     // Report the recovery consequence (informational) when we snapshotted.
     if let Some(img) = img_holder.lock().take() {
-        let renv = Environment::open(env_cfg(img.path(), false)).unwrap();
-        let rdb = renv.open_database(None, "nt", &db_cfg(false)).unwrap();
+        let renv = Environment::open(env_cfg(img.path(), true)).unwrap();
+        let rdb = renv.open_database(None, "nt", &db_cfg(true)).unwrap();
         let after = rdb.get(b"k").unwrap().map(|b| b.to_vec());
         eprintln!(
             "FIX3A W1 crash-image recovery k = {:?} (V1 => V2 was non-durable \

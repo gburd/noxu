@@ -152,6 +152,31 @@ impl<'a> SecondaryCursor<'a> {
     /// When the cursor was opened with `None`, every step runs
     /// auto-committed, which preserves the v1.4 behaviour.
     pub fn delete(&mut self) -> Result<OperationStatus> {
+        // FID-CURSOR-AUTOCOMMIT completeness (F1): a SECONDARY cursor opened
+        // with no transaction on a *transactional* database must refuse the
+        // delete, exactly as the primary `Cursor` does.  JE `Cursor.init` sets
+        // `updateOperationsProhibited = ... || (databaseImpl.isTransactional()
+        // && !locker.isTransactional()) || ...` (Cursor.java:333-338), and
+        // `SecondaryCursor.delete` goes through the same `checkUpdatesAllowed`
+        // throw (Cursor.java:5340-5367) — a `SecondaryCursor` on a
+        // transactional db opened with `txn == null` has a non-transactional
+        // (ThreadLocker) locker, so JE throws `UnsupportedOperationException`
+        // *before* cascading the delete to the primary.  Noxu maps that to
+        // `OperationNotAllowed`.  (The primary `Cursor` guard is wired via
+        // `Database::open_cursor_user`, but `SecondaryCursor::new` opens its
+        // inner cursor through `open_cursor_internal` and performs the primary
+        // delete out-of-band via `Database::delete`, so the primary guard does
+        // not cover this path; this explicit check does.)  A non-transactional
+        // secondary (ThreadLocker, allowed) and an explicit-txn cursor
+        // (`self.txn.is_some()`) are unaffected.
+        if self.secondary_db.inner_db().config().transactional
+            && self.txn.is_none()
+        {
+            return Err(NoxuError::OperationNotAllowed(
+                "Write operation is not allowed because a Transaction was not supplied to openCursor and the Database is transactional."
+                    .to_string(),
+            ));
+        }
         // Read the current secondary record to obtain the primary key.
         let mut sec_key = DatabaseEntry::new();
         let mut p_key_entry = DatabaseEntry::new();
