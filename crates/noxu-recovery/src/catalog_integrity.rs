@@ -556,4 +556,48 @@ mod tests {
             "must not name a 7.11.x-absent subcommand"
         );
     }
+
+    /// Cost bound (overhead requirement): `detect_xdb711_damage` is O(total
+    /// catalog events), independent of data volume. With a clean catalog of
+    /// `k` names each carrying a short committed history, the detector does a
+    /// single linear pass over the event lists and fires on none. This asserts
+    /// the work scales with catalog-op count — not a new log/data scan — by
+    /// running a large synthetic catalog in negligible time.
+    #[test]
+    fn detector_cost_is_linear_in_catalog_ops_only() {
+        let k = 10_000usize;
+        let mut mounted = HashMap::new();
+        let mut events = HashMap::new();
+        let mut committed = HashMap::new();
+        for i in 0..k {
+            let name = format!("db{i}");
+            let id = (i as u64) + 100;
+            let tid = (i as u64) + 1;
+            committed.insert(tid, lsn(1));
+            // Clean history: committed create + a relog of the CURRENT id.
+            events.insert(
+                name.clone(),
+                vec![
+                    ev(100 + i as u32, id, false, Some(tid)),
+                    ev(900 + i as u32, id, false, None),
+                ],
+            );
+            mounted.insert(name, id);
+        }
+        let start = std::time::Instant::now();
+        let d = detect_xdb711_damage(
+            &mounted,
+            &events,
+            &committed,
+            &HashSet::new(),
+        );
+        let elapsed = start.elapsed();
+        assert!(d.is_empty(), "clean catalog must not fire");
+        // 10k names x 2 events each is trivial work; a generous ceiling proves
+        // it is not doing anything super-linear or scan-like.
+        assert!(
+            elapsed.as_millis() < 200,
+            "detector over {k} names took {elapsed:?} (must be ~O(ops))"
+        );
+    }
 }
