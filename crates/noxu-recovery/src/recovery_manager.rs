@@ -859,12 +859,20 @@ impl RecoveryManager {
         // FOUND_COMMITTED_TXN refuse-to-mount pattern) raises the typed
         // EnvironmentFailureReason::LogIntegrity so the recovery crate's
         // public API is unchanged (patch-safe).
-        let xdb711_damage = crate::catalog_integrity::detect_xdb711_damage(
-            &analysis.recovered_db_names,
-            &analysis.catalog_events,
-            &analysis.committed_txns,
-            &analysis.aborted_txns,
-        );
+        // TEETH / diagnosis seam (XDB-DETECT): NOXU_XDB711_DETECT_OFF=1
+        // disables the detector so a test can observe the would-be-mounted
+        // (silently wrong) catalog.  Absent in normal operation.
+        let xdb711_damage =
+            if std::env::var_os("NOXU_XDB711_DETECT_OFF").is_some() {
+                Vec::new()
+            } else {
+                crate::catalog_integrity::detect_xdb711_damage(
+                    &analysis.recovered_db_names,
+                    &analysis.catalog_events,
+                    &analysis.committed_txns,
+                    &analysis.aborted_txns,
+                )
+            };
         if !xdb711_damage.is_empty() {
             let injectivity =
                 crate::catalog_integrity::mounted_injectivity_violations(

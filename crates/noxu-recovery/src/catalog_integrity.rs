@@ -173,11 +173,21 @@ pub struct CatalogDamage {
 ///    no legitimate (committed-transactional, or non-relog non-transactional)
 ///    **live** `N→F` event at `lsn ≥ e_auth.lsn`. If one existed, recovery's
 ///    `N→F` would be legitimate and the detector must not fire.
+/// 4. **`F` was `N`'s own binding BEFORE the authority** — there is a
+///    surviving legitimate live `N→F` event at `lsn < e_auth.lsn`. The stray
+///    relog resurrects an id that WAS bound to `N` and was then superseded;
+///    this positive surviving evidence is what makes the signal robust to log
+///    cleaning. A legitimate remove + recreate `N→G` (G a fresh id) whose
+///    recreate NameLN is later reclaimed by the cleaner leaves only the
+///    committed remove + a relog of the current `N→G`; because `G` had no
+///    legitimate binding below the remove, (4) fails and the detector stays
+///    silent (recovery's `N→G` is correct). See XDB-DETECT-FP-2.
 ///
-/// (1)+(2)+(3) is exactly: *a stray relog-run NameLN `N→F` won recovery above
-/// `N`'s latest legitimate authority, which binds `N→T≠F` or removed `N`, and
-/// no legitimate op ever re-bound `N→F`.* That is the stray-relog fingerprint
-/// and nothing else.
+/// (1)–(4) is exactly: *a stray relog-run NameLN `N→F` won recovery above
+/// `N`'s latest legitimate authority, which binds `N→T≠F` or removed `N`,
+/// where `F` was `N`'s own binding before that authority and no legitimate op
+/// re-bound `N→F` after it.* That is the stray-relog fingerprint and nothing
+/// else.
 ///
 /// # Why each legitimate history is excluded
 ///
@@ -334,6 +344,33 @@ fn stray_relog_damage(
             && is_legit(ev)
     });
     if legit_rebind_to_f {
+        return None;
+    }
+
+    // (4) CLEANING-ROBUSTNESS: F must have been N's own LEGITIMATE binding
+    //     BEFORE the superseding authority — i.e. the stray relog resurrects
+    //     an OLD binding of N→F that a later op superseded. A surviving
+    //     legitimate (committed or auto) live N→F at `lsn < e_auth.lsn` is
+    //     that evidence.
+    //
+    //     Without this, log cleaning causes a FALSE POSITIVE: a legitimate
+    //     remove + recreate `N→G` (G a FRESH id) whose recreate NameLN file
+    //     is reclaimed leaves only the committed remove (authority) + the
+    //     relog `N→G`; the relog faithfully preserves the CURRENT binding,
+    //     but G never had a legitimate binding below the remove (G was
+    //     allocated after it), so recovery's `N→G` is correct and we must not
+    //     fire. A genuine stray relog, by contrast, resurrects an id that WAS
+    //     N's binding before the superseding op (XDB-DETECT-FP-2). Requiring
+    //     positive surviving evidence keeps the detector silent (never wrong)
+    //     when cleaning has erased the history, and firing only when the
+    //     resurrected-old-binding evidence survives.
+    let f_was_old_binding = hist.iter().any(|ev| {
+        ev.lsn < e_auth.lsn
+            && !ev.is_deleted
+            && ev.id == mounted_id
+            && is_legit(ev)
+    });
+    if !f_was_old_binding {
         return None;
     }
 
@@ -988,6 +1025,53 @@ mod tests {
             fire(&p, &[10]).is_empty(),
             "aborted second binding is not a collision"
         );
+    }
+
+    // ── Signal (a) cleaning-robustness: condition (4) ──
+
+    /// XDB-DETECT-FP-2: a legitimate remove + recreate to a FRESH id whose
+    /// recreate NameLN was reclaimed by the cleaner. Surviving history: the
+    /// committed remove (of the OLD id) + a relog of the current fresh id.
+    /// The fresh id had NO legitimate binding below the remove, so condition
+    /// (4) fails — must NOT fire (recovery's binding is correct).
+    #[test]
+    fn excludes_relog_after_remove_recreate_fresh_id_cleaned() {
+        let p = one(
+            "c",
+            6,
+            vec![
+                // The old c→2 create + the recreate c→6 NameLN were cleaned;
+                // only the committed remove (of old id 2) and the relog of the
+                // current fresh id 6 survive.
+                ev(0x200, 2, true, Some(20)), // committed remove (old id)
+                relog(0x900, 6),              // relog of the CURRENT fresh id 6
+            ],
+        );
+        assert!(
+            fire(&p, &[20]).is_empty(),
+            "fresh-id relog after a cleaned recreate must not fire (FP-2)"
+        );
+    }
+
+    /// But if the resurrected id DID have a legitimate binding below the
+    /// authority (the genuine stray resurrecting an OLD id), condition (4)
+    /// holds and it fires. (seed 193773810554 shape: auto c→2 below a
+    /// committed remove, then a stray relog resurrects c→2.)
+    #[test]
+    fn fires_on_stray_relog_resurrecting_old_id_below_authority() {
+        let p = one(
+            "c",
+            2,
+            vec![
+                ev(0x100, 2, false, None), // AUTO create c→2 (old binding)
+                ev(0x200, 0, true, Some(20)), // committed remove c
+                relog(0x900, 2),           // STRAY relog resurrects old c→2
+            ],
+        );
+        let d = fire(&p, &[20]);
+        assert_eq!(d.len(), 1, "genuine stray resurrecting an old id fires");
+        assert_eq!(d[0].kind, DamageKind::StrayRelog);
+        assert_eq!(d[0].committed_id, None);
     }
 
     /// A plain committed create, no relog at all.
