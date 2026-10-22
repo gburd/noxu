@@ -383,15 +383,36 @@ pub fn apply_redo_ln(tree: &mut noxu_tree::Tree, rec: &LnRecord, lsn: Lsn) {
             // compressor; a KD slot or an absent key is left alone.  Keeping
             // the slot lets undo of a later uncommitted write to the key match
             // it by LSN (RecoveryManager.java:1912-1963).
-            if let Some((slot_lsn, false)) = tree.slot_lsn_any(&rec.key)
-                && (slot_lsn.is_null() || lsn >= slot_lsn)
-            {
-                // FID-CURSOR-1: recovery redo of a committed deletion marks
-                // the slot KNOWN-deleted (JE `recoverRecord(.., redoKD=true,
-                // ..)`, RecoveryManager.java:2545-2555) — no active txn exists
-                // at recovery time, so the deletion is "known" (`pending =
-                // false`), skippable by a later scan without a lock.
-                tree.mark_deleted(&rec.key, lsn, false);
+            //
+            // ENG-FSYNCDROP-RESURRECT-1 (S1): when the slot is ALREADY deleted
+            // (KD or PD) at an OLDER LSN (frozen in a checkpoint by an earlier
+            // UNCOMMITTED delete of the SAME id -- possible only because
+            // Noxu's truncate reuses the id and logs per-record DeleteLNs,
+            // deviation F1), the non-deleted branch below never runs, so the
+            // slot keeps the uncommitted-delete LSN and the later undo of that
+            // uncommitted delete reverts it to its committed before-image,
+            // resurrecting a record a committed truncate removed.  Mirror JE
+            // `recoverRecord(.., logrecLsn, redoKD, ..)`
+            // (RecoveryManager.java:2592) and advance the deleted slot's LSN
+            // to the committed delete's LSN so the earlier undo no longer
+            // matches it by LSN (JE `updateEntry = compareTo(logLsn, slotLsn)
+            // == 0`) and the committed deletion stands.
+            match tree.slot_lsn_any(&rec.key) {
+                Some((slot_lsn, false))
+                    if slot_lsn.is_null() || lsn >= slot_lsn =>
+                {
+                    // FID-CURSOR-1: recovery redo of a committed deletion
+                    // marks the slot KNOWN-deleted (JE `recoverRecord(..,
+                    // redoKD=true, ..)`, RecoveryManager.java:2545-2555) -- no
+                    // active txn exists at recovery time, so the deletion is
+                    // "known" (`pending = false`), skippable by a later scan
+                    // without a lock.
+                    tree.mark_deleted(&rec.key, lsn, false);
+                }
+                Some((_, true)) => {
+                    tree.redo_advance_deleted_slot_lsn(&rec.key, lsn);
+                }
+                _ => {}
             }
         }
     }

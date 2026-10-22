@@ -11088,6 +11088,69 @@ impl Tree {
         true
     }
 
+    /// Recovery-redo currency fix for a committed DELETE replayed over a slot
+    /// that is ALREADY deleted (KD or PD) at an OLDER LSN.
+    ///
+    /// JE `RecoveryManager.redo` handles a redo-deletion over a KD slot in the
+    /// `else if (found)` arm (RecoveryManager.java:2576-2600): it queues the
+    /// slot for compression and ASSERTS `logrecLsn <= treeLsn` ("the record
+    /// must have been re-inserted between treeLsn and logrecLsn, in which case
+    /// the slot could not have been KD").  That invariant holds in JE because
+    /// a truncate assigns a NEW `DatabaseId` (`DbTree.doTruncateDb`), so a
+    /// committed delete of an id can never carry a HIGHER LSN than a slot
+    /// frozen deleted by an earlier *uncommitted* delete of the *same* id.
+    ///
+    /// Noxu's truncate keeps the SAME id and logs per-record `DeleteLN`s
+    /// (deviation F1), so a committed truncate's delete CAN arrive at
+    /// `logrecLsn > slot_lsn` on a slot the checkpoint froze deleted for an
+    /// earlier uncommitted (later aborted) delete.  The non-KD redo path
+    /// (`mark_deleted`) never runs for a deleted slot, so the slot keeps the
+    /// OLD (uncommitted-delete) LSN; the subsequent undo of that uncommitted
+    /// delete then matches it by LSN (`undo_slot_is_current`, JE `updateEntry
+    /// = compareTo(logLsn, slotLsn) == 0`) and REVERTS it to its committed
+    /// before-image, resurrecting a record a committed truncate removed
+    /// (ENG-FSYNCDROP-RESURRECT-1, S1).
+    ///
+    /// The fix mirrors JE's `recoverRecord(.., logrecLsn, redoKD, ..)` LSN
+    /// advance for the `lsnCmp > 0` case: when the slot is deleted (KD or PD)
+    /// and `del_lsn > slot_lsn`, advance the slot LSN to `del_lsn` (keeping
+    /// its deleted state; data already dropped).  The slot stays deleted and
+    /// now carries the committed delete's LSN, so the earlier uncommitted
+    /// delete's undo no longer matches by LSN and leaves the committed
+    /// deletion in place.
+    ///
+    /// Returns `true` iff a deleted slot's LSN was advanced.  Idempotent, and
+    /// a no-op for a non-deleted slot (handled by `mark_deleted`), an absent
+    /// key, or `del_lsn <= slot_lsn`.
+    pub fn redo_advance_deleted_slot_lsn(
+        &self,
+        key: &[u8],
+        del_lsn: Lsn,
+    ) -> bool {
+        let Some(bin_arc) = self.get_parent_bin_for_child_ln(key) else {
+            return false;
+        };
+        let mut g = bin_arc.write();
+        let TreeNode::Bottom(bin) = &mut *g else {
+            return false;
+        };
+        let (idx, exact) = match &self.key_comparator {
+            Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
+            None => bin.find_entry_compressed(key),
+        };
+        if !exact || !bin.entries[idx].is_deleted() {
+            return false; // non-deleted slot: the mark_deleted path handles it
+        }
+        let cur = bin.get_lsn(idx);
+        if !cur.is_null() && del_lsn <= cur {
+            return false; // already at/ahead of the committed delete
+        }
+        bin.set_lsn(idx, del_lsn);
+        bin.entries[idx].dirty = true;
+        bin.dirty = true;
+        true
+    }
+
     /// `(slot LSN, is_deleted)` of the slot for `key`, INCLUDING a deleted
     /// slot (JE `getParentBINForChildLN` returns KD/PD slots; the read-path
     /// `findEntry` hides them, IN.java:3197).  Used where JE inspects a slot
@@ -20386,6 +20449,119 @@ mod split_special_tests {
             "TREE-F1: collect_bins_with_known_deleted must still observe the \
              KD slot so the compressor can reclaim it"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // JE redo-parity for the KD slot (ENG-FSYNCDROP-RESURRECT-1).
+    // JE `RecoveryManager.redo` -> `bin.recoverRecord` applies a log record
+    // whenever `logrecLsn > treeLsn`, regardless of the slot's KD state:
+    //   * a DELETE leaves the slot KD at the NEW (higher) LSN;
+    //   * an INSERT/UPDATE of a newer LN onto a KD slot takes the LN and
+    //     CLEARS KD.
+    // These exercise `redo_advance_deleted_slot_lsn` (the DELETE-on-KD LSN
+    // advance the live redo path lacked) and confirm the insert/update-on-KD
+    // paths already clear KD — the full newer/older/equal × live/KD × ins/del
+    // matrix.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Mark the slot for `key` known-deleted at `kd_lsn`, directly in the BIN.
+    fn force_kd(tree: &Tree, key: &[u8], kd_lsn: Lsn) {
+        let root = tree.get_root().expect("root");
+        let bin_arc = find_bin_arc_for_key(&root, key).expect("bin");
+        let mut g = bin_arc.write();
+        if let TreeNode::Bottom(b) = &mut *g {
+            let idx = (0..b.entries.len())
+                .find(|&i| b.get_full_key(i).as_deref() == Some(key))
+                .expect("key slot");
+            b.set_lsn(idx, kd_lsn);
+            b.entries[idx].known_deleted = true;
+            b.entries[idx].data = None;
+        } else {
+            panic!("expected BIN");
+        }
+    }
+
+    /// DELETE-on-KD, NEWER LSN: advance the KD slot LSN, keep it KD.
+    #[test]
+    fn redo_delete_on_kd_newer_lsn_advances_slot() {
+        let tree = Tree::new(1, 128);
+        let key = b"k".to_vec();
+        tree.insert(key.clone(), vec![1], Lsn::new(1, 100)).unwrap();
+        force_kd(&tree, &key, Lsn::new(1, 100));
+        assert_eq!(tree.slot_lsn_any(&key), Some((Lsn::new(1, 100), true)));
+
+        // A committed delete at a HIGHER LSN advances the KD slot LSN.
+        let adv = tree.redo_advance_deleted_slot_lsn(&key, Lsn::new(2, 200));
+        assert!(adv, "KD slot LSN must advance for a newer delete");
+        assert_eq!(
+            tree.slot_lsn_any(&key),
+            Some((Lsn::new(2, 200), true)),
+            "slot stays KD, LSN advanced to the committed delete"
+        );
+    }
+
+    /// DELETE-on-KD, OLDER or EQUAL LSN: no change (JE lsnCmp <= 0 no-op).
+    #[test]
+    fn redo_delete_on_kd_older_or_equal_lsn_is_noop() {
+        let tree = Tree::new(1, 128);
+        let key = b"k".to_vec();
+        tree.insert(key.clone(), vec![1], Lsn::new(5, 500)).unwrap();
+        force_kd(&tree, &key, Lsn::new(5, 500));
+
+        assert!(!tree.redo_advance_deleted_slot_lsn(&key, Lsn::new(2, 200)));
+        assert_eq!(tree.slot_lsn_any(&key), Some((Lsn::new(5, 500), true)));
+        assert!(!tree.redo_advance_deleted_slot_lsn(&key, Lsn::new(5, 500)));
+        assert_eq!(tree.slot_lsn_any(&key), Some((Lsn::new(5, 500), true)));
+    }
+
+    /// DELETE-on-non-KD or absent key: `redo_advance_deleted_slot_lsn` is a
+    /// no-op (the non-KD case is the `mark_deleted` path; absent key = None).
+    #[test]
+    fn redo_advance_deleted_slot_lsn_only_touches_kd() {
+        let tree = Tree::new(1, 128);
+        let key = b"k".to_vec();
+        tree.insert(key.clone(), vec![1], Lsn::new(1, 100)).unwrap();
+        // Live (non-KD) slot: no advance.
+        assert!(!tree.redo_advance_deleted_slot_lsn(&key, Lsn::new(2, 200)));
+        assert_eq!(tree.slot_lsn_any(&key), Some((Lsn::new(1, 100), false)));
+        // Absent key: no slot, no advance.
+        assert!(!tree.redo_advance_deleted_slot_lsn(b"absent", Lsn::new(9, 9)));
+    }
+
+    /// INSERT/UPDATE-on-KD, NEWER LSN: takes the LN and CLEARS KD (JE
+    /// recoverRecord redoKD=false).  Already correct via the insert paths;
+    /// this locks it in.
+    #[test]
+    fn redo_insert_on_kd_newer_lsn_clears_kd_and_takes_ln() {
+        let tree = Tree::new(1, 128);
+        let key = b"k".to_vec();
+        tree.insert(key.clone(), vec![1], Lsn::new(1, 100)).unwrap();
+        force_kd(&tree, &key, Lsn::new(1, 100));
+        assert_eq!(tree.slot_lsn_any(&key), Some((Lsn::new(1, 100), true)));
+
+        tree.redo_insert(&key, b"reborn", Lsn::new(3, 300)).unwrap();
+        // KD cleared, data present, LSN advanced.
+        assert_eq!(tree.slot_lsn_any(&key), Some((Lsn::new(3, 300), false)));
+        let got = tree.search_with_data(&key).expect("slot");
+        assert!(got.found, "insert over KD must revive the record");
+        assert_eq!(got.data.as_deref(), Some(&b"reborn"[..]));
+    }
+
+    /// INSERT-on-KD, OLDER or EQUAL LSN: skipped, slot stays KD (JE lsnCmp<=0).
+    #[test]
+    fn redo_insert_on_kd_older_or_equal_lsn_keeps_kd() {
+        let tree = Tree::new(1, 128);
+        let key = b"k".to_vec();
+        tree.insert(key.clone(), vec![1], Lsn::new(5, 500)).unwrap();
+        force_kd(&tree, &key, Lsn::new(5, 500));
+
+        tree.redo_insert(&key, b"stale", Lsn::new(2, 200)).unwrap();
+        assert_eq!(
+            tree.slot_lsn_any(&key),
+            Some((Lsn::new(5, 500), true)),
+            "older-LSN insert must not revive a KD slot"
+        );
+        assert!(!tree.search_with_data(&key).expect("slot").found);
     }
 
     // ─────────────────────────────────────────────────────────────────────
