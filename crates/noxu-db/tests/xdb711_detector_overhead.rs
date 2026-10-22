@@ -44,9 +44,7 @@ fn env_cfg(dir: &std::path::Path) -> EnvironmentConfig {
 }
 
 fn db_cfg() -> DatabaseConfig {
-    DatabaseConfig::new()
-        .with_allow_create(true)
-        .with_transactional(true)
+    DatabaseConfig::new().with_allow_create(true).with_transactional(true)
 }
 
 #[test]
@@ -84,8 +82,7 @@ fn xdb711_detector_overhead_is_bounded() {
         }
         {
             let t = env.begin_transaction(None).unwrap();
-            let db =
-                env.open_database(Some(&t), "bravo", &db_cfg()).unwrap();
+            let db = env.open_database(Some(&t), "bravo", &db_cfg()).unwrap();
             db.close().unwrap();
             t.commit().unwrap();
         }
@@ -113,9 +110,7 @@ fn xdb711_detector_overhead_is_bounded() {
     let log_bytes: u64 = std::fs::read_dir(&base)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path().extension().map(|x| x == "ndb").unwrap_or(false)
-        })
+        .filter(|e| e.path().extension().map(|x| x == "ndb").unwrap_or(false))
         .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
         .sum();
     eprintln!(
@@ -137,10 +132,7 @@ fn xdb711_detector_overhead_is_bounded() {
     );
     // Clean history: the rename chain + remove/recreate must leave the catalog
     // mounted (detector did not fire), proving no false positive at scale.
-    assert!(
-        names.iter().any(|n| n == "alpha2"),
-        "renamed db must be present"
-    );
+    assert!(names.iter().any(|n| n == "alpha2"), "renamed db must be present");
     assert!(
         !names.iter().any(|n| n == "alpha"),
         "old name must be gone after committed rename"
