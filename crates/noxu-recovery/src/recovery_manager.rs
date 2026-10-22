@@ -849,6 +849,48 @@ impl RecoveryManager {
         // ------------------------------------------------------------------
         self.run_mapping_tree_undo_pass(&mut analysis);
 
+        // XDB-711 fail-closed detector (option A): before mounting the
+        // settled latest-NameLN-wins catalog, check it against the committed
+        // transactional history for the stray-relog signature of the
+        // 7.11.0/.1 writer bug.  A writer-side fix cannot repair a log already
+        // written; JE refuses such a catalog with LOG_INTEGRITY rather than
+        // serve wrong data silently (xdb-711-fix.md §9).  We only RECORD the
+        // verdict here; the open path (environment_impl, mirroring the L-14
+        // FOUND_COMMITTED_TXN refuse-to-mount pattern) raises the typed
+        // EnvironmentFailureReason::LogIntegrity so the recovery crate's
+        // public API is unchanged (patch-safe).
+        let xdb711_damage = crate::catalog_integrity::detect_xdb711_damage(
+            &analysis.recovered_db_names,
+            &analysis.catalog_events,
+            &analysis.committed_txns,
+            &analysis.aborted_txns,
+        );
+        if !xdb711_damage.is_empty() {
+            let injectivity = crate::catalog_integrity::
+                mounted_injectivity_violations(&analysis.recovered_db_names);
+            for d in &xdb711_damage {
+                log::error!(
+                    "recovery[xdb-711]: catalog integrity violation: database \
+                     '{}' mounted as id {} but the latest committed \
+                     transactional operation bound it to {:?} (stray \
+                     non-transactional NameLN at LSN {}, committed authority \
+                     at LSN {})",
+                    d.name,
+                    d.mounted_id,
+                    d.committed_id,
+                    d.stray_lsn,
+                    d.authority_lsn
+                );
+            }
+            for (id, names) in &injectivity {
+                log::error!(
+                    "recovery[xdb-711]: injectivity violation: id {id} is \
+                     mounted under names {names:?} (corroborating evidence)"
+                );
+            }
+        }
+        self.info.xdb711_damage = xdb711_damage;
+
         self.set_progress(RecoveryProgress::ReplayLNs);
         self.run_redo_all(scanner, &analysis, trees)?;
 
@@ -2037,6 +2079,20 @@ impl RecoveryManager {
                 // NameLN: database name registration
                 // ----------------------------------------------------------
                 LogEntry::NameLn(rec) => {
+                    // XDB-711 detector: record EVERY NameLN/NameLNTxn event
+                    // (live or tombstone, txnal or not) in ascending-LSN order
+                    // per name, before the latest-wins mutation below discards
+                    // the superseded records.  Bounded per-NameLN work.
+                    result_ref
+                        .catalog_events
+                        .entry(rec.name.clone())
+                        .or_default()
+                        .push(crate::catalog_integrity::CatalogEvent {
+                            lsn: entry_lsn,
+                            id: rec.db_id,
+                            is_deleted: rec.is_deleted,
+                            txn_id: rec.txn_id,
+                        });
                     if rec.is_deleted {
                         // BUG-DDL-DURABILITY-1: a TRANSACTIONAL delete
                         // (txn_id=Some) must only take effect if its txn

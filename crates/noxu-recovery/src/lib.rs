@@ -17,6 +17,7 @@
 //! open and periodic checkpointing to bound recovery time.
 
 pub mod analysis_result;
+pub mod catalog_integrity;
 pub mod checkpoint_end;
 pub mod checkpoint_start;
 pub mod checkpoint_stat;
@@ -33,6 +34,13 @@ pub mod txn_chain;
 pub use analysis_result::{
     AnalysisResult, DirtyInEntry, DirtyInKey, PreparedLnOperation,
     PreparedLnReplay, PreparedTxnInfo,
+};
+// XDB-711 fail-closed detector. `#[doc(hidden)]`: new cross-crate helpers are
+// not part of the stable public surface (release-backport-contract).
+#[doc(hidden)]
+pub use catalog_integrity::{
+    CatalogDamage, CatalogEvent, detect_xdb711_damage, log_integrity_message,
+    mounted_injectivity_violations,
 };
 pub use checkpoint_end::CheckpointEnd;
 pub use checkpoint_start::CheckpointStart;
