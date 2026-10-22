@@ -118,8 +118,7 @@ fn drive(env: &Environment, seed: u64) -> Vec<String> {
                 }
             }
             4 => {
-                if live.contains_key(n)
-                    && env.remove_database(None, n).is_ok()
+                if live.contains_key(n) && env.remove_database(None, n).is_ok()
                 {
                     live.remove(n);
                 }
