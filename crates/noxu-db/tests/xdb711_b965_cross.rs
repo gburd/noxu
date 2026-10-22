@@ -28,6 +28,27 @@ fn images_root() -> Option<PathBuf> {
     std::env::var_os("XDB_B965_IMAGES").map(PathBuf::from)
 }
 
+/// Stage an image dir into a fresh scratch copy so the read-write recovery
+/// open never mutates the pristine corpus (a recovery open appends a
+/// checkpoint tail; on v8 that newer-format tail would shift the bounded
+/// analysis window past the stray evidence on a second in-place open).
+fn stage(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for e in std::fs::read_dir(src).unwrap() {
+        let e = e.unwrap();
+        if e.file_type().unwrap().is_file() {
+            std::fs::copy(e.path(), dst.join(e.file_name())).unwrap();
+        }
+    }
+}
+
+fn scratch_base() -> PathBuf {
+    std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!("xdb-b965-cross-{}", std::process::id()))
+}
+
 fn reopen_names(dir: &Path) -> Result<Vec<String>, NoxuError> {
     let mut rc = EnvironmentConfig::new(dir.to_path_buf())
         .with_allow_create(false)
@@ -74,13 +95,19 @@ fn b965_written_images_cross_engine() {
     let mut first_fp = String::new();
     let mut first_silent = String::new();
 
+    let base = scratch_base();
+    let _ = std::fs::remove_dir_all(&base);
     for dir in &dirs {
         let expect = ground_truth(dir);
+        let name = dir.file_name().unwrap().to_string_lossy().to_string();
 
-        // Pass 1: detector OFF → would-be catalog.
+        // Pass 1: detector OFF → would-be catalog. Stage a FRESH copy so this
+        // recovery open's checkpoint tail does not contaminate pass 2.
+        let off_dir = base.join(format!("{name}-off"));
+        stage(dir, &off_dir);
         // SAFETY: single-threaded test.
         unsafe { std::env::set_var("NOXU_XDB711_DETECT_OFF", "1") };
-        let would = reopen_names(dir);
+        let would = reopen_names(&off_dir);
         // SAFETY: single-threaded test.
         unsafe { std::env::remove_var("NOXU_XDB711_DETECT_OFF") };
         let is_damaged = !matches!(&would, Ok(g) if *g == expect);
@@ -88,8 +115,10 @@ fn b965_written_images_cross_engine() {
             damaged += 1;
         }
 
-        // Pass 2: detector ON.
-        match reopen_names(dir) {
+        // Pass 2: detector ON, on a SEPARATE fresh staged copy.
+        let on_dir = base.join(format!("{name}-on"));
+        stage(dir, &on_dir);
+        match reopen_names(&on_dir) {
             Ok(_) => {
                 if is_damaged {
                     damaged_silent += 1;
