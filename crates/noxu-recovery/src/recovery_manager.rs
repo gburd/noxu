@@ -866,8 +866,10 @@ impl RecoveryManager {
             &analysis.aborted_txns,
         );
         if !xdb711_damage.is_empty() {
-            let injectivity = crate::catalog_integrity::
-                mounted_injectivity_violations(&analysis.recovered_db_names);
+            let injectivity =
+                crate::catalog_integrity::mounted_injectivity_violations(
+                    &analysis.recovered_db_names,
+                );
             for d in &xdb711_damage {
                 log::error!(
                     "recovery[xdb-711]: catalog integrity violation: database \

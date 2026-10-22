@@ -16,7 +16,9 @@
 //! DISABLED does (the RED proof that the detector is load-bearing). See
 //! `xdb-detect.md` §3.
 
-use noxu_db::{Environment, EnvironmentConfig, EnvironmentFailureReason, NoxuError};
+use noxu_db::{
+    Environment, EnvironmentConfig, EnvironmentFailureReason, NoxuError,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -91,11 +93,7 @@ fn xdb711_saved_images_fail_closed() {
         })
         .collect();
     seeds.sort();
-    assert!(
-        !seeds.is_empty(),
-        "no seed-* image dirs under {}",
-        root.display()
-    );
+    assert!(!seeds.is_empty(), "no seed-* image dirs under {}", root.display());
 
     for seed in &seeds {
         let name = seed.file_name().unwrap().to_string_lossy().to_string();
@@ -115,7 +113,9 @@ fn xdb711_saved_images_fail_closed() {
                 "[teeth] {name}: expected a SILENT open (detector disabled) \
                  but got {r_desc}"
             );
-            eprintln!("[teeth] {name}: opened silently (detector disabled) — RED");
+            eprintln!(
+                "[teeth] {name}: opened silently (detector disabled) — RED"
+            );
         } else {
             match r {
                 Err(NoxuError::EnvironmentFailure {
@@ -129,8 +129,7 @@ fn xdb711_saved_images_fail_closed() {
                         "{name}: message missing XDB-711 attribution: {msg}"
                     );
                     assert!(
-                        msg.contains("restore")
-                            && msg.contains("preserve"),
+                        msg.contains("restore") && msg.contains("preserve"),
                         "{name}: message missing recovery options: {msg}"
                     );
                     assert!(

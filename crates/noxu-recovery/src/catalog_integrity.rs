@@ -245,14 +245,12 @@ pub fn mounted_injectivity_violations(
 /// `noxu-admin scavenge`: that offline-salvage subcommand does not exist in
 /// the 7.11.x release line (it is a v8 feature).
 pub fn log_integrity_message(damaged: &[CatalogDamage]) -> String {
-    let mut names: Vec<&str> = damaged.iter().map(|d| d.name.as_str()).collect();
+    let mut names: Vec<&str> =
+        damaged.iter().map(|d| d.name.as_str()).collect();
     names.sort_unstable();
     names.dedup();
-    let name_list = names
-        .iter()
-        .map(|n| format!("'{n}'"))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let name_list =
+        names.iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", ");
     format!(
         "database catalog is inconsistent — the log was written by a Noxu DB \
          7.11.0/7.11.1 version affected by XDB-711 and the recovered \
@@ -276,12 +274,7 @@ mod tests {
     }
 
     fn ev(l: u32, id: u64, del: bool, txn: Option<u64>) -> CatalogEvent {
-        CatalogEvent {
-            lsn: lsn(l),
-            id,
-            is_deleted: del,
-            txn_id: txn,
-        }
+        CatalogEvent { lsn: lsn(l), id, is_deleted: del, txn_id: txn }
     }
 
     fn committed(ids: &[u64]) -> HashMap<u64, Lsn> {
@@ -299,9 +292,9 @@ mod tests {
         events.insert(
             "charlie".to_string(),
             vec![
-                ev(0x1f78, 7, false, Some(91)),  // committed rename-in
+                ev(0x1f78, 7, false, Some(91)), // committed rename-in
                 ev(0x4100, 99, false, Some(150)), // committed recreate → id 99
-                ev(0x5339, 7, false, None),       // STRAY relog → id 7
+                ev(0x5339, 7, false, None),     // STRAY relog → id 7
             ],
         );
         let mut mounted = HashMap::new();
@@ -424,8 +417,8 @@ mod tests {
             "gamma".to_string(),
             vec![
                 ev(0x100, 4, false, Some(10)), // committed create
-                ev(0x200, 4, true, Some(77)),  // in-doubt remove (txn 77 NOT committed)
-                ev(0x900, 4, false, None),     // relog of current id 4
+                ev(0x200, 4, true, Some(77)), // in-doubt remove (txn 77 NOT committed)
+                ev(0x900, 4, false, None),    // relog of current id 4
             ],
         );
         let mut mounted = HashMap::new();
@@ -453,7 +446,7 @@ mod tests {
             "b".to_string(),
             vec![
                 ev(0x200, 7, false, Some(20)), // rename a→b (in)
-                ev(0x300, 7, true, Some(30)),  // rename b→c (b tombstoned), committed
+                ev(0x300, 7, true, Some(30)), // rename b→c (b tombstoned), committed
             ],
         );
         let mut mounted = HashMap::new();

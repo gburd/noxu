@@ -16,7 +16,9 @@
 //! Complements `xdb711_detect_images.rs` (the 4 damaged images MUST fail
 //! closed) — together they bound the detector from both sides.
 
-use noxu_db::{Environment, EnvironmentConfig, EnvironmentFailureReason, NoxuError};
+use noxu_db::{
+    Environment, EnvironmentConfig, EnvironmentFailureReason, NoxuError,
+};
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
