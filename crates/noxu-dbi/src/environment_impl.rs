@@ -1838,6 +1838,91 @@ impl EnvironmentImpl {
             })
         };
 
+        // ENG-CLEAN-TOMBSTONE-1 (S1, D-ADDITIVE-SAFETY, 7.11.x only):
+        // name-resurrection oracle for the cleaner's NameLN-tombstone clamp.
+        // Given a tombstone for `name` at `tombstone_lsn`, report whether
+        // reclaiming its file could RESURRECT the removed database:
+        //   * `name` is LIVE in the committed catalog (recreated) -> false:
+        //     the recreate's newer live NameLN wins recovery regardless of
+        //     this tombstone, so retaining it would only waste space.
+        //   * `name` is REMOVED -> true iff a live (create) NameLN for `name`
+        //     survives on disk in a file OLDER than the tombstone's file.
+        //     That older live create is exactly what recovery's
+        //     latest-NameLN-per-name replay would pick if this tombstone's
+        //     file were reclaimed -- so the file must be RETAINED.
+        // The oracle asks the LOG directly (JE derives catalog liveness from
+        // the mapping tree it scans; 7.11.x has no name tree, so we scan the
+        // surviving NameLN stream of the older files) -- no side map, no
+        // per-write-path bookkeeping.  It runs only while cleaning a file
+        // that actually holds a tombstone (rare), and only scans files older
+        // than the tombstone.
+        // Bounded / progress guaranteed: the older create's file is itself a
+        // clean candidate (its live NameLN classifies `Other` -> obsolete,
+        // migrated nowhere, nothing retains it); once it is reclaimed no
+        // older live create survives, the oracle returns false, and the
+        // tombstone's file becomes reclaimable.  No file retained forever.
+        let name_resurrection_oracle: noxu_cleaner::NameResurrectionOracle = {
+            let name_map = Arc::clone(&name_map);
+            let fm =
+                log_manager.as_ref().map(|lm| Arc::clone(lm.file_manager()));
+            Arc::new(move |name: &str, tombstone_lsn: noxu_util::Lsn| {
+                // Recreated / still-live name: the live binding wins; no retain.
+                if name_map.read().contains_key(name) {
+                    return false;
+                }
+                let fm = match &fm {
+                    Some(fm) => fm,
+                    None => return false,
+                };
+                // Scan every surviving file OLDER than the tombstone's file
+                // for a live (non-deleted) NameLN whose key == `name`.  If one
+                // exists it could resurrect `name` on recovery -> retain.
+                let files = match fm.list_file_numbers() {
+                    Ok(v) => v,
+                    // Cannot enumerate -> be safe and retain (never risk a
+                    // resurrection on an I/O hiccup).
+                    Err(_) => return true,
+                };
+                for fnum in files {
+                    if fnum >= tombstone_lsn.file_number() {
+                        continue;
+                    }
+                    let mut reader =
+                        match noxu_log::log_file_reader::LogFileReader::open(
+                            Arc::clone(fm),
+                            fnum,
+                        ) {
+                            Ok(r) => r,
+                            Err(_) => return true, // unreadable -> be safe
+                        };
+                    while let Some((_lsn, ty, payload)) = reader.read_next() {
+                        if !matches!(
+                            ty,
+                            noxu_log::LogEntryType::NameLN
+                                | noxu_log::LogEntryType::NameLNTxn
+                        ) {
+                            continue;
+                        }
+                        let is_txn =
+                            matches!(ty, noxu_log::LogEntryType::NameLNTxn);
+                        if let Ok(e) =
+                            noxu_log::entry::LnLogEntry::read_from_log(
+                                &payload, is_txn,
+                            )
+                            && e.data.is_some()
+                            && e.key == name.as_bytes()
+                        {
+                            // An older live create for the removed name
+                            // survives -> reclaiming the tombstone would
+                            // resurrect it.  Retain the tombstone's file.
+                            return true;
+                        }
+                    }
+                }
+                false
+            })
+        };
+
         // Cleaner initialization.
         // constructor (called after RecoveryManager.recover()).
         // D1 / F-3: the env invalidation flag is shared with the cleaner.
@@ -1864,6 +1949,13 @@ impl EnvironmentImpl {
             // R-UNOPENED-RECLAIM (D-ADDITIVE-SAFETY): wire the live-db oracle
             // so the cleaner never reclaims a recovered-but-unopened db's file.
             .with_live_db_oracle(Arc::clone(&live_db_oracle))
+            // ENG-CLEAN-TOMBSTONE-1 (D-ADDITIVE-SAFETY): wire the
+            // name-resurrection oracle so the cleaner never reclaims a
+            // removed name's tombstone file while an older live create could
+            // resurrect it on recovery.
+            .with_name_resurrection_oracle(Arc::clone(
+                &name_resurrection_oracle,
+            ))
             // D1 / F-3: share the env invalidation flag with the cleaner.
             .with_env_invalid(Arc::clone(&is_invalid));
             // CLN-F1: wire the minFileUtilization second-tier threshold so the

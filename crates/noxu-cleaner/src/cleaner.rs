@@ -47,6 +47,20 @@ impl From<String> for FileCleaningError {
 /// `SharedTreeLookup::live_db_oracle`.
 pub type LiveDbOracle = Arc<dyn Fn(i64) -> bool + Send + Sync>;
 
+/// ENG-CLEAN-TOMBSTONE-1 (D-ADDITIVE-SAFETY, 7.11.x only): oracle answering
+/// "would reclaiming the NameLN tombstone for `name` at `tombstone_lsn`
+/// resurrect the removed database?".  Returns `true` iff `name` is currently
+/// REMOVED in the committed catalog AND a live (create) NameLN for it still
+/// survives in an on-disk file OLDER than the tombstone's file -- which
+/// recovery's latest-NameLN-per-name replay would then pick, resurrecting the
+/// removed database (the checkpoint relog never re-materialises a tombstone).
+/// The cleaner RETAINS the tombstone's file while this is `true`, exactly like
+/// the R-UNOPENED live-db retain-guard; once the older create's file is itself
+/// reclaimed the oracle returns `false` and the tombstone's file becomes
+/// reclaimable (bounded by proof, no cap).  Wired from `EnvironmentImpl`.
+pub type NameResurrectionOracle =
+    Arc<dyn Fn(&str, noxu_util::Lsn) -> bool + Send + Sync>;
+
 /// Bundled context for calling `process_pending` from within the
 /// `FileProcessor` periodic hook (CLN-12).
 ///
@@ -396,6 +410,10 @@ pub struct Cleaner {
     /// R-UNOPENED-RECLAIM (D-ADDITIVE-SAFETY): live-db oracle; when wired the
     /// cleaner never reclaims the file of a recovered-but-unopened database.
     live_db_oracle: Option<LiveDbOracle>,
+    /// ENG-CLEAN-TOMBSTONE-1 (D-ADDITIVE-SAFETY): name-resurrection oracle;
+    /// when wired the cleaner retains a NameLN-tombstone file while reclaiming
+    /// it could resurrect the removed database.  See `NameResurrectionOracle`.
+    name_resurrection_oracle: Option<NameResurrectionOracle>,
 }
 
 /// Result of a cleaning operation.
@@ -455,6 +473,7 @@ impl Cleaner {
             utilization_tracker: None,
             env_invalid: Arc::new(AtomicBool::new(false)),
             live_db_oracle: None,
+            name_resurrection_oracle: None,
         }
     }
 
@@ -503,6 +522,7 @@ impl Cleaner {
             utilization_tracker: None,
             env_invalid: Arc::new(AtomicBool::new(false)),
             live_db_oracle: None,
+            name_resurrection_oracle: None,
         }
     }
 
@@ -561,6 +581,7 @@ impl Cleaner {
             utilization_tracker: None,
             env_invalid: Arc::new(AtomicBool::new(false)),
             live_db_oracle: None,
+            name_resurrection_oracle: None,
         }
     }
 
@@ -614,6 +635,7 @@ impl Cleaner {
             utilization_tracker: None,
             env_invalid: Arc::new(AtomicBool::new(false)),
             live_db_oracle: None,
+            name_resurrection_oracle: None,
         }
     }
 
@@ -677,6 +699,17 @@ impl Cleaner {
     /// database.  See `LiveDbOracle` / `SharedTreeLookup::live_db_oracle`.
     pub fn with_live_db_oracle(mut self, oracle: LiveDbOracle) -> Self {
         self.live_db_oracle = Some(oracle);
+        self
+    }
+
+    /// ENG-CLEAN-TOMBSTONE-1 (D-ADDITIVE-SAFETY): wire the name-resurrection
+    /// oracle so the cleaner retains a NameLN-tombstone file while reclaiming
+    /// it could resurrect the removed database.  See `NameResurrectionOracle`.
+    pub fn with_name_resurrection_oracle(
+        mut self,
+        oracle: NameResurrectionOracle,
+    ) -> Self {
+        self.name_resurrection_oracle = Some(oracle);
         self
     }
 
@@ -1481,6 +1514,13 @@ impl Cleaner {
             let p =
                 FileProcessor::new(self.stats.clone(), self.shutdown.clone())
                     .with_obsolete_offsets(obsolete_offsets);
+            // ENG-CLEAN-TOMBSTONE-1 (D-ADDITIVE-SAFETY): wire the
+            // name-resurrection oracle so a NameLN-tombstone file is retained
+            // while reclaiming it could resurrect the removed database.
+            let p = match &self.name_resurrection_oracle {
+                Some(o) => p.with_name_resurrection_oracle(Arc::clone(o)),
+                None => p,
+            };
             if let Some(f) = pending_fn {
                 p.with_process_pending_fn(f)
             } else {
@@ -1605,12 +1645,38 @@ impl Cleaner {
                         ),
                     }
                 }
-                // Catalog and utilization are re-logged at checkpoint before
-                // the deletion barrier. Transaction/checkpoint records in an
-                // eligible old file are superseded by that checkpoint.
-                WireEntryType::NameLN
-                | WireEntryType::NameLNTxn
-                | WireEntryType::FileSummaryLN
+                // Catalog NameLN(Txn): a LIVE NameLN stays `Other` (the
+                // checkpoint relog re-materialises it, so losing a cleaned
+                // copy is harmless).  A TOMBSTONE (`data = None`, a REMOVE or
+                // a rename's old-name delete) classifies as
+                // `NameLnTombstone { name }` so `process_file` can consult
+                // the name-resurrection oracle before reclaiming the file --
+                // the relog NEVER re-materialises a tombstone, so reclaiming
+                // it while an older live create survives resurrects the
+                // removed database (ENG-CLEAN-TOMBSTONE-1, S1).  The on-disk
+                // NameLN is a bare `LnLogEntry` on 7.11.x (key = name bytes,
+                // data = Some(id+trailer) live / None tombstone -- all four
+                // writers use `LnLogEntry::new`, no op-byte wrapper), so
+                // decode it exactly as the writers produce it.
+                WireEntryType::NameLN | WireEntryType::NameLNTxn => {
+                    let ln = LnLogEntry::read_from_log(
+                        &payload,
+                        matches!(entry_type, WireEntryType::NameLNTxn),
+                    )
+                    .map_err(|e| {
+                        format!("cleaner: {entry_type} at {lsn}: {e}")
+                    })?;
+                    if ln.data.is_none() {
+                        LogEntryType::NameLnTombstone {
+                            name: String::from_utf8_lossy(&ln.key).into_owned(),
+                        }
+                    } else {
+                        // Live NameLN: relog re-materialises it; obsolete to
+                        // the cleaner, as before.
+                        LogEntryType::Other
+                    }
+                }
+                WireEntryType::FileSummaryLN
                 | WireEntryType::TxnCommit
                 | WireEntryType::TxnAbort
                 | WireEntryType::CkptStart

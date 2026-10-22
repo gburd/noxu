@@ -1374,6 +1374,26 @@ pub enum LogEntryType {
         node_id: i64,
     },
 
+    /// A NameLN **tombstone** -- a catalog `NameLN`/`NameLNTxn` whose data is
+    /// absent (`data = None`), i.e. a database REMOVE (or a rename's old-name
+    /// delete).  Carries the database `name` so the cleaner can consult the
+    /// name-resurrection oracle before reclaiming this file.
+    ///
+    /// ENG-CLEAN-TOMBSTONE-1 (S1, D-ADDITIVE-SAFETY, 7.11.x only): on 7.11.x
+    /// the catalog is a flat NameLN stream (no mapping tree); recovery takes
+    /// the latest NameLN per name, and the checkpoint relog re-materialises
+    /// only LIVE names -- never tombstones.  So if the cleaner reclaims the
+    /// file holding a removed name's tombstone while an OLDER surviving file
+    /// still holds a live (create) NameLN for that name, the stale create
+    /// wins recovery's latest-wins replay and the removed database is
+    /// RESURRECTED.  A LIVE NameLN stays classified `Other` (the relog
+    /// re-materialises it); only a tombstone needs the clamp, hence this
+    /// dedicated variant.
+    NameLnTombstone {
+        /// Database name the tombstone removes.
+        name: String,
+    },
+
     /// Any other entry type (file header, commit records, …).
     /// The cleaner considers these immediately obsolete and skips them.
     Other,
@@ -1546,6 +1566,21 @@ pub struct FileProcessor {
     /// fileOffset -> isObsolete = true`).  Empty by default (no skip); wired
     /// by `Cleaner::process_single_file` from the live utilization tracker.
     obsolete_offsets: std::collections::HashSet<u32>,
+
+    /// ENG-CLEAN-TOMBSTONE-1 (D-ADDITIVE-SAFETY): oracle answering "would
+    /// reclaiming a NameLN tombstone for `name` in this file let recovery
+    /// resurrect `name`?".  Returns `true` iff `name` is currently REMOVED in
+    /// the committed catalog AND a live (create) NameLN for it still survives
+    /// in an OLDER on-disk file that recovery's latest-wins replay could pick.
+    /// When it returns `true` the file is RETAINED (`retain_file`), exactly
+    /// like the R-UNOPENED live-db retain-guard; once the older create's file
+    /// is itself reclaimed (its live NameLN classifies `Other` -> obsolete, no
+    /// migration, nothing retains it) the oracle returns `false` and the
+    /// tombstone's file becomes reclaimable -- bounded by proof, no cap, no
+    /// file retained forever.  Absent (tests / non-env paths) -> no clamp
+    /// (behaviour unchanged).
+    name_resurrection_oracle:
+        Option<Arc<dyn Fn(&str, Lsn) -> bool + Send + Sync>>,
 }
 
 /// Result of processing a single file.
@@ -1627,7 +1662,20 @@ impl FileProcessor {
             process_pending_interval: PROCESS_PENDING_EVERY_N_LNS,
             process_pending_fn: None,
             obsolete_offsets: std::collections::HashSet::new(),
+            name_resurrection_oracle: None,
         }
+    }
+
+    /// ENG-CLEAN-TOMBSTONE-1 (D-ADDITIVE-SAFETY): wire the name-resurrection
+    /// oracle (see the `name_resurrection_oracle` field) so the cleaner
+    /// retains a NameLN-tombstone file while reclaiming it could resurrect the
+    /// removed database.
+    pub fn with_name_resurrection_oracle(
+        mut self,
+        oracle: Arc<dyn Fn(&str, Lsn) -> bool + Send + Sync>,
+    ) -> Self {
+        self.name_resurrection_oracle = Some(oracle);
+        self
     }
 
     /// Wires the set of already-known-obsolete LN offsets for the file being
@@ -1823,6 +1871,33 @@ impl FileProcessor {
 
                 // ── Other / unknown entries ────────────────────────────────
                 // "Consider all entries we do not process as obsolete."
+                // NameLN tombstone (database remove / rename-away).
+                // ENG-CLEAN-TOMBSTONE-1 (S1, D-ADDITIVE-SAFETY): reclaiming a
+                // removed name's tombstone while an OLDER file still holds a
+                // live (create) NameLN for that name would let recovery's
+                // latest-NameLN-per-name replay pick the stale create and
+                // RESURRECT the removed database (the checkpoint relog never
+                // re-materialises a tombstone).  Ask the name-resurrection
+                // oracle; if reclaiming could resurrect `name`, RETAIN this
+                // file (`retain_file`), exactly like the R-UNOPENED live-db
+                // retain-guard.  JE never has this hazard (its NameLNs live in
+                // the DbTree name database and the cleaner MIGRATES live
+                // mapping-tree LNs); the retain is the 7.11.x stand-in for
+                // JE's "an obsolete LN is reclaimable only once nothing older
+                // can resurrect it", enforced at file granularity.  Once the
+                // older create's file is itself reclaimed the oracle returns
+                // false and this file becomes reclaimable (bounded, no cap).
+                LogEntryType::NameLnTombstone { name } => {
+                    if let Some(oracle) = &self.name_resurrection_oracle
+                        && oracle(name, lsn)
+                    {
+                        result.retain_file = true;
+                    }
+                    // Otherwise the tombstone is safely obsolete (no older
+                    // live create can resurrect `name`): counted obsolete,
+                    // skipped.
+                }
+
                 LogEntryType::Other => {
                     // Counted as obsolete but no migration needed.
                     // We don't have a separate other_obsolete counter so we

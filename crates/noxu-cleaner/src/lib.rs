@@ -39,7 +39,7 @@ pub mod utilization_tracker_observer;
 pub mod verify_utils;
 
 // Re-exports
-pub use cleaner::{CleanResult, Cleaner, LiveDbOracle};
+pub use cleaner::{CleanResult, Cleaner, LiveDbOracle, NameResurrectionOracle};
 pub use cleaner_stat::{CleanerStats, CleanerStatsSnapshot};
 pub use data_eraser::{DataEraser, EraseRequest};
 pub use db_file_summary::DbFileSummary;
