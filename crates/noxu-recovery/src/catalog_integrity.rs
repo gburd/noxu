@@ -65,6 +65,44 @@
 //! every legitimate history (relog of a current binding, auto-commit DDL
 //! mixed with transactional DDL, a truncated/torn tail, an in-doubt XA DDL,
 //! rename chains, rename-back, recreate-same-name, remove+recreate).
+//!
+//! # Write-order vs commit-order (why the rule is still sound)
+//!
+//! Catalog events are ordered here by their **write LSN**, but a
+//! transactional NameLN takes effect only at its txn's **commit**. A
+//! candidate second signal (two committed live bindings for one name with no
+//! tombstone between them, by write LSN) was removed precisely because it
+//! confused the two orders: under concurrent transactions a legitimate rename
+//! can interleave so that, by write LSN, two committed bindings of one name
+//! appear "adjacent" with the intervening tombstone elsewhere — recovery
+//! (latest-NameLN-wins) handles it correctly, but the write-order scan falsely
+//! saw a collision (the REC-SEED-1 concurrent-DDL witness). The **stray-relog**
+//! signal does NOT have this flaw:
+//!
+//! - The relog NameLN is **non-transactional** and is appended at a definite
+//!   LSN; its "winning" is decided by recovery's own latest-NameLN-wins rule,
+//!   which is the SAME write-LSN order the detector reads. So the detector's
+//!   notion of "which record won" is exactly recovery's.
+//! - The signal fires only when the winner is a non-transactional relog-run
+//!   record whose id `F` was `N`'s own binding *below* the latest legitimate
+//!   authority AND the authority disagrees. If a concurrent transactional
+//!   rename/remove/create of `N` is *written* before the relog burst but
+//!   *commits* after it, then at recovery its txn IS in `committed_txns`, so
+//!   it is a legitimate authority and the detector uses it — commit status,
+//!   not write position, decides legitimacy (condition `t ∈ committed`). A
+//!   later-committed binding of `N` to `F` makes condition (3) false (no fire);
+//!   a later-committed rebind/remove to a different id makes the authority the
+//!   winner's equal-or-higher-LSN event, which cannot be below `e_win` — and
+//!   the relog re-logs the *current* `name_map`, so a relog that post-dates a
+//!   commit re-logs that commit's binding (agreement, no fire).
+//! - An **aborted** txn's NameLN inside the window is never in `committed_txns`
+//!   and never `in_relog_run`, so it is neither a legitimate authority nor a
+//!   stray — it is ignored, exactly as recovery's mapping-tree undo drops it.
+//!
+//! These three cases (txnal rename/remove written-before-committed-after a
+//! relog burst; txnal create likewise; an aborted NameLN in the window) are
+//! covered by unit tests in both directions and by the multi-threaded fuzz on
+//! the 7.11.0, 7.11.1, and fixed writers.
 
 use hashbrown::{HashMap, HashSet};
 use noxu_util::Lsn;
@@ -101,15 +139,22 @@ pub struct CatalogEvent {
 }
 
 /// Which XDB-711 signature produced a [`CatalogDamage`].
+///
+/// Only one signature remains after the FP-1/FP-2 rework: the stray catalog
+/// relog. A second candidate signal (two committed transactions binding one
+/// name to two ids — the defect-#2 collision) was removed because it is NOT
+/// exact under concurrent transactional renames (NameLN entries are ordered by
+/// write LSN, not commit order, so a legitimate concurrent rename can present
+/// as two "adjacent" committed bindings with no intervening tombstone and was
+/// falsely refused — see the REC-SEED-1 concurrent-DDL witness). Defect-#2
+/// double-binding damage (e.g. image seed 167229452944) is therefore NOT
+/// detectable from the NameLN catalog without false positives; it is salvage/
+/// backup only (see the advisory).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DamageKind {
-    /// Signal (a): a stray catalog relog-run NameLN won recovery over a
-    /// legitimate operation that had already superseded the binding.
+    /// A stray catalog relog-run NameLN won recovery over a legitimate
+    /// operation that had already superseded the binding.
     StrayRelog,
-    /// Signal (b): two committed transactions bound one name to two different
-    /// ids with no committed tombstone of the name between them (the
-    /// defect-#2 collision — one database's committed records are orphaned).
-    DoubleCommittedBinding,
 }
 
 /// A detected XDB-711 catalog-integrity violation for one database name.
@@ -117,18 +162,15 @@ pub enum DamageKind {
 pub struct CatalogDamage {
     /// The mounted (recovered) database name whose binding is untrustworthy.
     pub name: String,
-    /// Which signature fired.
+    /// Which signature fired (currently always `StrayRelog`).
     pub kind: DamageKind,
-    /// For `StrayRelog`: the id the stray relog-run NameLN bound the name to
-    /// (what recovery would mount). For `DoubleCommittedBinding`: the mounted
-    /// (latest-committed) id.
+    /// The id the stray relog-run NameLN bound the name to (what recovery
+    /// would mount).
     pub mounted_id: u64,
-    /// The id of the superseded / orphaned binding, or `None` if the
-    /// superseding op *removed* the name (only for `StrayRelog`).
+    /// The id of the superseded binding, or `None` if the superseding op
+    /// *removed* the name.
     pub committed_id: Option<u64>,
-    /// LSN of the record that won recovery (the stray relog NameLN for
-    /// `StrayRelog`, or the later committed binding for
-    /// `DoubleCommittedBinding`).
+    /// LSN of the stray relog-run NameLN that won recovery.
     pub stray_lsn: Lsn,
     /// LSN of the superseded authority (the legitimate op for `StrayRelog`,
     /// or the earlier committed binding for `DoubleCommittedBinding`).
@@ -238,9 +280,6 @@ pub fn detect_xdb711_damage(
             None => !ev.in_relog_run,
         }
     };
-    let is_committed_txnal = |ev: &CatalogEvent| -> bool {
-        matches!(ev.txn_id, Some(t) if committed_txns.contains_key(&t))
-    };
 
     for (name, &mounted_id) in mounted.iter() {
         let Some(hist) = events.get(name) else {
@@ -249,33 +288,8 @@ pub fn detect_xdb711_damage(
             continue;
         };
 
-        // Signal (a): the STRAY RELOG supersession signature.
+        // The stray-relog supersession signature (the only exact signal).
         if let Some(d) = stray_relog_damage(name, mounted_id, hist, &is_legit) {
-            damaged.push(d);
-            continue;
-        }
-
-        // Signal (b): the DOUBLE-COMMITTED-LIVE-BINDING signature (defect #2,
-        // xdb-711-fix.md §8).  A name cannot be live-bound by two committed
-        // transactions to two different ids without a committed tombstone
-        // (remove / rename-away) of the name in between — a legitimate
-        // recreate or rename-back always tombstones the name first.  When two
-        // committed-transactional live bindings `N→A` and `N→B` (A≠B) occur
-        // with no committed tombstone of N between them, two committed DDLs
-        // raced and both bound one name: one database's committed records are
-        // under id A, the other's under id B, and recovery mounts only the
-        // latest — the other database's committed records are orphaned under a
-        // live id with no live name.  This is the durable fingerprint of the
-        // XDB-711 defect-#2 race (seed 167229452944: charlie→11 by txn87 and
-        // charlie→7 by txn91, no tombstone between; id 11 holds charlie's
-        // records, id 7 the old delta records).
-        if let Some(d) = double_committed_binding_damage(
-            name,
-            mounted_id,
-            hist,
-            &is_committed_txnal,
-            &is_legit,
-        ) {
             damaged.push(d);
             continue;
         }
@@ -384,78 +398,6 @@ fn stray_relog_damage(
     })
 }
 
-/// Signal (b): the double-committed-live-binding (defect #2) signature for one
-/// name. Returns a [`CatalogDamage`] if two committed-transactional LIVE
-/// bindings `N→A`, `N→B` (A≠B) exist with no committed tombstone of N between
-/// them. `None` otherwise.
-///
-/// Exactness: a legitimate rebind of one name to a new id ALWAYS writes a
-/// committed tombstone first (remove+recreate, or rename-away+rename-in), so
-/// two adjacent committed live bindings with no tombstone between them cannot
-/// arise from any single-writer-correct history — it is the durable trace of
-/// two DDL transactions that both committed a binding for one name (the
-/// defect-#2 race). The reported `authority_lsn`/`stray_lsn` are the earlier
-/// and later of the two colliding committed bindings; `committed_id` is the
-/// earlier id (whose committed records are orphaned).
-fn double_committed_binding_damage(
-    name: &str,
-    mounted_id: u64,
-    hist: &[CatalogEvent],
-    is_committed_txnal: &impl Fn(&CatalogEvent) -> bool,
-    is_legit: &impl Fn(&CatalogEvent) -> bool,
-) -> Option<CatalogDamage> {
-    // Walk events in ascending LSN; track the last OPEN committed-txnal LIVE
-    // binding.  A collision is two committed-txnal LIVE bindings to different
-    // ids with no LEGITIMATE closure between them.  A legitimate closure is
-    // ANY non-relog event that ends or re-binds the name:
-    //   * a tombstone of any kind (committed-txnal remove/rename-away, OR a
-    //     non-transactional auto/legacy remove/rename-away);
-    //   * a non-transactional auto/legacy LIVE rebind (the name was
-    //     legitimately rebound outside a transaction).
-    // A relog-run record is NEITHER a binding nor a closure — it is the stray
-    // writer's artifact and is ignored here (signal (a) handles it).
-    let mut last_live: Option<CatalogEvent> = None;
-    for ev in hist.iter() {
-        // Ignore relog-run records entirely and any in-doubt/aborted txn
-        // record (not legitimate, not committed) — they neither open nor
-        // close a binding for the purpose of this signal.
-        let committed_live = is_committed_txnal(ev) && !ev.is_deleted;
-        if !committed_live && !is_legit(ev) {
-            // in-doubt / aborted txn record, or a relog-run NameLN: skip.
-            continue;
-        }
-        if ev.is_deleted {
-            // A legitimate tombstone (committed or auto) closes the binding.
-            last_live = None;
-            continue;
-        }
-        if !committed_live {
-            // A legitimate NON-transactional (auto/legacy) LIVE rebind: the
-            // name was legitimately rebound outside a transaction, which
-            // closes any prior committed binding (no collision across it).
-            last_live = None;
-            continue;
-        }
-        // A committed-transactional LIVE binding.
-        if let Some(prev) = last_live
-            && prev.id != ev.id
-        {
-            // Two committed-txnal live bindings to different ids with no
-            // legitimate closure between them — the defect-#2 collision.
-            return Some(CatalogDamage {
-                name: name.to_string(),
-                kind: DamageKind::DoubleCommittedBinding,
-                mounted_id,
-                committed_id: Some(prev.id),
-                stray_lsn: ev.lsn,
-                authority_lsn: prev.lsn,
-            });
-        }
-        last_live = Some(*ev);
-    }
-    None
-}
-
 /// Corroborating injectivity check (xdb-711-fix.md §9 option 2), logged as
 /// supporting evidence only — the primary gate is [`detect_xdb711_damage`].
 ///
@@ -505,34 +447,16 @@ pub fn log_integrity_message(damaged: &[CatalogDamage]) -> String {
     evidence.sort_by(|a, b| a.name.cmp(&b.name));
     let evidence_lines = evidence
         .iter()
-        .map(|d| match d.kind {
-            DamageKind::StrayRelog => {
-                let superseded = match d.committed_id {
-                    Some(t) => format!("re-bound it to id {t}"),
-                    None => "removed it".to_string(),
-                };
-                format!(
-                    "a stray catalog record at LSN {} binds database '{}' to \
-                     id {}, but a later legitimate operation at LSN {} {}",
-                    d.stray_lsn,
-                    d.name,
-                    d.mounted_id,
-                    d.authority_lsn,
-                    superseded
-                )
-            }
-            DamageKind::DoubleCommittedBinding => format!(
-                "two committed operations bound database '{}' to two ids with \
-                 no removal between them — id {} (committed at LSN {}) and id \
-                 {} (committed at LSN {}); one database's committed records \
-                 are orphaned under id {}",
-                d.name,
-                d.committed_id.unwrap_or(d.mounted_id),
-                d.authority_lsn,
-                d.mounted_id,
-                d.stray_lsn,
-                d.committed_id.unwrap_or(d.mounted_id),
-            ),
+        .map(|d| {
+            let superseded = match d.committed_id {
+                Some(t) => format!("re-bound it to id {t}"),
+                None => "removed it".to_string(),
+            };
+            format!(
+                "a stray catalog record at LSN {} binds database '{}' to id \
+                 {}, but a later legitimate operation at LSN {} {}",
+                d.stray_lsn, d.name, d.mounted_id, d.authority_lsn, superseded
+            )
         })
         .collect::<Vec<_>>()
         .join("; ");
@@ -540,16 +464,15 @@ pub fn log_integrity_message(damaged: &[CatalogDamage]) -> String {
     format!(
         "database catalog is inconsistent — the recovered name->id binding \
          for database(s) [{name_list}] cannot be trusted: {evidence_lines}. \
-         The damage is from an earlier version's concurrent catalog DDL + \
-         crash (XDB-711): either a non-transactional checkpoint-relog record \
-         won recovery over an operation that had superseded the binding, or \
-         two committed operations bound one name to two ids, so recovery \
-         would mount one database's records under another database's name. \
-         This problem is persistent; recovery will not mount a catalog it \
-         knows is wrong. To recover: restore this environment from a backup, \
-         or preserve this environment directory (copy it as-is; do not delete \
-         or reinitialise it) for offline salvage. This version refuses to \
-         open the environment, so nothing further is written to it."
+         A non-transactional catalog record (written by an earlier version's \
+         checkpoint catalog relog, XDB-711) won recovery over an operation \
+         that had already superseded the binding, so recovery would mount one \
+         database's records under another database's name. This problem is \
+         persistent; recovery will not mount a catalog it knows is wrong. To \
+         recover: restore this environment from a backup, or preserve this \
+         environment directory (copy it as-is; do not delete or reinitialise \
+         it) for offline salvage. This version refuses to open the \
+         environment, so nothing further is written to it."
     )
 }
 
@@ -910,120 +833,55 @@ mod tests {
         assert!(fire(&p, &[10, 20, 30]).is_empty());
     }
 
-    // ── Signal (b): double-committed-live-binding (defect #2) ──
+    // ── Dropped signal (b): defect-#2 double-binding is NOT exactly
+    //    detectable from the NameLN catalog. These histories must OPEN. ──
 
-    /// seed 167229452944 shape: charlie bound by TWO committed txns to two
-    /// ids (charlie→11 txn87, charlie→7 txn91) with NO committed tombstone of
-    /// charlie between them → the defect-#2 collision. Must FIRE.
+    /// seed 167229452944 shape: charlie bound by two committed txns
+    /// (charlie→11 txn87, charlie→7 txn91) then a relog of the CURRENT id 7.
+    /// charlie→7 (txn91) is the latest committed binding, so signal (a)'s
+    /// authority AGREES with the mounted id — the detector must NOT fire. The
+    /// data-level defect-#2 corruption (id 11 orphaned) is undetectable from
+    /// the NameLN catalog; this image OPENS with wrong data (salvage only).
     #[test]
-    fn fires_on_double_committed_live_binding() {
+    fn opens_on_defect2_double_binding_167_shape() {
         let p = one(
             "charlie",
             7,
             vec![
-                ev(0x1c28, 0, true, Some(76)), // committed remove (legit)
+                ev(0x1c28, 0, true, Some(76)),   // committed remove
                 ev(0x1ea5, 11, false, Some(87)), // committed charlie→11
-                ev(0x1f78, 7, false, Some(91)), // committed charlie→7 (no tombstone!)
-                relog(0x5339, 7),               // stray relog of current id 7
-            ],
-        );
-        let d = fire(&p, &[76, 87, 91]);
-        assert_eq!(d.len(), 1, "double committed binding must fire");
-        assert_eq!(d[0].name, "charlie");
-        assert_eq!(d[0].committed_id, Some(11), "orphaned earlier id");
-        assert_eq!(d[0].authority_lsn, lsn(0x1ea5));
-        assert_eq!(d[0].stray_lsn, lsn(0x1f78));
-    }
-
-    /// A committed TXNAL remove tombstone between the two bindings is a
-    /// legitimate recreate → must NOT fire.
-    #[test]
-    fn excludes_double_binding_with_txnal_remove_between() {
-        let p = one(
-            "n",
-            2,
-            vec![
-                ev(0x100, 1, false, Some(10)), // committed create n→1
-                ev(0x200, 0, true, Some(20)),  // committed TXNAL remove
-                ev(0x300, 2, false, Some(30)), // committed recreate n→2
-            ],
-        );
-        assert!(fire(&p, &[10, 20, 30]).is_empty());
-    }
-
-    /// A committed TXNAL rename-AWAY tombstone (n as the old name) between the
-    /// two bindings is a legitimate rebind → must NOT fire.
-    #[test]
-    fn excludes_double_binding_with_rename_away_between() {
-        let p = one(
-            "n",
-            2,
-            vec![
-                ev(0x100, 1, false, Some(10)), // committed create n→1
-                ev(0x200, 0, true, Some(20)), // committed rename n→m (n tombstoned)
-                ev(0x300, 2, false, Some(30)), // committed create n→2 again
-            ],
-        );
-        assert!(fire(&p, &[10, 20, 30]).is_empty());
-    }
-
-    /// A NON-txn AUTO remove tombstone between two committed-txnal bindings
-    /// does NOT count as an intervening committed tombstone for signal (b)
-    /// (an auto tombstone is not a committed-transactional event), so the two
-    /// committed live bindings with an auto tombstone between them are still
-    /// the defect-#2 shape — EXCEPT the auto remove IS a legitimate
-    /// supersession, which signal (b) must not confuse. Here the auto remove
-    /// legitimately closed n→1 before the committed recreate n→2, so (b) must
-    /// NOT fire. (The auto tombstone is a legitimate binding event; signal (a)
-    /// treats it as an authority, and signal (b) must respect it as closing
-    /// the prior live binding.)
-    #[test]
-    fn excludes_double_binding_with_auto_remove_between() {
-        let p = one(
-            "n",
-            2,
-            vec![
-                ev(0x100, 1, false, Some(10)), // committed create n→1
-                ev(0x200, 0, true, None),      // AUTO remove (non-txn)
-                ev(0x300, 2, false, Some(30)), // committed recreate n→2
+                ev(0x1f78, 7, false, Some(91)),  // committed charlie→7 (latest)
+                relog(0x5339, 7),                // relog of current id 7
             ],
         );
         assert!(
-            fire(&p, &[10, 30]).is_empty(),
-            "auto remove between committed bindings must not fire (b)"
+            fire(&p, &[76, 87, 91]).is_empty(),
+            "defect-#2 double binding is not detectable; must open"
         );
     }
 
-    /// Two committed live bindings to the SAME id (a relog or re-log of the
-    /// same committed binding) is not a collision → must NOT fire.
+    /// XDB-DETECT-FP (the concurrent-rename false positive the dropped signal
+    /// (b) produced): a rename carried an older id onto a name after a higher
+    /// id, with the intervening tombstone at a write LSN that is not a simple
+    /// "between" in commit order. Recovery handles it correctly; the detector
+    /// must OPEN it. (Mirrors `rec_seed_1_concurrent_txn_ddl` 'a'→8 then 'a'→1.)
     #[test]
-    fn excludes_double_binding_same_id() {
+    fn opens_on_concurrent_rename_two_committed_bindings() {
+        // 'a'→8 committed, then 'a'→1 committed later (a rename of some db
+        // id 1 onto 'a'); the relog re-logs the current 'a'→1. The latest
+        // legitimate binding is 'a'→1 (agrees with mounted) — no fire.
         let p = one(
-            "n",
-            5,
-            vec![
-                ev(0x100, 5, false, Some(10)),
-                ev(0x200, 5, false, Some(20)), // same id, no collision
-            ],
-        );
-        assert!(fire(&p, &[10, 20]).is_empty());
-    }
-
-    /// One committed live binding + an ABORTED second binding to a different
-    /// id: the aborted one is not committed → not a collision.
-    #[test]
-    fn excludes_double_binding_second_aborted() {
-        let p = one(
-            "n",
+            "a",
             1,
             vec![
-                ev(0x100, 1, false, Some(10)), // committed n→1
-                ev(0x200, 2, false, Some(20)), // n→2 but txn20 ABORTED
+                ev(0x9fd, 8, false, Some(40)), // committed a→8
+                ev(0xabb, 1, false, Some(41)), // committed a→1 (concurrent rename)
+                relog(0x1200, 1),              // relog of current a→1
             ],
         );
         assert!(
-            fire(&p, &[10]).is_empty(),
-            "aborted second binding is not a collision"
+            fire(&p, &[40, 41]).is_empty(),
+            "concurrent-rename double binding must open (dropped signal b FP)"
         );
     }
 
@@ -1072,6 +930,80 @@ mod tests {
         assert_eq!(d.len(), 1, "genuine stray resurrecting an old id fires");
         assert_eq!(d[0].kind, DamageKind::StrayRelog);
         assert_eq!(d[0].committed_id, None);
+    }
+
+    // ── Write-order vs commit-order soundness (coordinator point 1) ──
+
+    /// A txnal rename/remove of N is WRITTEN before a relog burst but COMMITS
+    /// after it. At recovery its txn is committed, so it is a legitimate
+    /// authority; the relog re-logs the CURRENT binding. The relog that wins
+    /// re-logs whatever name_map held at its checkpoint; if N was removed by
+    /// the later-committing txn, the relog (pre-skip on 7.11.0, or a stale
+    /// snapshot) resurrecting the OLD id fires correctly; if the relog
+    /// re-logged the removal-consistent state it would not be live. Here the
+    /// committed remove (txn 20, committed) is the authority and the stray
+    /// relog of the old id fires — legitimacy is decided by COMMIT status
+    /// (`t ∈ committed`), not by the relog's write position.
+    #[test]
+    fn txnal_remove_written_before_relog_committed_after() {
+        let p = one(
+            "n",
+            5,
+            vec![
+                ev(0x100, 5, false, Some(10)), // committed create n→5
+                ev(0x200, 0, true, Some(20)),  // txnal remove WRITTEN here
+                relog(0x300, 5), // relog burst (stale snapshot) n→5
+                                 // ...remove txn 20 COMMITS later
+            ],
+        );
+        // txn 20 committed → remove is the authority; relog resurrected n→5.
+        let d = fire(&p, &[10, 20]);
+        assert_eq!(
+            d.len(),
+            1,
+            "committed remove is authority by commit status"
+        );
+        assert_eq!(d[0].committed_id, None);
+    }
+
+    /// If that same txn ABORTED, its remove NameLN in the window is NOT a
+    /// legitimate authority (not in committed), and the relog of the still-live
+    /// n→5 is correct — must NOT fire.
+    #[test]
+    fn aborted_remove_in_window_does_not_fire() {
+        let p = one(
+            "n",
+            5,
+            vec![
+                ev(0x100, 5, false, Some(10)), // committed create n→5
+                ev(0x200, 0, true, Some(20)),  // remove WRITTEN but txn ABORTS
+                relog(0x300, 5),               // relog of the still-current n→5
+            ],
+        );
+        assert!(
+            fire(&p, &[10]).is_empty(), // txn 20 NOT committed
+            "an aborted remove in the window must not fire"
+        );
+    }
+
+    /// A txnal create of N written before a relog burst, committed after: the
+    /// create is the authority (committed) binding N→F, the relog re-logs the
+    /// same F — agreement, must NOT fire. (A later-committed binding to F
+    /// makes condition (3) false.)
+    #[test]
+    fn txnal_create_written_before_relog_committed_after() {
+        let p = one(
+            "n",
+            5,
+            vec![
+                ev(0x100, 5, false, Some(10)), // committed create n→5 WRITTEN
+                relog(0x200, 5),               // relog of current n→5
+            ],
+        );
+        assert!(
+            fire(&p, &[10]).is_empty(),
+            "a committed create agreeing with the relog must not fire"
+        );
     }
 
     /// A plain committed create, no relog at all.
@@ -1152,24 +1084,6 @@ mod tests {
         }];
         let m = log_integrity_message(&d);
         assert!(m.contains("removed it"), "names the removing op");
-    }
-
-    #[test]
-    fn message_names_double_binding_evidence() {
-        let d = vec![CatalogDamage {
-            name: "charlie".to_string(),
-            kind: DamageKind::DoubleCommittedBinding,
-            mounted_id: 7,
-            committed_id: Some(11),
-            stray_lsn: lsn(0x1f78),
-            authority_lsn: lsn(0x1ea5),
-        }];
-        let m = log_integrity_message(&d);
-        assert!(
-            m.contains("two committed operations bound database 'charlie'")
-        );
-        assert!(m.contains("orphaned under id 11"));
-        assert!(!m.contains("scavenge"));
     }
 
     /// Cost bound (overhead requirement): `detect_xdb711_damage` is O(total
