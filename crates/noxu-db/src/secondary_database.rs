@@ -983,27 +983,44 @@ impl SecondaryDatabase {
         // Walk every (sec_key, pri_key) pair via a primary-table-style
         // scan and delete each.  The inner index is an ordinary
         // Database, so this is just a cursor scan + delete.
-        let mut cursor = self.state.inner.open_cursor(None)?;
-        let mut sec_key = DatabaseEntry::new();
-        let mut data = DatabaseEntry::new();
-        // get_first returns NotFound if the index is empty.
-        if cursor.get(&mut sec_key, &mut data, crate::get::Get::First, None)?
-            != OperationStatus::Success
-        {
-            return Ok(0);
-        }
-        loop {
-            cursor.delete()?;
-            match cursor.get(
+        //
+        // FID-CURSOR-AUTOCOMMIT: a cursor write needs a transactional locker
+        // on a transactional db.  Run the whole scan+delete inside one
+        // auto-commit scope (JE `beginAutoCommit`/`commitAutoCommit`): a
+        // transactional db yields `Some(auto_txn)` so the cursor is opened
+        // with `open_cursor_in` (writes allowed); a non-transactional db
+        // yields `None` and the cursor auto-commits on the ThreadLocker path.
+        self.state.inner.run_in_auto_commit(|t| {
+            let mut cursor = match t {
+                Some(tt) => self.state.inner.open_cursor_in(tt, None)?,
+                None => self.state.inner.open_cursor(None)?,
+            };
+            let mut sec_key = DatabaseEntry::new();
+            let mut data = DatabaseEntry::new();
+            // get_first returns NotFound if the index is empty.
+            if cursor.get(
                 &mut sec_key,
                 &mut data,
-                crate::get::Get::Next,
+                crate::get::Get::First,
                 None,
-            )? {
-                OperationStatus::Success => continue,
-                _ => break,
+            )? != OperationStatus::Success
+            {
+                return Ok(());
             }
-        }
+            loop {
+                cursor.delete()?;
+                match cursor.get(
+                    &mut sec_key,
+                    &mut data,
+                    crate::get::Get::Next,
+                    None,
+                )? {
+                    OperationStatus::Success => continue,
+                    _ => break,
+                }
+            }
+            Ok(())
+        })?;
         Ok(pre)
     }
 

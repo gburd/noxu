@@ -21,7 +21,12 @@ fn open_env_db(
         .with_transactional(true);
     let env = noxu_db::Environment::open(cfg).unwrap();
     let dbcfg =
-        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
+        // FID-CURSOR-AUTOCOMMIT: these tests exercise cursor put/delete via an
+    // auto-commit cursor (`open_cursor(None)`).  In JE that is the
+    // ThreadLocker (non-transactional) write path, so the database is
+    // non-transactional here.  A cursor write with no txn on a
+    // transactional db is prohibited (JE Cursor.updateOperationsProhibited).
+    DatabaseConfig::new().with_allow_create(true);
     let db = env.open_database(None, name, &dbcfg).unwrap();
     (env, db)
 }

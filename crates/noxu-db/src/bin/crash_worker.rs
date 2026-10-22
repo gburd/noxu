@@ -2676,6 +2676,36 @@ fn main() {
             flag(&dir, "firstlsn_done");
         }
 
+        // FID-NONTXN-SYNC-FSYNC witness: a NON-transactional db write has no
+        // per-write fsync (JE `LN.logInternal` logs flushRequired=false,
+        // fsyncRequired=false).  Durability comes from `Environment::sync()`
+        // (JE `Environment.sync()` = a forced checkpoint).  So: records written
+        // before `env.sync()` SURVIVE a crash; records written after `sync`
+        // (unsynced) are LOST -- exactly the deferred-write property, but for a
+        // plain non-transactional db.  The parent SIGKILLs mid-unsynced-batch.
+        "nontxn_sync_survives" => {
+            let nt_cfg = DatabaseConfig::new().with_allow_create(true);
+            let nt = env
+                .open_database(None, "nontxn", &nt_cfg)
+                .expect("open non-txn db");
+            for i in 0u32..50 {
+                let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
+                let val = DatabaseEntry::from_bytes(b"synced");
+                nt.put(&key, &val).expect("put synced non-txn");
+            }
+            env.sync().expect("env.sync() phase 1");
+            flag(&dir, "nontxn_phase1_synced");
+            for i in 1000u32..1050 {
+                let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
+                let val = DatabaseEntry::from_bytes(b"unsynced");
+                nt.put(&key, &val).expect("put unsynced non-txn");
+            }
+            flag(&dir, "nontxn_unsynced_started");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
         other => panic!("Unknown NOXU_CRASH_MODE: {other}"),
     }
 }

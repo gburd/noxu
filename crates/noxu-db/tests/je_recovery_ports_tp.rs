@@ -308,7 +308,8 @@ fn reverse_split_dups_recovers() {
         // Delete the first two dups via a cursor at First (JE empties the
         // leftmost BIN by deleting getFirst twice).
         {
-            let mut c = db.open_cursor(None).unwrap();
+            let txn = env.begin_transaction(None).unwrap();
+            let mut c = db.open_cursor_in(&txn, None).unwrap();
             let mut k = DatabaseEntry::new();
             let mut d = DatabaseEntry::new();
             for _ in 0..2 {
@@ -321,6 +322,7 @@ fn reverse_split_dups_recovers() {
                 expected.retain(|x| x != &removed);
             }
             c.close().unwrap();
+            txn.commit().unwrap();
         }
 
         // Checkpoint (recovery relies on INs, not replayed deleted LNs).
@@ -401,7 +403,8 @@ fn complete_removal_dups_recovers() {
         // Delete every dup by repeatedly deleting the first (stays within one
         // dup chain; avoids the NEW-3 cross-BIN Get::Next delete path).
         {
-            let mut c = db.open_cursor(None).unwrap();
+            let txn = env.begin_transaction(None).unwrap();
+            let mut c = db.open_cursor_in(&txn, None).unwrap();
             let mut k = DatabaseEntry::new();
             let mut d = DatabaseEntry::new();
             let mut count = 0u32;
@@ -413,6 +416,7 @@ fn complete_removal_dups_recovers() {
             }
             assert_eq!(count, max, "should delete all {max} dups");
             c.close().unwrap();
+            txn.commit().unwrap();
         }
 
         // Checkpoint (don't just replay deleted LNs), then compress.
@@ -511,7 +515,9 @@ fn complete_removal_dups_get_next_still_12() {
     }
 
     // Delete every dup by advancing with Get::Next (NEW-3 cross-BIN path).
-    let mut c = db.open_cursor(None).unwrap();
+    // FID-CURSOR-AUTOCOMMIT: cursor delete on a transactional db needs a txn.
+    let txn = env.begin_transaction(None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     let mut count = 0u32;
@@ -523,6 +529,7 @@ fn complete_removal_dups_get_next_still_12() {
     }
     assert_eq!(count, max, "Get::Next+delete must remove all {max} dups");
     c.close().unwrap();
+    txn.commit().unwrap();
 
     // Point-get sweep: every dup absent.
     for i in 0u32..max {
@@ -564,7 +571,9 @@ fn single_bin_dups_get_first_removes_all() {
             .unwrap();
     }
 
-    let mut c = db.open_cursor(None).unwrap();
+    // FID-CURSOR-AUTOCOMMIT: cursor delete on a transactional db needs a txn.
+    let txn = env.begin_transaction(None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     let mut count = 0u32;
@@ -579,6 +588,7 @@ fn single_bin_dups_get_first_removes_all() {
         "single-BIN Get::First+delete must remove all {max} dups"
     );
     c.close().unwrap();
+    txn.commit().unwrap();
 
     for i in 0u32..max {
         let d = ikey(i).into_bytes();

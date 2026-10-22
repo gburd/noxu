@@ -1219,7 +1219,9 @@ fn cursor_put_overwrite_replaces_value() {
     db.put(DatabaseEntry::from_bytes(b"k"), DatabaseEntry::from_bytes(b"v1"))
         .unwrap();
 
-    let mut cursor = db.open_cursor(None).unwrap();
+    // FID-CURSOR-AUTOCOMMIT: cursor write on a transactional db needs a txn.
+    let txn = _env.begin_transaction(None).unwrap();
+    let mut cursor = db.open_cursor_in(&txn, None).unwrap();
     let mut k = DatabaseEntry::from_bytes(b"k");
     let mut v = DatabaseEntry::new();
     cursor.get(&mut k, &mut v, Get::Search, None).unwrap();
@@ -1227,6 +1229,7 @@ fn cursor_put_overwrite_replaces_value() {
     let new_v = DatabaseEntry::from_bytes(b"v2");
     cursor.put(&k, &new_v, Put::Overwrite).unwrap();
     cursor.close().unwrap();
+    txn.commit().unwrap();
 
     let mut out = DatabaseEntry::new();
     db.get_into(None, DatabaseEntry::from_bytes(b"k"), &mut out).unwrap();

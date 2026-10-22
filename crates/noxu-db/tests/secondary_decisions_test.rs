@@ -1586,40 +1586,100 @@ fn wave1b_cursor_delete_uncommitted_cascade_invisible_to_others() {
     assert_eq!(data.data_opt().unwrap(), b"Apple");
 }
 
-/// Happy-path regression: the existing pattern of `open_cursor(None,
-/// None)` followed by `cursor.delete()` still cascades and still
-/// auto-commits both sides, matching the v1.4 behaviour.  This pins
-/// the auto-commit branch so a future refactor of the txn plumbing
-/// does not regress it.
+/// FID-CURSOR-AUTOCOMMIT completeness (F1): the pre-fix Noxu behaviour pinned
+/// here (a no-txn `open_cursor(None)` + `cursor.delete()` on a *transactional*
+/// secondary auto-committed its cascade) is a deviation JE refuses — a
+/// `SecondaryCursor` opened with `txn == null` on a transactional db has a
+/// non-transactional locker, so JE throws before cascading the delete to the
+/// primary (`Cursor.init` `updateOperationsProhibited`, `Cursor.java:333-338`;
+/// `SecondaryCursor.delete` → `checkUpdatesAllowed`, `Cursor.java:5340-5367`).
+///
+/// This test now pins the JE-faithful contract on both legs:
+///   * a no-txn `SecondaryCursor::delete` on a transactional secondary is
+///     REFUSED with the JE-exact message, and neither side is modified; and
+///   * under an explicit transaction the cascade still removes BOTH the primary
+///     record and the secondary index entry on commit — i.e. the cascade
+///     correctness this test originally protected is preserved, just under a
+///     txn as JE requires.
 #[test]
 fn wave1b_cursor_delete_auto_commit_cascade_unchanged() {
     let dir = TempDir::new().unwrap();
     let (env, primary, sec) =
         open_pri_sec_for_txn(&dir, "primary", "secondary");
-    drop(env); // env not needed for the auto-commit path
 
-    // Seed (auto-commit). primary.put() auto-maintains secondary.
+    // Seed one record (under a txn, since the secondary is transactional).
     {
-        let pk = DatabaseEntry::from_bytes(b"pk1");
-        let v = DatabaseEntry::from_bytes(b"Apple");
-        primary.lock().put(&pk, &v).unwrap();
-        // No explicit update_secondary needed (auto-hook handles it).
+        let seed = env.begin_transaction(None).unwrap();
+        put_under_txn(&primary, &sec, &seed, b"pk1", b"Apple");
+        seed.commit().unwrap();
     }
 
-    // Auto-commit cursor delete.
-    let mut cursor = sec.open_cursor(None).unwrap();
+    // Leg 1: a no-txn cursor delete on a TRANSACTIONAL secondary is refused
+    // (JE `updateOperationsProhibited`), and both sides survive.
+    {
+        let mut cursor = sec.open_cursor(None).unwrap();
+        let mut p_key = DatabaseEntry::new();
+        let mut data = DatabaseEntry::new();
+        let st = cursor
+            .get_search_key(
+                &DatabaseEntry::from_bytes(b"A"),
+                &mut p_key,
+                &mut data,
+            )
+            .unwrap();
+        assert_eq!(st, OperationStatus::Success);
+        match cursor.delete() {
+            Err(NoxuError::OperationNotAllowed(m)) => assert!(
+                m.contains("a Transaction was not supplied to openCursor"),
+                "unexpected refusal message: {m}"
+            ),
+            other => panic!(
+                "no-txn SecondaryCursor::delete on a transactional secondary                  must be refused, got {other:?}"
+            ),
+        }
+        cursor.close().unwrap();
+    }
+    // The refusal left both sides intact.
+    let pk1 = DatabaseEntry::from_bytes(b"pk1");
+    let mut data = DatabaseEntry::new();
+    assert!(
+        primary.lock().get_into(None, &pk1, &mut data).unwrap(),
+        "refused delete must leave the primary record in place"
+    );
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
-    let st = cursor
-        .get_search_key(&DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
-        .unwrap();
-    assert_eq!(st, OperationStatus::Success);
-    let del_st = cursor.delete().unwrap();
-    assert_eq!(del_st, OperationStatus::Success);
-    cursor.close().unwrap();
+    assert!(
+        sec.get_into(
+            None,
+            DatabaseEntry::from_bytes(b"A"),
+            &mut p_key,
+            &mut data
+        )
+        .unwrap(),
+        "refused delete must leave the secondary entry in place"
+    );
 
-    // Both sides auto-committed gone (no txn to abort).
-    let pk1 = DatabaseEntry::from_bytes(b"pk1");
+    // Leg 2: the cascade correctness this test protected is preserved under an
+    // explicit transaction — the delete still removes BOTH sides on commit.
+    let txn = env.begin_transaction(None).unwrap();
+    {
+        let mut cursor = sec.open_cursor_in(&txn, None).unwrap();
+        let mut p_key = DatabaseEntry::new();
+        let mut data = DatabaseEntry::new();
+        let st = cursor
+            .get_search_key(
+                &DatabaseEntry::from_bytes(b"A"),
+                &mut p_key,
+                &mut data,
+            )
+            .unwrap();
+        assert_eq!(st, OperationStatus::Success);
+        assert_eq!(cursor.delete().unwrap(), OperationStatus::Success);
+        cursor.close().unwrap();
+    }
+    txn.commit().unwrap();
+
+    // Both sides are now gone (cascade committed with the txn).
     let mut data = DatabaseEntry::new();
     assert!(!(primary.lock().get_into(None, &pk1, &mut data).unwrap()));
     let mut p_key = DatabaseEntry::new();

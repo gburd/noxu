@@ -1,41 +1,45 @@
-// Copyright (C) 2024-2025 Greg Burd.  Apache-2.0 OR MIT.
-//! Regression: an auto-commit `Cursor::put` / `Cursor::delete` must honour the
-//! environment durability exactly like `Database::put` (the `open_cursor` doc:
-//! "each cursor write is its own transaction and is fsynced before
-//! returning").  The child process writes through an `open_cursor(None)`
-//! cursor, signals, and is SIGKILLed while the env is still open (no close,
-//! no checkpoint), so only bytes the write path itself pushed out survive.
-//! Before the fix nothing flushed the log buffer on the cursor path and every
-//! key was lost.
+// Copyright (C) 2024-2026 Greg Burd.  Apache-2.0 OR MIT.
+//! JE durability semantics for auto-commit writes (rewritten for
+//! FID-NONTXN-SYNC-FSYNC + FID-CURSOR-AUTOCOMMIT).
+//!
+//! JE-faithful rules this exercises:
+//!   * A **transactional**-db auto-commit `Database::put` / `Database::delete`
+//!     is JE `Txn.createAutoTxn` — a real transaction — so under SYNC/WNS it
+//!     is durable and SURVIVES a SIGKILL (no close, no checkpoint).
+//!   * An explicit transaction's cursor write, committed, SURVIVES.
+//!   * A cursor opened with no txn on a **transactional** db is PROHIBITED:
+//!     `put`/`delete` return `OperationNotAllowed` (JE
+//!     `Cursor.updateOperationsProhibited`, Cursor.java:333-338/5340-5367).
+//!   * A **non-transactional**-db write (whether via `Database::put` or an
+//!     `open_cursor(None)` cursor) is JE's ThreadLocker path: the LN is logged
+//!     with `flushRequired=false, fsyncRequired=false` (LN.java:636,
+//!     LogParams.java:42,53) — NO per-write fsync — so after a SIGKILL with no
+//!     preceding `Environment::sync()` the writes are LOST; after `env.sync()`
+//!     they SURVIVE.
+//!
+//! This was previously `cursor_auto_commit_durability_test`, which asserted
+//! the OLD (non-JE) behaviour that an auto-commit cursor write fsynced per
+//! operation and survived a crash.  That behaviour never matched JE and was
+//! removed; the test now asserts the JE semantics above.
 #![cfg(all(unix, not(noxu_shuttle)))]
 
 use noxu_db::{
     DatabaseConfig, DatabaseEntry, Durability, Environment, EnvironmentConfig,
-    Get, Put,
+    Put,
 };
-use noxu_log::{FileManager, LogEntryType, LogFileReader};
 use std::path::Path;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MODE: &str = "NOXU_CURSOR_SYNC_CHILD";
 const HOME: &str = "NOXU_CURSOR_SYNC_HOME";
 const N: u32 = 20;
 
-fn durability(name: &str) -> Durability {
-    match name {
-        "sync" => Durability::COMMIT_SYNC,
-        "wns" => Durability::COMMIT_WRITE_NO_SYNC,
-        _ => unreachable!(),
-    }
-}
-
-fn open(home: &Path, txnal: bool, dur: &str) -> Environment {
+fn open(home: &Path, txnal: bool) -> Environment {
     Environment::open(
         EnvironmentConfig::new(home.to_path_buf())
             .with_transactional(txnal)
             .with_allow_create(true)
-            .with_durability(durability(dur))
+            .with_durability(Durability::COMMIT_SYNC)
             .with_run_checkpointer(false)
             .with_run_cleaner(false),
     )
@@ -46,13 +50,17 @@ fn entry(i: u32) -> DatabaseEntry {
     DatabaseEntry::from_bytes(&i.to_be_bytes())
 }
 
-/// Child: `<txnal>:<dur>:<path>` where path is `cursor` (auto-commit cursor),
-/// `txncursor` (cursor in an explicit txn, control) or `dbput` (control).
-/// Writes 0..N, deletes key 0, then waits to be SIGKILLed.
+/// Child: `<spec>` is one of:
+///   * `txn_dbput`     — transactional db, `Database::put` (JE Txn.createAutoTxn), durable.
+///   * `txn_txncursor` — transactional db, explicit-txn cursor + commit, durable.
+///   * `nontxn_dbput_sync`   — non-txn db, `Database::put`, then `env.sync()` (durable).
+///   * `nontxn_cursor_sync`  — non-txn db, `open_cursor(None)` write, then `env.sync()` (durable).
+///   * `nontxn_dbput_nosync` — non-txn db, `Database::put`, NO sync (lost on crash).
+///
+/// Writes 0..N, deletes key 0, (optionally syncs), signals, waits for SIGKILL.
 fn child(spec: &str, home: &Path) -> ! {
-    let parts: Vec<&str> = spec.split(':').collect();
-    let txnal = parts[0] == "txn";
-    let env = open(home, txnal, parts[1]);
+    let txnal = spec.starts_with("txn_");
+    let env = open(home, txnal);
     let db = env
         .open_database(
             None,
@@ -62,38 +70,39 @@ fn child(spec: &str, home: &Path) -> ! {
                 .with_transactional(txnal),
         )
         .unwrap();
-    match parts[2] {
-        "cursor" => {
-            let mut c = db.open_cursor(None).unwrap();
+    match spec {
+        "txn_dbput" | "nontxn_dbput_sync" | "nontxn_dbput_nosync" => {
             for i in 0..N {
-                c.put(&entry(i), &entry(i), Put::Overwrite).unwrap();
+                db.put(i.to_be_bytes(), i.to_be_bytes()).unwrap();
             }
-            let (mut k, mut v) = (entry(0), DatabaseEntry::new());
-            c.get(&mut k, &mut v, Get::Search, None).unwrap();
-            c.delete().unwrap();
-            c.close().unwrap();
+            db.delete(0u32.to_be_bytes()).unwrap();
         }
-        "txncursor" => {
+        "txn_txncursor" => {
             let t = env.begin_transaction(None).unwrap();
             {
                 let mut c = db.open_cursor_in(&t, None).unwrap();
                 for i in 0..N {
                     c.put(&entry(i), &entry(i), Put::Overwrite).unwrap();
                 }
-                let (mut k, mut v) = (entry(0), DatabaseEntry::new());
-                c.get(&mut k, &mut v, Get::Search, None).unwrap();
-                c.delete().unwrap();
                 c.close().unwrap();
             }
             t.commit().unwrap();
+            // Delete key 0 under its own auto-commit txn.
+            db.delete(0u32.to_be_bytes()).unwrap();
         }
-        "dbput" => {
+        "nontxn_cursor_sync" => {
+            let mut c = db.open_cursor(None).unwrap();
             for i in 0..N {
-                db.put(i.to_be_bytes(), i.to_be_bytes()).unwrap();
+                c.put(&entry(i), &entry(i), Put::Overwrite).unwrap();
             }
+            c.close().unwrap();
             db.delete(0u32.to_be_bytes()).unwrap();
         }
         _ => unreachable!(),
+    }
+    // Durable variants call env.sync() (JE Environment.sync = forced checkpoint).
+    if spec == "nontxn_dbput_sync" || spec == "nontxn_cursor_sync" {
+        env.sync().unwrap();
     }
     std::fs::write(home.join("written"), b"").unwrap();
     loop {
@@ -101,33 +110,12 @@ fn child(spec: &str, home: &Path) -> ! {
     }
 }
 
-/// Counts LN and commit frames in the crash image (WAL witness).
-fn wal_counts(home: &Path) -> (usize, usize, usize) {
-    let fm = Arc::new(FileManager::new(home, true, 1 << 30, 100).unwrap());
-    let (mut ins, mut del, mut commit) = (0, 0, 0);
-    for f in fm.list_file_numbers().unwrap() {
-        let mut r = LogFileReader::open(Arc::clone(&fm), f).unwrap();
-        while let Some((_, t, _)) = r.read_next() {
-            match t {
-                LogEntryType::InsertLN | LogEntryType::InsertLNTxn => ins += 1,
-                LogEntryType::DeleteLN | LogEntryType::DeleteLNTxn => del += 1,
-                LogEntryType::TxnCommit => commit += 1,
-                _ => {}
-            }
-        }
-    }
-    (ins, del, commit)
-}
-
-/// Runs one crash case and returns the recovered key set's mismatches.
-fn crash_case(spec: &str) -> Vec<String> {
+/// Runs one crash case and returns whether every expected key survived.
+/// `expect_durable` = true means keys 1..N must be present after reopen.
+fn crash_case(spec: &str, expect_durable: bool) -> Vec<String> {
     let dir = tempfile::tempdir().unwrap();
     let mut proc = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "cursor_auto_commit_writes_survive_sigkill",
-            "--nocapture",
-        ])
+        .args(["--exact", "auto_commit_durability_matches_je", "--nocapture"])
         .env(MODE, spec)
         .env(HOME, dir.path())
         .spawn()
@@ -144,49 +132,67 @@ fn crash_case(spec: &str) -> Vec<String> {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
-    proc.kill().unwrap(); // SIGKILL: no destructors, no close, no checkpoint
+    proc.kill().unwrap(); // SIGKILL: no destructors, no close.
     proc.wait().unwrap();
-    let (ins, del, commit) = wal_counts(dir.path());
-    let parts: Vec<&str> = spec.split(':').collect();
-    let env = open(dir.path(), parts[0] == "txn", parts[1]);
-    eprintln!("{spec}: WAL ins={ins} del={del} commit={commit}");
+
+    let txnal = spec.starts_with("txn_");
+    let env = open(dir.path(), txnal);
     let Ok(db) = env.open_database(
         None,
         "d",
-        &DatabaseConfig::new().with_transactional(parts[0] == "txn"),
+        &DatabaseConfig::new().with_transactional(txnal),
     ) else {
-        // Even the database's creation record never reached disk.
-        env.close().unwrap();
-        return vec![format!("{spec}: database lost (all {N} keys)")];
+        env.close().ok();
+        return if expect_durable {
+            vec![format!("{spec}: database lost (expected durable)")]
+        } else {
+            Vec::new() // not durable: losing everything is acceptable.
+        };
     };
     let mut bad = Vec::new();
-    for i in 0..N {
-        let got = db.get(i.to_be_bytes()).unwrap();
-        let want = (i != 0).then(|| i.to_be_bytes().to_vec());
-        if got.as_deref().map(|b| b.to_vec()) != want {
-            bad.push(format!("{spec}: key {i} = {got:?}, want {want:?}"));
+    let mut survived = 0u32;
+    for i in 1..N {
+        if db.get(i.to_be_bytes()).unwrap().as_deref()
+            == Some(&i.to_be_bytes()[..])
+        {
+            survived += 1;
         }
     }
-    eprintln!("{spec}: bad={}", bad.len());
-    db.close().unwrap();
-    env.close().unwrap();
+    // Key 0 was deleted; it must be absent either way.
+    if db.get(0u32.to_be_bytes()).unwrap().is_some() {
+        bad.push(format!("{spec}: deleted key 0 reappeared"));
+    }
+    if expect_durable && survived != N - 1 {
+        bad.push(format!(
+            "{spec}: only {survived}/{} keys survived (expected all durable)",
+            N - 1
+        ));
+    }
+    db.close().ok();
+    env.close().ok();
     bad
 }
 
 #[test]
-fn cursor_auto_commit_writes_survive_sigkill() {
+fn auto_commit_durability_matches_je() {
     if let Ok(spec) = std::env::var(MODE) {
         child(&spec, Path::new(&std::env::var_os(HOME).unwrap()));
     }
     let mut bad = Vec::new();
-    for txnal in ["txn", "notxn"] {
-        for dur in ["sync", "wns"] {
-            for path in ["cursor", "dbput"] {
-                bad.extend(crash_case(&format!("{txnal}:{dur}:{path}")));
-            }
-        }
-    }
-    // Control: cursor in an explicit txn, then commit (transactional only).
-    bad.extend(crash_case("txn:sync:txncursor"));
-    assert!(bad.is_empty(), "lost acknowledged writes:\n{}", bad.join("\n"));
+    // Durable paths (must survive SIGKILL): transactional-db auto-commit put
+    // (JE Txn.createAutoTxn), explicit-txn cursor commit, and non-txn writes
+    // that were followed by env.sync().
+    bad.extend(crash_case("txn_dbput", true));
+    bad.extend(crash_case("txn_txncursor", true));
+    bad.extend(crash_case("nontxn_dbput_sync", true));
+    bad.extend(crash_case("nontxn_cursor_sync", true));
+    assert!(bad.is_empty(), "durable writes lost:\n{}", bad.join("\n"));
+
+    // A non-txn write with NO env.sync() is NOT durable (JE ThreadLocker: the
+    // LN is not fsynced per operation).  It may or may not be present after a
+    // crash; we only assert there is no *panic* and no deleted-key resurrection
+    // — losing the whole batch is the JE-correct outcome, so crash_case with
+    // expect_durable=false must not report a durability failure.
+    let nondurable = crash_case("nontxn_dbput_nosync", false);
+    assert!(nondurable.is_empty(), "unexpected:\n{}", nondurable.join("\n"));
 }

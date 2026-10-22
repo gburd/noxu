@@ -596,9 +596,12 @@ fn db_cursor_duplicate_test_get_next_no_dup() {
 /// `Put::NoDupData` returns `KeyExists`.
 #[test]
 fn db_cursor_duplicate_test_put_no_dup_data2() {
-    let (_dir, _env, db) = open_dup_env_db();
+    let (_dir, env, db) = open_dup_env_db();
 
-    let mut cursor = db.open_cursor(None).unwrap();
+    // FID-CURSOR-AUTOCOMMIT: cursor write on a transactional dup db
+    // needs a txn (JE beginAutoCommit).
+    let txn = env.begin_transaction(None).unwrap();
+    let mut cursor = db.open_cursor_in(&txn, None).unwrap();
     let key = DatabaseEntry::from_bytes(b"oneKey");
     for d in 0..DUP_N_PER_KEY {
         let data = DatabaseEntry::from_bytes(&[d]);
@@ -616,6 +619,7 @@ fn db_cursor_duplicate_test_put_no_dup_data2() {
         );
     }
     cursor.close().unwrap();
+    txn.commit().unwrap();
 }
 
 // --- testDuplicateReplacement ----------------------------------------------
@@ -627,7 +631,7 @@ fn db_cursor_duplicate_test_put_no_dup_data2() {
 /// `Cursor::put(.., Put::Current)`.
 #[test]
 fn db_cursor_duplicate_test_duplicate_replacement() {
-    let (_dir, _env, db) = open_dup_env_db();
+    let (_dir, env, db) = open_dup_env_db();
 
     // Single-primary scenario, matching JE's testDuplicateReplacement.
     let key = DatabaseEntry::from_bytes(b"aaaa");
@@ -635,7 +639,10 @@ fn db_cursor_duplicate_test_duplicate_replacement() {
     let v2 = DatabaseEntry::from_bytes(b"d2d2");
 
     {
-        let mut cursor = db.open_cursor(None).unwrap();
+        // FID-CURSOR-AUTOCOMMIT: cursor write on a transactional dup db
+        // needs a txn (JE beginAutoCommit).
+        let txn = env.begin_transaction(None).unwrap();
+        let mut cursor = db.open_cursor_in(&txn, None).unwrap();
         // First dup; NoDupData succeeds because the pair is fresh.
         let s = cursor.put(&key, &v1, Put::NoDupData).unwrap();
         assert_eq!(OperationStatus::Success, s);
@@ -646,10 +653,14 @@ fn db_cursor_duplicate_test_duplicate_replacement() {
         let s = cursor.put(&key, &v2, Put::NoDupData).unwrap();
         assert_eq!(OperationStatus::Success, s);
         cursor.close().unwrap();
+        txn.commit().unwrap();
     }
 
     // Walk the cursor and re-write each dup with its existing value.
-    let mut cursor = db.open_cursor(None).unwrap();
+    // FID-CURSOR-AUTOCOMMIT: putCurrent is a cursor WRITE on a transactional
+    // db, so it runs under an explicit auto-commit txn.
+    let txn = env.begin_transaction(None).unwrap();
+    let mut cursor = db.open_cursor_in(&txn, None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     let mut n = 0usize;
@@ -665,6 +676,7 @@ fn db_cursor_duplicate_test_duplicate_replacement() {
     }
     assert_eq!(2, n, "both dups must remain after putCurrent rewrites");
     cursor.close().unwrap();
+    txn.commit().unwrap();
 }
 
 // --- testDuplicateDuplicates -----------------------------------------------
@@ -677,13 +689,16 @@ fn db_cursor_duplicate_test_duplicate_replacement() {
 /// a no-op).  Final dup count is 2.
 #[test]
 fn db_cursor_duplicate_test_duplicate_duplicates() {
-    let (_dir, _env, db) = open_dup_env_db();
+    let (_dir, env, db) = open_dup_env_db();
 
     let key = DatabaseEntry::from_bytes(b"aaaa");
     let v1 = DatabaseEntry::from_bytes(b"d1d1");
     let v2 = DatabaseEntry::from_bytes(b"d2d2");
 
-    let mut cursor = db.open_cursor(None).unwrap();
+    // FID-CURSOR-AUTOCOMMIT: cursor write on a transactional dup db
+    // needs a txn (JE beginAutoCommit).
+    let txn = env.begin_transaction(None).unwrap();
+    let mut cursor = db.open_cursor_in(&txn, None).unwrap();
 
     // First dup pair fresh.
     assert_eq!(
@@ -717,8 +732,12 @@ fn db_cursor_duplicate_test_duplicate_duplicates() {
         cursor.put(&key, &v2, Put::Overwrite).unwrap()
     );
 
-    // Verify exactly two dup pairs survived (cursor walk).
+    // Commit the write txn so the verify walk (a read-only auto-commit cursor)
+    // does not block on the writer's still-held locks.
     cursor.close().unwrap();
+    txn.commit().unwrap();
+
+    // Verify exactly two dup pairs survived (read-only cursor walk).
     let mut cursor = db.open_cursor(None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();

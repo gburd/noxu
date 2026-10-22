@@ -8,7 +8,7 @@
 use std::marker::PhantomData;
 
 use noxu_bind::EntryBinding;
-use noxu_db::{Database, OperationStatus, Transaction};
+use noxu_db::{Database, Transaction};
 
 use crate::error::{CollectionError, Result};
 use crate::internal::encode_key;
@@ -141,15 +141,20 @@ where
         if self.read_only {
             return Err(CollectionError::ReadOnly);
         }
-        let mut cursor = crate::internal::open_cursor(self.db, txn, None)?;
-        let mut key = noxu_db::DatabaseEntry::new();
-        let mut data = noxu_db::DatabaseEntry::new();
-        while let OperationStatus::Success =
-            cursor.get(&mut key, &mut data, noxu_db::Get::First, None)?
-        {
-            cursor.delete()?;
+        // JE `StoredContainer.clear` runs the whole multi-record delete under
+        // one auto-commit scope (`beginAutoCommit`/`commitAutoCommit`,
+        // StoredContainer.java:293).  FID-CURSOR-AUTOCOMMIT: a cursor write
+        // needs a transactional locker on a transactional db, so route the
+        // scan+delete through the auto-commit scope — a transactional db
+        // yields a real auto txn (`open_cursor_in`, writes allowed); a
+        // non-transactional db yields `None` (the ThreadLocker path).  Same
+        // shape as `StoredMap::clear`.
+        match txn {
+            Some(_) => crate::internal::clear_all(self.db, txn)?,
+            None => self.db.run_in_auto_commit(|t| {
+                crate::internal::clear_all(self.db, t)
+            })?,
         }
-        cursor.close()?;
         Ok(())
     }
 }

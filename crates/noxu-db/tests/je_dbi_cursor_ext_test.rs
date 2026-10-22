@@ -662,8 +662,10 @@ fn db_cursor_search_test_simple_search_both_with_partial_dbt() {
 // ===========================================================================
 #[test]
 fn db_cursor_dup_test_dup_initialized_uninitialized_get_current_fails() {
-    let (_dir, _env, db) = open_nondup(false);
-    let mut c = db.open_cursor(None).unwrap();
+    let (_dir, env, db) = open_nondup(false);
+    // FID-CURSOR-AUTOCOMMIT: cursor write on a transactional db needs a txn.
+    let txn = env.begin_transaction(None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     // Uninitialized getCurrent -> error (JE IllegalStateException).
@@ -687,6 +689,8 @@ fn db_cursor_dup_test_dup_initialized_uninitialized_get_current_fails() {
     assert_eq!(OperationStatus::Success, s);
     let s = c.get(&mut k, &mut d, Get::Next, None).unwrap();
     assert_eq!(OperationStatus::NotFound, s);
+    c.close().unwrap();
+    txn.commit().unwrap();
 }
 
 // ===========================================================================
@@ -786,8 +790,10 @@ fn db_cursor_duplicate_test_duplicate_creation_forward_key_last() {
 // ===========================================================================
 #[test]
 fn db_cursor_duplicate_test_put_no_dup_data() {
-    let (_dir, _env, db) = open_dup();
-    let mut cursor = db.open_cursor(None).unwrap();
+    let (_dir, env, db) = open_dup();
+    // FID-CURSOR-AUTOCOMMIT: cursor write on a transactional dup db needs a txn.
+    let txn = env.begin_transaction(None).unwrap();
+    let mut cursor = db.open_cursor_in(&txn, None).unwrap();
     // Insert a handful of dup pairs.
     let pairs: &[(&[u8], &[u8])] =
         &[(b"k1", b"a"), (b"k1", b"b"), (b"k2", b"a"), (b"k2", b"c")];
@@ -816,6 +822,8 @@ fn db_cursor_duplicate_test_put_no_dup_data() {
             "re-inserting existing dup pair must return KEYEXIST"
         );
     }
+    cursor.close().unwrap();
+    txn.commit().unwrap();
 }
 
 // ===========================================================================

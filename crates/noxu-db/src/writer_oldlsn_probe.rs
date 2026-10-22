@@ -90,16 +90,26 @@ fn run(mode: &'static str) {
             }
             "auto" => wdb.put(KEY, &wd1).unwrap(),
             "cursor" => {
-                let mut c = wdb.open_cursor(None).unwrap();
-                let st = c
-                    .put(
-                        &DatabaseEntry::from_bytes(KEY),
-                        &DatabaseEntry::from_bytes(&wd1),
-                        Put::Overwrite,
-                    )
-                    .unwrap();
-                assert_eq!(st, OperationStatus::Success);
-                c.close().unwrap();
+                // FID-CURSOR-AUTOCOMMIT: a cursor write on a transactional db
+                // requires a transactional locker (JE
+                // `Cursor.updateOperationsProhibited`); open the cursor under
+                // an explicit txn.  This still exercises the cursor write
+                // path (the old-LSN write-lock-until-slot-update invariant
+                // under test), which is what this probe checks.
+                let txn = wenv.begin_transaction(None).unwrap();
+                {
+                    let mut c = wdb.open_cursor_in(&txn, None).unwrap();
+                    let st = c
+                        .put(
+                            &DatabaseEntry::from_bytes(KEY),
+                            &DatabaseEntry::from_bytes(&wd1),
+                            Put::Overwrite,
+                        )
+                        .unwrap();
+                    assert_eq!(st, OperationStatus::Success);
+                    c.close().unwrap();
+                }
+                txn.commit_with_durability(Durability::COMMIT_SYNC).unwrap();
             }
             _ => unreachable!(),
         }

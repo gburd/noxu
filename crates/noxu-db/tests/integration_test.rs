@@ -176,19 +176,23 @@ fn test_cursor_search() {
 #[test]
 fn test_cursor_delete() {
     let dir = TempDir::new().unwrap();
-    let (_env, db) = open_env_and_db(&dir);
+    let (env, db) = open_env_and_db(&dir);
 
     let mut key = DatabaseEntry::from_bytes(b"k");
     let val = DatabaseEntry::from_bytes(b"v");
     db.put(&key, &val).unwrap();
 
-    let mut cursor = db.open_cursor(None).unwrap();
+    // FID-CURSOR-AUTOCOMMIT: a cursor write on a transactional db needs
+    // a transactional locker; open under an explicit auto-commit txn.
+    let txn = env.begin_transaction(None).unwrap();
+    let mut cursor = db.open_cursor_in(&txn, None).unwrap();
     let mut data = DatabaseEntry::new();
 
     // Position on the record then delete via cursor
     cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
     cursor.delete().unwrap();
     cursor.close().unwrap();
+    txn.commit().unwrap();
 
     // Verify gone via Database::get
     let mut out = DatabaseEntry::new();
@@ -624,7 +628,7 @@ fn cursor_search_gte_finds_first_ge_key() {
 #[test]
 fn cursor_delete_removes_record_next_skips_it() {
     let dir = tempfile::TempDir::new().unwrap();
-    let (_env, db) = open_env_and_db(&dir);
+    let (env, db) = open_env_and_db(&dir);
 
     for (k, v) in [(b"A".as_ref(), b"1".as_ref()), (b"B", b"2"), (b"C", b"3")] {
         db.put(
@@ -634,7 +638,10 @@ fn cursor_delete_removes_record_next_skips_it() {
         .unwrap();
     }
 
-    let mut cursor = db.open_cursor(None).unwrap();
+    // FID-CURSOR-AUTOCOMMIT: a cursor write on a transactional db needs
+    // a transactional locker; open under an explicit auto-commit txn.
+    let txn = env.begin_transaction(None).unwrap();
+    let mut cursor = db.open_cursor_in(&txn, None).unwrap();
     let mut key = noxu_db::DatabaseEntry::from_bytes(b"B");
     let mut data = noxu_db::DatabaseEntry::new();
 
@@ -664,6 +671,7 @@ fn cursor_delete_removes_record_next_skips_it() {
     assert_eq!(key2.data(), b"C");
 
     cursor.close().unwrap();
+    txn.commit().unwrap();
 }
 
 /// cursor.put(Put::Overwrite) replaces the existing value for a key.
@@ -672,7 +680,7 @@ fn cursor_delete_removes_record_next_skips_it() {
 #[test]
 fn cursor_put_overwrite_and_no_overwrite() {
     let dir = tempfile::TempDir::new().unwrap();
-    let (_env, db) = open_env_and_db(&dir);
+    let (env, db) = open_env_and_db(&dir);
 
     db.put(
         noxu_db::DatabaseEntry::from_bytes(b"K"),
@@ -680,7 +688,10 @@ fn cursor_put_overwrite_and_no_overwrite() {
     )
     .unwrap();
 
-    let mut cursor = db.open_cursor(None).unwrap();
+    // FID-CURSOR-AUTOCOMMIT: a cursor write on a transactional db needs
+    // a transactional locker; open under an explicit auto-commit txn.
+    let txn = env.begin_transaction(None).unwrap();
+    let mut cursor = db.open_cursor_in(&txn, None).unwrap();
 
     // NoOverwrite on existing key → KeyExists.
     let kentry = noxu_db::DatabaseEntry::from_bytes(b"K");
@@ -704,6 +715,7 @@ fn cursor_put_overwrite_and_no_overwrite() {
     assert_eq!(read_data.data(), b"v3");
 
     cursor.close().unwrap();
+    txn.commit().unwrap();
 }
 
 /// Two independent cursors on the same database have separate positions.
@@ -2464,7 +2476,7 @@ fn cursor_search_simple_exact_match() {
 #[test]
 fn cursor_search_after_delete_returns_not_found() {
     let dir = TempDir::new().unwrap();
-    let (_env, db) = open_env_and_db(&dir);
+    let (env, db) = open_env_and_db(&dir);
 
     let pairs: &[(&[u8], &[u8])] =
         &[(b"alpha", b"1"), (b"beta", b"2"), (b"gamma", b"3")];
@@ -2474,7 +2486,10 @@ fn cursor_search_after_delete_returns_not_found() {
             .unwrap();
     }
 
-    let mut cursor = db.open_cursor(None).unwrap();
+    // FID-CURSOR-AUTOCOMMIT: a cursor write on a transactional db needs
+    // a transactional locker; open under an explicit auto-commit txn.
+    let txn = env.begin_transaction(None).unwrap();
+    let mut cursor = db.open_cursor_in(&txn, None).unwrap();
 
     for (k, _v) in pairs {
         // Search must succeed before deletion.
@@ -2505,6 +2520,7 @@ fn cursor_search_after_delete_returns_not_found() {
     }
 
     cursor.close().unwrap();
+    txn.commit().unwrap();
 }
 
 ///
@@ -2559,7 +2575,7 @@ fn cursor_search_large_tree_exact_match() {
 #[test]
 fn cursor_search_large_tree_delete_and_search() {
     let dir = TempDir::new().unwrap();
-    let (_env, db) = open_env_and_db(&dir);
+    let (env, db) = open_env_and_db(&dir);
 
     const N_KEYS: u32 = 50;
 
@@ -2573,7 +2589,10 @@ fn cursor_search_large_tree_delete_and_search() {
         .unwrap();
     }
 
-    let mut cursor = db.open_cursor(None).unwrap();
+    // FID-CURSOR-AUTOCOMMIT: a cursor write on a transactional db needs
+    // a transactional locker; open under an explicit auto-commit txn.
+    let txn = env.begin_transaction(None).unwrap();
+    let mut cursor = db.open_cursor_in(&txn, None).unwrap();
 
     for i in 0..N_KEYS {
         let key_bytes = format!("{:08}", i).into_bytes();
@@ -2602,6 +2621,7 @@ fn cursor_search_large_tree_delete_and_search() {
     }
 
     cursor.close().unwrap();
+    txn.commit().unwrap();
 }
 
 /// Get::SearchGte finds the first key >= the

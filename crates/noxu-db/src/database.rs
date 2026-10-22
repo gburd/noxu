@@ -462,13 +462,21 @@ impl Database {
             let mut auto_txn =
                 self.txn_manager.begin_auto_txn(self.log_manager.clone());
             auto_txn.set_local_write(!is_replicated);
-            let durability = if self.no_sync {
-                crate::durability::Durability::COMMIT_NO_SYNC
-            } else if self.write_no_sync {
-                crate::durability::Durability::COMMIT_WRITE_NO_SYNC
-            } else {
-                crate::durability::Durability::COMMIT_SYNC
-            };
+            // FID-NONTXN-SYNC-FSYNC: a non-transactional write has NO
+            // commit-time fsync in JE.  `LN.logInternal` logs the LN with the
+            // `LogParams` defaults `flushRequired=false, fsyncRequired=false`
+            // (LN.java:636, LogParams.java:42,53) regardless of the env
+            // durability, and `BasicLocker`/`ThreadLocker.operationEnd`
+            // (BasicLocker.java:198-247) only RELEASES the locks — it never
+            // flushes or fsyncs.  Durability of a non-txnal write comes later,
+            // from a checkpoint / `Environment.sync()` / a subsequent SYNC
+            // commit that drains the buffer / env close.  So this path uses
+            // `COMMIT_NO_SYNC` (neither flush nor fsync) unconditionally; the
+            // per-db `no_sync`/`write_no_sync` knobs do not add a fsync here
+            // because JE never fsyncs a non-txnal LN.  (A non-txn db has no
+            // `Txn`; the inner auto-`Txn` here is only a cursor-wiring/lock
+            // vehicle, not JE's `Txn.createAutoTxn`.)
+            let durability = crate::durability::Durability::COMMIT_NO_SYNC;
             let txn = Transaction::new(
                 0,
                 crate::transaction_config::TransactionConfig::default()
@@ -582,19 +590,22 @@ impl Database {
         }
     }
 
-    /// Durability of an auto-commit write (`txn = None`), from the
-    /// database's `no_sync` / `write_no_sync` config.  Shared by
-    /// [`Self::with_auto_commit_transaction`]'s non-transactional
-    /// (ThreadLocker) path and auto-commit cursors so `db.put` and
-    /// `cursor.put` honour the same policy.
+    /// Durability of an auto-commit write performed through a bare
+    /// `open_cursor(None)` cursor on a NON-transactional database — JE's
+    /// `ThreadLocker`/`BasicLocker` path.
+    ///
+    /// FID-NONTXN-SYNC-FSYNC: a non-transactional LN is logged with
+    /// `flushRequired=false, fsyncRequired=false` (JE `LN.logInternal`,
+    /// `LogParams` defaults; LN.java:636, LogParams.java:42,53) and
+    /// `operationEnd` only releases locks (BasicLocker.java:198-247), so
+    /// there is NO commit-time flush or fsync.  This returns `CommitNoSync`
+    /// unconditionally (durability comes later, from a checkpoint /
+    /// `Environment::sync` / env close).  After FID-CURSOR-AUTOCOMMIT a
+    /// writable `open_cursor(None)` on a *transactional* database is refused
+    /// outright (`writes_prohibited`), so the only writable auto-commit
+    /// cursor that reaches this is on a non-transactional db.
     fn auto_commit_durability(&self) -> Durability {
-        if self.no_sync {
-            Durability::CommitNoSync
-        } else if self.write_no_sync {
-            Durability::CommitWriteNoSync
-        } else {
-            Durability::CommitSync
-        }
+        Durability::CommitNoSync
     }
 
     /// Creates a new database handle.
@@ -1648,8 +1659,17 @@ impl Database {
     /// (review P0-1: returns `Cursor<'_>`; review P0-2: auto-commit is the
     /// unadorned form, the transactional form is [`Self::open_cursor_in`]).
     ///
-    /// In auto-commit mode each cursor write is its own transaction and is
-    /// fsynced before returning.
+    /// On a **transactional** database a cursor opened with no transaction is
+    /// READ-ONLY: its reads are allowed but every update (`put`, `delete`)
+    /// returns [`NoxuError::OperationNotAllowed`], matching JE
+    /// `Cursor.updateOperationsProhibited` (Cursor.java:333-338/5340-5367) —
+    /// "a Transaction was not supplied to openCursor and the Database is
+    /// transactional".  To write through a cursor on a transactional db, open
+    /// it with [`Self::open_cursor_in`] under an explicit transaction, or use
+    /// [`Self::put`] / [`Self::delete`] (auto-commit).  On a
+    /// **non-transactional** database cursor writes are allowed (JE's
+    /// `ThreadLocker` path) and are NOT fsynced per write (FID-NONTXN-SYNC-FSYNC);
+    /// call [`crate::Environment::sync`] to make them durable.
     ///
     /// # Arguments
     /// * `config` - Optional cursor configuration
@@ -1660,7 +1680,7 @@ impl Database {
         &self,
         config: Option<&CursorConfig>,
     ) -> Result<Cursor<'static>> {
-        self.open_cursor_internal(None, config)
+        self.open_cursor_user(None, config)
     }
 
     /// Opens a cursor bound to an explicit transaction (review P0-1/P0-2).
@@ -1686,7 +1706,36 @@ impl Database {
         txn: &'txn Transaction,
         config: Option<&CursorConfig>,
     ) -> Result<Cursor<'txn>> {
-        self.open_cursor_internal(Some(txn), config)
+        self.open_cursor_user(Some(txn), config)
+    }
+
+    /// User-facing cursor open (JE `Database.openCursor`).  Wraps
+    /// [`Self::open_cursor_internal`] and, for a cursor opened WITHOUT a
+    /// transaction on a TRANSACTIONAL database, marks its updates prohibited —
+    /// JE `Cursor.init` sets `updateOperationsProhibited =
+    /// (databaseImpl.isTransactional() && !locker.isTransactional())`
+    /// (Cursor.java:333-338), and `checkUpdatesAllowed` throws for such a
+    /// cursor (Cursor.java:5340-5367).  FID-CURSOR-AUTOCOMMIT.
+    ///
+    /// Internal engine cursors (secondary-index maintenance, iterators,
+    /// `noxu-collections` / `noxu-persist` / XA / cleaner / recovery) call
+    /// [`Self::open_cursor_internal`] directly and are NOT prohibited — in JE
+    /// those run under an auto-commit *transactional* locker so their writes
+    /// are allowed.
+    pub(crate) fn open_cursor_user<'txn>(
+        &self,
+        txn: Option<&'txn Transaction>,
+        config: Option<&CursorConfig>,
+    ) -> Result<Cursor<'txn>> {
+        let mut cursor = self.open_cursor_internal(txn, config)?;
+        // JE Cursor.updateOperationsProhibited: a user cursor whose database
+        // is transactional but whose locker is NOT transactional (no txn
+        // supplied) prohibits all updates.
+        if self.config.transactional && txn.is_none() && !cursor.is_read_only()
+        {
+            cursor.set_writes_prohibited(true);
+        }
+        Ok(cursor)
     }
 
     /// Shared cursor-open used by [`Self::open_cursor`] /
@@ -2151,39 +2200,56 @@ impl Database {
         }
     }
 
-    /// Flushes all pending writes for this database to stable storage.
+    /// Flushes a **deferred-write** database's dirty tree to stable storage.
     ///
-    /// Implements `Database.sync()` — issues an fdatasync on the log file,
-    /// ensuring that all writes made by non-transactional or deferred-sync
-    /// operations are durable before returning.
+    /// Implements `Database.sync()` — which JE supports **only** for a
+    /// deferred-write database (`DatabaseImpl.sync(true)`,
+    /// DatabaseImpl.java:1389-1395).  For a deferred-write db it flushes the
+    /// db's dirty BINs/INs bottom-up and fsyncs, making its records durable.
     ///
-    /// # Returns
-    /// `Ok(())` on success. Acts as a no-op for non-transactional /
-    /// in-memory environments where no log manager is configured.
+    /// For a non-deferred-write database this is **not supported** (as in JE):
+    /// make a non-transactional / non-DW write durable with
+    /// [`Environment::sync`] (a forced checkpoint) or
+    /// [`Environment::flush_log`] with `fsync = true`, or commit a
+    /// transaction with SYNC durability.
+    ///
+    /// [`Environment::sync`]: crate::Environment::sync
+    /// [`Environment::flush_log`]: crate::Environment::flush_log
     ///
     /// # Errors
-    /// Returns an error if the database is closed or the underlying
-    /// log-manager flush fails.
+    /// Returns [`NoxuError::OperationNotAllowed`] if the database is not
+    /// deferred-write (with the JE message "Database.sync() is only supported
+    /// for deferred-write databases"), if the database is closed, or if the
+    /// underlying flush fails.
     pub fn sync(&self) -> Result<()> {
         self.check_open()?;
+        // JE `Database.sync()` -> `DatabaseImpl.sync(true)`: a sync is only
+        // supported for a deferred-write database.  `DatabaseImpl.sync` throws
+        // `UnsupportedOperationException("Database.sync() is only supported for
+        // deferred-write databases")` when the db is not durable-deferred-write
+        // (DatabaseImpl.java:1389-1395), BEFORE touching the tree.  Noxu maps
+        // that to `OperationNotAllowed` with the JE-exact message.  A
+        // non-transactional / non-DW write is made durable through
+        // `Environment::sync()` (a forced checkpoint, JE `Environment.sync()`)
+        // or `Environment::flush_log(true)` (JE `Environment.flushLog`) — not
+        // through `Database::sync()`.
+        if !self.db_impl.read().is_deferred_write() {
+            return Err(NoxuError::OperationNotAllowed(
+                "Database.sync() is only supported for deferred-write databases"
+                    .to_string(),
+            ));
+        }
         // BUG-DW-SYNC-1 fix: a DEFERRED-WRITE DB defers LOGGING of its tree, so
         // flushing the log buffer alone makes nothing durable — the dirty
-        // BINs/INs were never logged.  JE `Database.sync()` ->
-        // `DatabaseImpl.sync(true)` -> `Checkpointer.syncDatabase(dbImpl)`
-        // (Checkpointer.java:950-988) flushes THIS db's dirty tree bottom-up
-        // (ckptStart=NULL) then flushSync.  Route a deferred-write sync through
-        // the per-DB checkpointer path so synced records survive a crash.
-        if self.db_impl.read().is_deferred_write() {
-            let env_impl = self.env_impl.lock();
-            env_impl
-                .sync_database(self.id)
-                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
-            return Ok(());
-        }
-        if let Some(lm) = &self.log_manager {
-            lm.flush_sync()
-                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
-        }
+        // BINs/INs were never logged.  JE `DatabaseImpl.sync(true)` ->
+        // `Checkpointer.syncDatabase(dbImpl)` (Checkpointer.java:950-988)
+        // flushes THIS db's dirty tree bottom-up (ckptStart=NULL) then
+        // flushSync.  Route the deferred-write sync through the per-DB
+        // checkpointer path so synced records survive a crash.
+        let env_impl = self.env_impl.lock();
+        env_impl
+            .sync_database(self.id)
+            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
         Ok(())
     }
 
@@ -3157,14 +3223,20 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_on_open_database_succeeds() {
-        let (_tmp, _env, db) = temp_env_and_db();
+    fn test_sync_on_non_deferred_write_database_is_refused() {
+        // JE `Database.sync()` is supported only for deferred-write databases
+        // (`DatabaseImpl.sync` throws otherwise, DatabaseImpl.java:1389-1395).
+        // `temp_env_and_db()` opens a plain (non-DW) transactional db, so sync
+        // must be refused; the supported durability path is `env.flush_log`.
+        let (_tmp, env, db) = temp_env_and_db();
         db.put(
             DatabaseEntry::from_bytes(b"key"),
             DatabaseEntry::from_bytes(b"val"),
         )
         .unwrap();
-        assert!(db.sync().is_ok());
+        assert!(matches!(db.sync(), Err(NoxuError::OperationNotAllowed(_))));
+        // The supported non-DW durability path still works.
+        env.flush_log(true).unwrap();
     }
 
     #[test]

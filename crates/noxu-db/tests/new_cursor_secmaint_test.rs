@@ -112,15 +112,22 @@ fn cursor_put_insert_maintains_secondary() {
     let sec = open_secondary(Arc::clone(&primary), &env, "s");
 
     {
-        let pri = primary.lock();
-        let mut cur = pri.open_cursor(None).unwrap();
-        cur.put(
-            &DatabaseEntry::from_bytes(b"k"),
-            &DatabaseEntry::from_bytes(&[5]),
-            Put::Overwrite,
-        )
-        .unwrap();
-        cur.close().unwrap();
+        // FID-CURSOR-AUTOCOMMIT: a cursor write on a transactional
+        // primary needs a transactional locker; open under an
+        // explicit auto-commit txn (JE beginAutoCommit).
+        let txn = env.begin_transaction(None).unwrap();
+        {
+            let pri = primary.lock();
+            let mut cur = pri.open_cursor_in(&txn, None).unwrap();
+            cur.put(
+                &DatabaseEntry::from_bytes(b"k"),
+                &DatabaseEntry::from_bytes(&[5]),
+                Put::Overwrite,
+            )
+            .unwrap();
+            cur.close().unwrap();
+        }
+        txn.commit().unwrap();
     }
 
     // Secondary key = 5 + 100 = 105 must now resolve to the primary data.
@@ -140,15 +147,22 @@ fn cursor_put_no_overwrite_maintains_secondary() {
     let sec = open_secondary(Arc::clone(&primary), &env, "s");
 
     {
-        let pri = primary.lock();
-        let mut cur = pri.open_cursor(None).unwrap();
-        cur.put(
-            &DatabaseEntry::from_bytes(b"k"),
-            &DatabaseEntry::from_bytes(&[7]),
-            Put::NoOverwrite,
-        )
-        .unwrap();
-        cur.close().unwrap();
+        // FID-CURSOR-AUTOCOMMIT: a cursor write on a transactional
+        // primary needs a transactional locker; open under an
+        // explicit auto-commit txn (JE beginAutoCommit).
+        let txn = env.begin_transaction(None).unwrap();
+        {
+            let pri = primary.lock();
+            let mut cur = pri.open_cursor_in(&txn, None).unwrap();
+            cur.put(
+                &DatabaseEntry::from_bytes(b"k"),
+                &DatabaseEntry::from_bytes(&[7]),
+                Put::NoOverwrite,
+            )
+            .unwrap();
+            cur.close().unwrap();
+        }
+        txn.commit().unwrap();
     }
 
     assert_eq!(
@@ -176,15 +190,22 @@ fn cursor_put_replace_moves_secondary_key() {
 
     // REPLACE the data via a cursor put: 5 -> 9, so sec key 105 -> 109.
     {
-        let pri = primary.lock();
-        let mut cur = pri.open_cursor(None).unwrap();
-        cur.put(
-            &DatabaseEntry::from_bytes(b"k"),
-            &DatabaseEntry::from_bytes(&[9]),
-            Put::Overwrite,
-        )
-        .unwrap();
-        cur.close().unwrap();
+        // FID-CURSOR-AUTOCOMMIT: a cursor write on a transactional
+        // primary needs a transactional locker; open under an
+        // explicit auto-commit txn (JE beginAutoCommit).
+        let txn = env.begin_transaction(None).unwrap();
+        {
+            let pri = primary.lock();
+            let mut cur = pri.open_cursor_in(&txn, None).unwrap();
+            cur.put(
+                &DatabaseEntry::from_bytes(b"k"),
+                &DatabaseEntry::from_bytes(&[9]),
+                Put::Overwrite,
+            )
+            .unwrap();
+            cur.close().unwrap();
+        }
+        txn.commit().unwrap();
     }
 
     assert_eq!(
@@ -215,20 +236,28 @@ fn cursor_put_current_maintains_secondary() {
     assert_eq!(lookup(&sec, 105), Some(vec![5]), "seed maps 105->5");
 
     {
-        let pri = primary.lock();
-        let mut cur = pri.open_cursor(None).unwrap();
-        // Position on the key, then replace its data via put_current.
-        let mut k = DatabaseEntry::from_bytes(b"k");
-        let mut v = DatabaseEntry::new();
-        let st = cur.get(&mut k, &mut v, noxu_db::Get::Search, None).unwrap();
-        assert_eq!(st, noxu_db::OperationStatus::Success);
-        cur.put(
-            &DatabaseEntry::from_bytes(b"k"),
-            &DatabaseEntry::from_bytes(&[9]),
-            Put::Current,
-        )
-        .unwrap();
-        cur.close().unwrap();
+        // FID-CURSOR-AUTOCOMMIT: a cursor write on a transactional
+        // primary needs a transactional locker; open under an
+        // explicit auto-commit txn (JE beginAutoCommit).
+        let txn = env.begin_transaction(None).unwrap();
+        {
+            let pri = primary.lock();
+            let mut cur = pri.open_cursor_in(&txn, None).unwrap();
+            // Position on the key, then replace its data via put_current.
+            let mut k = DatabaseEntry::from_bytes(b"k");
+            let mut v = DatabaseEntry::new();
+            let st =
+                cur.get(&mut k, &mut v, noxu_db::Get::Search, None).unwrap();
+            assert_eq!(st, noxu_db::OperationStatus::Success);
+            cur.put(
+                &DatabaseEntry::from_bytes(b"k"),
+                &DatabaseEntry::from_bytes(&[9]),
+                Put::Current,
+            )
+            .unwrap();
+            cur.close().unwrap();
+        }
+        txn.commit().unwrap();
     }
 
     assert_eq!(
@@ -259,14 +288,22 @@ fn cursor_delete_maintains_secondary() {
     assert_eq!(lookup(&sec, 105), Some(vec![5]), "seed maps 105->5");
 
     {
-        let pri = primary.lock();
-        let mut cur = pri.open_cursor(None).unwrap();
-        let mut k = DatabaseEntry::from_bytes(b"k");
-        let mut v = DatabaseEntry::new();
-        let st = cur.get(&mut k, &mut v, noxu_db::Get::Search, None).unwrap();
-        assert_eq!(st, noxu_db::OperationStatus::Success);
-        cur.delete().unwrap();
-        cur.close().unwrap();
+        // FID-CURSOR-AUTOCOMMIT: a cursor write on a transactional
+        // primary needs a transactional locker; open under an
+        // explicit auto-commit txn (JE beginAutoCommit).
+        let txn = env.begin_transaction(None).unwrap();
+        {
+            let pri = primary.lock();
+            let mut cur = pri.open_cursor_in(&txn, None).unwrap();
+            let mut k = DatabaseEntry::from_bytes(b"k");
+            let mut v = DatabaseEntry::new();
+            let st =
+                cur.get(&mut k, &mut v, noxu_db::Get::Search, None).unwrap();
+            assert_eq!(st, noxu_db::OperationStatus::Success);
+            cur.delete().unwrap();
+            cur.close().unwrap();
+        }
+        txn.commit().unwrap();
     }
 
     assert_eq!(
