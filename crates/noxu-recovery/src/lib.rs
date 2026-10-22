@@ -39,8 +39,8 @@ pub use analysis_result::{
 // not part of the stable public surface (release-backport-contract).
 #[doc(hidden)]
 pub use catalog_integrity::{
-    CatalogDamage, CatalogEvent, detect_xdb711_damage, log_integrity_message,
-    mounted_injectivity_violations,
+    CatalogDamage, CatalogEvent, DamageKind, detect_xdb711_damage,
+    log_integrity_message, mounted_injectivity_violations,
 };
 pub use checkpoint_end::CheckpointEnd;
 pub use checkpoint_start::CheckpointStart;

@@ -872,11 +872,11 @@ impl RecoveryManager {
                 );
             for d in &xdb711_damage {
                 log::error!(
-                    "recovery[xdb-711]: catalog integrity violation: database \
-                     '{}' mounted as id {} but the latest committed \
-                     transactional operation bound it to {:?} (stray \
-                     non-transactional NameLN at LSN {}, committed authority \
+                    "recovery[xdb-711]: catalog integrity violation ({:?}): \
+                     database '{}' mounted as id {}; superseded/orphaned \
+                     id {:?} (winning record at LSN {}, superseded authority \
                      at LSN {})",
+                    d.kind,
                     d.name,
                     d.mounted_id,
                     d.committed_id,
@@ -1903,8 +1903,63 @@ impl RecoveryManager {
         let mut fsln: HashMap<u32, (RebuiltFileSummary, Lsn)> = HashMap::new();
         let mut obsolete_after: Vec<(u32, Lsn)> = Vec::new();
 
+        // XDB-711 detector: track the catalog RELOG BURST positionally.  The
+        // checkpoint catalog relog (`relog_live_catalog_impl`) writes a
+        // contiguous run of live NameLNs — one per live database — immediately
+        // before the checkpoint's `CkptStart` (the checkpointer calls the
+        // relog callback at the top of `do_checkpoint`, then logs `CkptStart`).
+        // `relog_run_pending` accumulates the `(name, index-in-events-list)` of
+        // consecutive NameLN records; when a `CkptStart` closes the run we mark
+        // every pending event's `in_relog_run = true`; any other record type
+        // breaks the run (it was not a relog burst).  This is what lets the
+        // detector identify the stray relog record itself rather than treating
+        // any non-transactional NameLN as a stray (XDB-DETECT-FP-1).
+        let mut relog_run_pending: Vec<(String, usize)> = Vec::new();
+
         let mut process = |pe: PositionedEntry| {
             let entry_lsn = pe.lsn;
+            // Positional relog-burst bookkeeping (see `relog_run_pending`): a
+            // NameLN continues the current run, a CkptStart closes+marks it,
+            // anything else breaks it.
+            let entry_is_name_ln = matches!(pe.entry, LogEntry::NameLn(_));
+            let entry_is_ckpt_start =
+                matches!(pe.entry, LogEntry::CkptStart(_));
+            if entry_is_ckpt_start {
+                // The pending NameLN run ended at a CkptStart: it is this
+                // checkpoint's catalog relog burst.  The relog re-logs each
+                // LIVE database name EXACTLY ONCE, so within the run only the
+                // LAST occurrence of each name is a relog record.  A user
+                // auto-commit DDL NameLN that happens to be logged immediately
+                // before the burst (e.g. an auto rename-in right before a
+                // close checkpoint) lands in the same contiguous run but is an
+                // EARLIER occurrence of its name — it must NOT be mis-flagged
+                // as a relog record (that would hide the true authority and
+                // false-fire, XDB-DETECT-FP-1 / V4).  So keep only the
+                // highest-LSN event per name in the run.
+                let mut last_idx_by_name: hashbrown::HashMap<String, usize> =
+                    hashbrown::HashMap::new();
+                for (name, idx) in relog_run_pending.drain(..) {
+                    // relog_run_pending is in ascending scan order, so the
+                    // later entry overwrites — the final value is the last
+                    // (highest-LSN) occurrence of each name.
+                    last_idx_by_name.insert(name, idx);
+                }
+                for (name, idx) in last_idx_by_name {
+                    if let Some(list) = result_ref.catalog_events.get_mut(&name)
+                        && let Some(ev) = list.get_mut(idx)
+                        && !ev.is_deleted
+                    {
+                        // The relog only ever emits LIVE NameLNs (it skips
+                        // tombstones), so a deleted event in the run is a user
+                        // op, never a relog record.
+                        ev.in_relog_run = true;
+                    }
+                }
+            } else if !entry_is_name_ln {
+                // A non-NameLN, non-CkptStart record breaks the run — the
+                // preceding NameLNs were not a relog-then-CkptStart burst.
+                relog_run_pending.clear();
+            }
             match pe.entry {
                 // ----------------------------------------------------------
                 // IN/BIN entries → build dirty-IN map
@@ -2085,16 +2140,25 @@ impl RecoveryManager {
                     // (live or tombstone, txnal or not) in ascending-LSN order
                     // per name, before the latest-wins mutation below discards
                     // the superseded records.  Bounded per-NameLN work.
-                    result_ref
-                        .catalog_events
-                        .entry(rec.name.clone())
-                        .or_default()
-                        .push(crate::catalog_integrity::CatalogEvent {
+                    //
+                    // `in_relog_run` starts false and is set true later if a
+                    // `CkptStart` closes this record's NameLN run (the relog
+                    // burst) — see `relog_run_pending` above.
+                    {
+                        let list = result_ref
+                            .catalog_events
+                            .entry(rec.name.clone())
+                            .or_default();
+                        list.push(crate::catalog_integrity::CatalogEvent {
                             lsn: entry_lsn,
                             id: rec.db_id,
                             is_deleted: rec.is_deleted,
                             txn_id: rec.txn_id,
+                            in_relog_run: false,
                         });
+                        relog_run_pending
+                            .push((rec.name.clone(), list.len() - 1));
+                    }
                     if rec.is_deleted {
                         // BUG-DDL-DURABILITY-1: a TRANSACTIONAL delete
                         // (txn_id=Some) must only take effect if its txn
