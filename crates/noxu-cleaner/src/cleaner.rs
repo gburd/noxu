@@ -47,19 +47,120 @@ impl From<String> for FileCleaningError {
 /// `SharedTreeLookup::live_db_oracle`.
 pub type LiveDbOracle = Arc<dyn Fn(i64) -> bool + Send + Sync>;
 
-/// ENG-CLEAN-TOMBSTONE-1 (D-ADDITIVE-SAFETY, 7.11.x only): oracle answering
-/// "would reclaiming the NameLN tombstone for `name` at `tombstone_lsn`
-/// resurrect the removed database?".  Returns `true` iff `name` is currently
-/// REMOVED in the committed catalog AND a live (create) NameLN for it still
-/// survives in an on-disk file OLDER than the tombstone's file -- which
-/// recovery's latest-NameLN-per-name replay would then pick, resurrecting the
-/// removed database (the checkpoint relog never re-materialises a tombstone).
-/// The cleaner RETAINS the tombstone's file while this is `true`, exactly like
-/// the R-UNOPENED live-db retain-guard; once the older create's file is itself
-/// reclaimed the oracle returns `false` and the tombstone's file becomes
-/// reclaimable (bounded by proof, no cap).  Wired from `EnvironmentImpl`.
-pub type NameResurrectionOracle =
-    Arc<dyn Fn(&str, noxu_util::Lsn) -> bool + Send + Sync>;
+/// ENG-CLEAN-TOMBSTONE-1 (D-ADDITIVE-SAFETY, 7.11.x only): a pass-scoped
+/// snapshot of the on-disk catalog NameLN stream used by the cleaner's
+/// NameLN-tombstone clamp.  Built ONCE at the start of a cleaner pass by
+/// scanning the surviving files' NameLN records; discarded when the pass ends.
+///
+/// It is NOT a persistent side-map and carries no per-write-path bookkeeping:
+/// it is the transient, pass-local analogue of JE's in-memory name tree (JE
+/// derives catalog liveness from the mapping tree it already holds in memory;
+/// 7.11.x has no name tree, so the cleaner reconstructs the needed view with a
+/// single pass-start scan).  See `NameResurrectionOracle` and
+/// `NameLnSnapshot::retains_tombstone`.
+#[derive(Debug, Default, Clone)]
+pub struct NameLnSnapshot {
+    /// Per catalog name encountered on disk: the EXACT per-name facts the
+    /// exact retention rule needs.
+    entries: std::collections::HashMap<String, NameLnFacts>,
+}
+
+/// Per-name facts derived by scanning the surviving NameLN stream once.
+#[derive(Debug, Clone, Copy)]
+struct NameLnFacts {
+    /// LSN of the NEWEST NameLN (live OR tombstone) for this name across all
+    /// surviving files -- the one recovery's latest-NameLN-per-name replay
+    /// would pick.  LSNs are totally ordered by (file, offset), so this is
+    /// exact within AND across files.
+    newest_nameln: noxu_util::Lsn,
+    /// LSN of the OLDEST surviving LIVE (create) NameLN for this name, if any.
+    oldest_live_create: Option<noxu_util::Lsn>,
+    /// `true` iff this name is REMOVED in the committed catalog (absent from
+    /// `name_map`), captured at snapshot-build time.  A momentarily-stale
+    /// `name_map` can only make a live name look removed -> over-retain
+    /// (space), never under-retain (resurrection).
+    removed: bool,
+}
+
+impl NameLnSnapshot {
+    /// The EXACT clamp rule.  Returns `true` iff reclaiming a NameLN tombstone
+    /// for `name` at `tombstone_lsn` could let recovery resurrect `name`, i.e.
+    /// ALL of:
+    ///   (a) this tombstone is N's LATEST NameLN on disk (`tombstone_lsn`
+    ///       equals the newest NameLN LSN for N -- no newer NameLN, live OR
+    ///       tombstone, in any newer surviving file or later in the same
+    ///       file); AND
+    ///   (b) N is REMOVED in the committed catalog; AND
+    ///   (c) a LIVE (create) NameLN for N survives in a file OLDER than the
+    ///       tombstone's file.
+    /// Only ONE tombstone per removed name -- the latest -- can satisfy (a),
+    /// so at most one file is ever retained per such name: bounded disk.
+    pub fn retains_tombstone(
+        &self,
+        name: &str,
+        tombstone_lsn: noxu_util::Lsn,
+    ) -> bool {
+        match self.entries.get(name) {
+            Some(f) => {
+                f.removed
+                    && f.newest_nameln == tombstone_lsn
+                    && f.oldest_live_create.is_some_and(|c| {
+                        c.file_number() < tombstone_lsn.file_number()
+                    })
+            }
+            // Name never seen on disk (should not happen for a tombstone we
+            // are cleaning): be safe -> retain.
+            None => true,
+        }
+    }
+
+    /// Record one NameLN seen on disk during the pass-start scan.  `live` is
+    /// `true` for a create (`data = Some`), `false` for a tombstone
+    /// (`data = None`).  `removed` is the committed-catalog membership for the
+    /// name (same value for every record of the name in a pass).
+    pub fn observe(
+        &mut self,
+        name: &str,
+        lsn: noxu_util::Lsn,
+        live: bool,
+        removed: bool,
+    ) {
+        let e = self.entries.entry(name.to_owned()).or_insert(NameLnFacts {
+            newest_nameln: lsn,
+            oldest_live_create: None,
+            removed,
+        });
+        e.removed = removed;
+        if lsn.as_u64() > e.newest_nameln.as_u64() {
+            e.newest_nameln = lsn;
+        }
+        if live {
+            match e.oldest_live_create {
+                Some(c) if c.as_u64() <= lsn.as_u64() => {}
+                _ => e.oldest_live_create = Some(lsn),
+            }
+        }
+    }
+
+    /// Number of distinct names in the snapshot (diagnostics / tests).
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// `true` when the snapshot observed no NameLN (diagnostics / tests).
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// ENG-CLEAN-TOMBSTONE-1 (D-ADDITIVE-SAFETY, 7.11.x only): builds the
+/// pass-scoped `NameLnSnapshot` once per cleaner pass.  Wired from
+/// `EnvironmentImpl`, which scans the surviving NameLN stream of the log and
+/// gates each name on `name_map` membership.  The cleaner calls it exactly
+/// once at the start of a pass (so the per-tombstone decision is an O(1)
+/// map lookup, not an O(older-files) re-scan per tombstone), and drops the
+/// snapshot when the pass ends -- no persistent state, no side map.
+pub type NameResurrectionOracle = Arc<dyn Fn() -> NameLnSnapshot + Send + Sync>;
 
 /// Bundled context for calling `process_pending` from within the
 /// `FileProcessor` periodic hook (CLN-12).
@@ -410,9 +511,11 @@ pub struct Cleaner {
     /// R-UNOPENED-RECLAIM (D-ADDITIVE-SAFETY): live-db oracle; when wired the
     /// cleaner never reclaims the file of a recovered-but-unopened database.
     live_db_oracle: Option<LiveDbOracle>,
-    /// ENG-CLEAN-TOMBSTONE-1 (D-ADDITIVE-SAFETY): name-resurrection oracle;
-    /// when wired the cleaner retains a NameLN-tombstone file while reclaiming
-    /// it could resurrect the removed database.  See `NameResurrectionOracle`.
+    /// ENG-CLEAN-TOMBSTONE-1 (D-ADDITIVE-SAFETY): name-resurrection snapshot
+    /// builder; when wired the cleaner builds a pass-scoped `NameLnSnapshot`
+    /// once per pass and retains a NameLN-tombstone file only while it is the
+    /// removed name's latest NameLN AND an older live create survives.  See
+    /// `NameResurrectionOracle`.
     name_resurrection_oracle: Option<NameResurrectionOracle>,
 }
 
@@ -703,8 +806,9 @@ impl Cleaner {
     }
 
     /// ENG-CLEAN-TOMBSTONE-1 (D-ADDITIVE-SAFETY): wire the name-resurrection
-    /// oracle so the cleaner retains a NameLN-tombstone file while reclaiming
-    /// it could resurrect the removed database.  See `NameResurrectionOracle`.
+    /// snapshot builder so the cleaner builds a pass-scoped `NameLnSnapshot`
+    /// once per pass and retains a removed name's LATEST tombstone file while
+    /// an older live create survives.  See `NameResurrectionOracle`.
     pub fn with_name_resurrection_oracle(
         mut self,
         oracle: NameResurrectionOracle,
@@ -981,6 +1085,18 @@ impl Cleaner {
         self.n_runs.fetch_add(1, Ordering::Relaxed);
         self.stats.runs.fetch_add(1, Ordering::Relaxed);
 
+        // ENG-CLEAN-TOMBSTONE-1 (D-ADDITIVE-SAFETY, 7.11.x only): pass-scoped
+        // NameLN snapshot for the tombstone clamp.  Built lazily, ONCE per
+        // pass, on the first NameLN tombstone we actually meet (a normal,
+        // DDL-free workload never builds it), by scanning the surviving
+        // NameLN stream once; the per-tombstone decision is then an O(1) map
+        // lookup rather than an O(older-files) re-scan per tombstone.  The
+        // snapshot lives only for this `do_clean` call -- it is dropped when
+        // the pass ends (no persistent side map).  This is the transient,
+        // pass-local stand-in for JE's in-memory name tree.
+        let name_snapshot: Arc<std::sync::OnceLock<Arc<NameLnSnapshot>>> =
+            Arc::new(std::sync::OnceLock::new());
+
         // JE FileProcessor.doClean ~line 340:
         //   fileSummaryMap = profile.getFileSummaryMap(true /*includeTrackedFiles*/)
         //
@@ -1141,7 +1257,7 @@ impl Cleaner {
             self.file_protector.protect_file(file_number, "CleanerProcessing");
 
             // Process the file (scan, migrate LNs).
-            let result = self.process_single_file(file_number);
+            let result = self.process_single_file(file_number, &name_snapshot);
 
             // Unprotect after processing.
             self.file_protector.unprotect_file(file_number);
@@ -1196,6 +1312,27 @@ impl Cleaner {
                         self.file_selector
                             .lock()
                             .mark_file_cleaned(file_number);
+                    } else if result.retain_file {
+                        // ENG-CLEAN-TOMBSTONE-1 / R-UNOPENED (D-ADDITIVE-
+                        // SAFETY): the file holds a record that must NOT be
+                        // reclaimed yet (a removed name's LATEST tombstone
+                        // whose older live create still survives, or a
+                        // live-but-unregistered db).  Leave it on disk and
+                        // OUT of the deletion barrier, but do NOT re-enqueue
+                        // it into TO_BE_CLEANED: re-queuing would make every
+                        // retained file re-select first on the next pass and
+                        // starve the reclaimable garbage (the O(churn²)
+                        // livelock).  Drop it from the cleaning set instead;
+                        // the utilization profile's getBestFile re-nominates
+                        // it on a later pass, by which point a newer tombstone
+                        // may have superseded it (clamp now false -> cleaned).
+                        // Bounded: at most ONE tombstone file per removed name
+                        // is ever retained (only its LATEST tombstone matches
+                        // the clamp), so disk stays O(#removed names with an
+                        // older surviving create).
+                        self.file_selector
+                            .lock()
+                            .remove_file_from_cleaning(file_number);
                     } else {
                         // Processing interrupted (shutdown) — put file back.
                         self.file_selector
@@ -1462,6 +1599,7 @@ impl Cleaner {
     fn process_single_file(
         &self,
         file_number: u32,
+        name_snapshot: &Arc<std::sync::OnceLock<Arc<NameLnSnapshot>>>,
     ) -> Result<FileProcessResult, FileCleaningError> {
         let file_summary = match &self.file_manager {
             None => crate::FileSummary::new(),
@@ -1514,11 +1652,19 @@ impl Cleaner {
             let p =
                 FileProcessor::new(self.stats.clone(), self.shutdown.clone())
                     .with_obsolete_offsets(obsolete_offsets);
-            // ENG-CLEAN-TOMBSTONE-1 (D-ADDITIVE-SAFETY): wire the
-            // name-resurrection oracle so a NameLN-tombstone file is retained
-            // while reclaiming it could resurrect the removed database.
+            // ENG-CLEAN-TOMBSTONE-1 (D-ADDITIVE-SAFETY): give the processor
+            // a lazy, pass-scoped NameLN-snapshot provider.  The provider is
+            // invoked ONLY when the file actually holds a NameLN tombstone
+            // (so a DDL-free pass never scans), and it memoizes the snapshot
+            // in the pass-scoped `OnceLock` so the whole pass shares ONE scan.
             let p = match &self.name_resurrection_oracle {
-                Some(o) => p.with_name_resurrection_oracle(Arc::clone(o)),
+                Some(o) => {
+                    let memo = Arc::clone(name_snapshot);
+                    let oracle = Arc::clone(o);
+                    p.with_name_snapshot_provider(Arc::new(move || {
+                        Arc::clone(memo.get_or_init(|| Arc::new(oracle())))
+                    }))
+                }
                 None => p,
             };
             if let Some(f) = pending_fn {
@@ -2598,7 +2744,12 @@ mod tests {
 
         let cleaner = Cleaner::with_file_manager(50, 0, 0, Arc::clone(&fm));
 
-        let result = cleaner.process_single_file(0).unwrap();
+        let result = cleaner
+            .process_single_file(
+                0,
+                &std::sync::Arc::new(std::sync::OnceLock::new()),
+            )
+            .unwrap();
         assert!(result.completed, "processing must complete successfully");
     }
 
@@ -2929,7 +3080,12 @@ mod tests {
             Arc::clone(&lm),
         );
 
-        let result = cleaner.process_single_file(0).unwrap();
+        let result = cleaner
+            .process_single_file(
+                0,
+                &std::sync::Arc::new(std::sync::OnceLock::new()),
+            )
+            .unwrap();
 
         assert!(
             result.completed,
@@ -3128,7 +3284,12 @@ mod tests {
             Arc::clone(&lm),
         );
 
-        let result = cleaner.process_single_file(0).unwrap();
+        let result = cleaner
+            .process_single_file(
+                0,
+                &std::sync::Arc::new(std::sync::OnceLock::new()),
+            )
+            .unwrap();
 
         assert!(result.completed, "processing must complete");
         // The decoded real key matches the tree at entry_lsn == log_lsn.

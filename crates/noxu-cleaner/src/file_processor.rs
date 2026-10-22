@@ -1567,20 +1567,20 @@ pub struct FileProcessor {
     /// by `Cleaner::process_single_file` from the live utilization tracker.
     obsolete_offsets: std::collections::HashSet<u32>,
 
-    /// ENG-CLEAN-TOMBSTONE-1 (D-ADDITIVE-SAFETY): oracle answering "would
-    /// reclaiming a NameLN tombstone for `name` in this file let recovery
-    /// resurrect `name`?".  Returns `true` iff `name` is currently REMOVED in
-    /// the committed catalog AND a live (create) NameLN for it still survives
-    /// in an OLDER on-disk file that recovery's latest-wins replay could pick.
-    /// When it returns `true` the file is RETAINED (`retain_file`), exactly
-    /// like the R-UNOPENED live-db retain-guard; once the older create's file
-    /// is itself reclaimed (its live NameLN classifies `Other` -> obsolete, no
-    /// migration, nothing retains it) the oracle returns `false` and the
-    /// tombstone's file becomes reclaimable -- bounded by proof, no cap, no
-    /// file retained forever.  Absent (tests / non-env paths) -> no clamp
-    /// (behaviour unchanged).
-    name_resurrection_oracle:
-        Option<Arc<dyn Fn(&str, Lsn) -> bool + Send + Sync>>,
+    /// ENG-CLEAN-TOMBSTONE-1 (D-ADDITIVE-SAFETY): lazy, pass-scoped provider
+    /// of the `NameLnSnapshot` used by the NameLN-tombstone clamp.  Invoked
+    /// ONLY when this file actually holds a tombstone (so a DDL-free pass
+    /// never pays for the scan), and memoized by the caller so the whole
+    /// cleaner pass shares a single scan.  On a tombstone for a removed name
+    /// N the processor retains this file iff the snapshot says this is N's
+    /// LATEST NameLN on disk AND an older live create for N survives (see
+    /// `NameLnSnapshot::retains_tombstone`); the file is RETAINED
+    /// (`retain_file`) exactly like the R-UNOPENED live-db retain-guard.
+    /// Because only the latest tombstone per removed name can match, at most
+    /// ONE file is ever retained per such name -- bounded disk, no cap.
+    /// Absent (tests / non-env paths) -> no clamp (behaviour unchanged).
+    name_snapshot_provider:
+        Option<Arc<dyn Fn() -> Arc<crate::NameLnSnapshot> + Send + Sync>>,
 }
 
 /// Result of processing a single file.
@@ -1662,19 +1662,19 @@ impl FileProcessor {
             process_pending_interval: PROCESS_PENDING_EVERY_N_LNS,
             process_pending_fn: None,
             obsolete_offsets: std::collections::HashSet::new(),
-            name_resurrection_oracle: None,
+            name_snapshot_provider: None,
         }
     }
 
-    /// ENG-CLEAN-TOMBSTONE-1 (D-ADDITIVE-SAFETY): wire the name-resurrection
-    /// oracle (see the `name_resurrection_oracle` field) so the cleaner
-    /// retains a NameLN-tombstone file while reclaiming it could resurrect the
-    /// removed database.
-    pub fn with_name_resurrection_oracle(
+    /// ENG-CLEAN-TOMBSTONE-1 (D-ADDITIVE-SAFETY): wire the lazy, pass-scoped
+    /// NameLN-snapshot provider (see the `name_snapshot_provider` field) so
+    /// the cleaner retains a removed name's LATEST tombstone file while an
+    /// older live create survives.
+    pub fn with_name_snapshot_provider(
         mut self,
-        oracle: Arc<dyn Fn(&str, Lsn) -> bool + Send + Sync>,
+        provider: Arc<dyn Fn() -> Arc<crate::NameLnSnapshot> + Send + Sync>,
     ) -> Self {
-        self.name_resurrection_oracle = Some(oracle);
+        self.name_snapshot_provider = Some(provider);
         self
     }
 
@@ -1877,25 +1877,31 @@ impl FileProcessor {
                 // live (create) NameLN for that name would let recovery's
                 // latest-NameLN-per-name replay pick the stale create and
                 // RESURRECT the removed database (the checkpoint relog never
-                // re-materialises a tombstone).  Ask the name-resurrection
-                // oracle; if reclaiming could resurrect `name`, RETAIN this
-                // file (`retain_file`), exactly like the R-UNOPENED live-db
-                // retain-guard.  JE never has this hazard (its NameLNs live in
+                // re-materialises a tombstone).  Consult the pass-scoped
+                // NameLN snapshot; RETAIN this file (`retain_file`) iff this
+                // tombstone is N's LATEST NameLN on disk AND N is removed AND
+                // an older live create for N survives -- exactly like the
+                // R-UNOPENED live-db retain-guard.  Only the LATEST tombstone
+                // per removed name can match, so at most one file is retained
+                // per such name (bounded disk).  Earlier tombstones are
+                // shadowed by a newer NameLN for N (incl. one in a file being
+                // cleaned in the SAME pass -- the snapshot sees it because it
+                // scans the surviving files at pass start, before any file is
+                // deleted through the two-checkpoint barrier) and are safely
+                // reclaimable.  JE never has this hazard (its NameLNs live in
                 // the DbTree name database and the cleaner MIGRATES live
                 // mapping-tree LNs); the retain is the 7.11.x stand-in for
                 // JE's "an obsolete LN is reclaimable only once nothing older
-                // can resurrect it", enforced at file granularity.  Once the
-                // older create's file is itself reclaimed the oracle returns
-                // false and this file becomes reclaimable (bounded, no cap).
+                // can resurrect it", enforced at file granularity.
                 LogEntryType::NameLnTombstone { name } => {
-                    if let Some(oracle) = &self.name_resurrection_oracle
-                        && oracle(name, lsn)
+                    if let Some(provider) = &self.name_snapshot_provider
+                        && provider().retains_tombstone(name, lsn)
                     {
                         result.retain_file = true;
                     }
-                    // Otherwise the tombstone is safely obsolete (no older
-                    // live create can resurrect `name`): counted obsolete,
-                    // skipped.
+                    // Otherwise the tombstone is safely obsolete (it is not
+                    // N's latest NameLN, or N is live again, or no older live
+                    // create survives): counted obsolete, skipped.
                 }
 
                 LogEntryType::Other => {
