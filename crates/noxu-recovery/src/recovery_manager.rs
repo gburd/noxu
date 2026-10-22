@@ -397,6 +397,33 @@ pub fn apply_redo_ln(tree: &mut noxu_tree::Tree, rec: &LnRecord, lsn: Lsn) {
     }
 }
 
+/// Whether the XDB-711 fail-closed detector is disabled for this recovery.
+///
+/// A **test-only** diagnosis seam: in a `cfg(test)` build (the recovery
+/// crate's own unit tests) or a `feature = "testing"` build (integration-test
+/// crates that depend on `noxu-recovery/testing`, enabled e.g. by
+/// `noxu-db/testing`), `NOXU_XDB711_DETECT_OFF=1` disables the detector so a
+/// teeth test can observe the would-be-mounted (silently wrong) catalog and
+/// prove the detector is load-bearing.
+///
+/// In a production build the function is a `const false` — the environment
+/// variable is **never read**, so a production process can NOT turn the
+/// fail-closed guard off and mount a catalog the engine knows is corrupt.
+/// This mirrors the REC-SEED-1 `FullScanOverride` fence (test-only seam,
+/// compiled out of every shipped build).
+#[cfg(any(test, feature = "testing"))]
+fn xdb711_detect_disabled() -> bool {
+    std::env::var_os("NOXU_XDB711_DETECT_OFF").is_some()
+}
+
+/// Production build: the XDB-711 detector can never be disabled (the off-switch
+/// is compiled out).  See the `cfg(any(test, feature = "testing"))` variant.
+#[cfg(not(any(test, feature = "testing")))]
+#[inline]
+fn xdb711_detect_disabled() -> bool {
+    false
+}
+
 impl RecoveryManager {
     /// Create a new recovery manager.
     pub fn new() -> Self {
@@ -861,18 +888,21 @@ impl RecoveryManager {
         // public API is unchanged (patch-safe).
         // TEETH / diagnosis seam (XDB-DETECT): NOXU_XDB711_DETECT_OFF=1
         // disables the detector so a test can observe the would-be-mounted
-        // (silently wrong) catalog.  Absent in normal operation.
-        let xdb711_damage =
-            if std::env::var_os("NOXU_XDB711_DETECT_OFF").is_some() {
-                Vec::new()
-            } else {
-                crate::catalog_integrity::detect_xdb711_damage(
-                    &analysis.recovered_db_names,
-                    &analysis.catalog_events,
-                    &analysis.committed_txns,
-                    &analysis.aborted_txns,
-                )
-            };
+        // (silently wrong) catalog.  The env var is honoured ONLY in test /
+        // `testing`-feature builds (`xdb711_detect_disabled()`); a production
+        // build never reads it, so no process can mount a catalog the engine
+        // knows is wrong by setting an environment variable.  (Fence precedent:
+        // REC-SEED-1 `FullScanOverride` — test-only, unusable in production.)
+        let xdb711_damage = if xdb711_detect_disabled() {
+            Vec::new()
+        } else {
+            crate::catalog_integrity::detect_xdb711_damage(
+                &analysis.recovered_db_names,
+                &analysis.catalog_events,
+                &analysis.committed_txns,
+                &analysis.aborted_txns,
+            )
+        };
         if !xdb711_damage.is_empty() {
             let injectivity =
                 crate::catalog_integrity::mounted_injectivity_violations(
