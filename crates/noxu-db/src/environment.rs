@@ -900,6 +900,39 @@ impl Environment {
             )));
         }
 
+        // ENG-AUTODDL-3 (S3): an auto-commit CREATE (`txn = None`,
+        // `allow_create`, name not already committed) must be durable at
+        // return, as JE's `openDatabase(txn=null)` is — `DbNameOperation`
+        // -> `createAutoTxn` commits the create's NameLN/MapLN at the env
+        // default durability (COMMIT_SYNC). The direct auto-commit path wrote
+        // the NameLN lazily (`log_name_ln`, flush=false/fsync=false), so a
+        // crash after Ok lost the fresh database. Run the create through ONE
+        // internal auto-txn and return the resulting handle (its lifetime is
+        // independent of the auto-txn, exactly as JE returns the Database from
+        // the committed auto-txn). Scope strictly to an actual CREATE of a
+        // not-yet-committed name in a transactional env+db: a reopen of an
+        // existing database stays on the fast shared-READ path below, and a
+        // non-transactional env/db keeps the direct (ThreadLocker) path.
+        if txn.is_none()
+            && config.allow_create
+            && self.config.transactional
+            && config.transactional
+        {
+            let is_new = {
+                let env_impl = self.env_impl.lock();
+                !env_impl.database_exists(name)
+            };
+            if is_new {
+                return self.run_auto_commit_ddl(|auto| {
+                    // auto is always Some here (env is transactional).
+                    let t = auto.expect(
+                        "invariant: transactional env yields an auto-txn",
+                    );
+                    self.open_database(Some(t), name, config)
+                });
+            }
+        }
+
         let mut databases = self.databases.lock();
 
         // Check if database is already open via this environment handle
@@ -1380,28 +1413,38 @@ impl Environment {
 
         match txn {
             None => {
-                // Auto-commit: apply immediately (JE null-txn locker), but
-                // hold the NameLN WRITE lock for the op so a concurrent
-                // transactional remove/rename/truncate of the same name (held
-                // in doubt by another txn) BLOCKS or typed-conflicts rather
-                // than racing this removal (R-LIVEDDL-711; JE
-                // `DbTree.doRemoveDb` -> `lockNameLN` WRITE, DbTree.java:952).
-                self.with_name_record_lock(
-                    name,
-                    LockType::Write,
-                    /*non_blocking=*/ false,
-                    || {
-                        let mut databases = self.databases.lock();
-                        {
-                            let env_impl = self.env_impl.lock();
-                            env_impl
-                                .remove_database(name)
-                                .map_err(map_dbi_err(name))?;
-                        }
-                        databases.remove(name);
-                        Ok(())
-                    },
-                )
+                // ENG-AUTODDL-2 (S2): run the auto-commit remove through JE's
+                // `createAutoTxn` path — ONE internal auto-txn that logs the
+                // NameLN tombstone transactionally and commits SYNC, so a log
+                // error propagates (the former direct path discarded it with
+                // `let _ = log_name_ln_delete(..)`). The removal itself was
+                // already durable on the base (the tombstone was fsync'd), but
+                // the dropped error made a failed remove report Ok. A
+                // non-transactional env takes the direct path (`None`).
+                self.run_auto_commit_ddl(|auto| match auto {
+                    Some(t) => self.remove_database(Some(t), name),
+                    None => {
+                        // R-LIVEDDL-711: hold the NameLN WRITE lock for the op
+                        // (JE `DbTree.doRemoveDb` -> `lockNameLN` WRITE,
+                        // DbTree.java:952).
+                        self.with_name_record_lock(
+                            name,
+                            LockType::Write,
+                            /*non_blocking=*/ false,
+                            || {
+                                let mut databases = self.databases.lock();
+                                {
+                                    let env_impl = self.env_impl.lock();
+                                    env_impl
+                                        .remove_database(name)
+                                        .map_err(map_dbi_err(name))?;
+                                }
+                                databases.remove(name);
+                                Ok(())
+                            },
+                        )
+                    }
+                })
             }
             Some(txn) => {
                 // R-LIVEDDL-711: take the NameLN WRITE lock under `txn`, held
@@ -1567,22 +1610,32 @@ impl Environment {
 
         match txn {
             None => {
-                // R-LIVEDDL-711: hold the NameLN WRITE lock for the op so a
-                // concurrent transactional remove/rename/truncate of the same
-                // name (held in doubt by another txn) blocks/typed-conflicts
-                // (JE `DbTree.doTruncateDb` -> `lockNameLN` WRITE,
-                // DbTree.java:1282/952).
-                self.with_name_record_lock(
-                    name,
-                    LockType::Write,
-                    /*non_blocking=*/ false,
-                    || {
-                        let env_impl = self.env_impl.lock();
-                        env_impl
-                            .truncate_database(name)
-                            .map_err(map_dbi_err(name))
-                    },
-                )
+                // ENG-AUTODDL-2 (S2) + durability: run the auto-commit
+                // truncate through JE's `createAutoTxn` path — ONE internal
+                // auto-txn that deletes every record transactionally and
+                // commits SYNC, so the truncation is durable at return and a
+                // log error propagates (the former direct path logged lazy
+                // per-record DeleteLNs with `let _ = log_delete_ln(..)`). A
+                // non-transactional env takes the direct path (`None`).
+                self.run_auto_commit_ddl(|auto| match auto {
+                    Some(t) => self.truncate_database(Some(t), name),
+                    None => {
+                        // R-LIVEDDL-711: hold the NameLN WRITE lock for the op
+                        // (JE `DbTree.doTruncateDb` -> `lockNameLN` WRITE,
+                        // DbTree.java:1282/952).
+                        self.with_name_record_lock(
+                            name,
+                            LockType::Write,
+                            /*non_blocking=*/ false,
+                            || {
+                                let env_impl = self.env_impl.lock();
+                                env_impl
+                                    .truncate_database(name)
+                                    .map_err(map_dbi_err(name))
+                            },
+                        )
+                    }
+                })
             }
             Some(txn) => {
                 // R-LIVEDDL-711: take the NameLN WRITE lock under `txn`, held
@@ -1690,23 +1743,47 @@ impl Environment {
 
         match txn {
             None => {
-                // R-LIVEDDL-711: hold the NameLN WRITE lock for BOTH source
-                // and destination for the op, so a concurrent transactional
-                // rename/remove/truncate of either name (held in doubt by
-                // another txn) blocks/typed-conflicts (JE `DbTree.doRenameDb`
-                // -> `lockNameLN` WRITE on source + create WRITE on dest).
-                self.with_rename_record_locks(old_name, new_name, || {
-                    let mut databases = self.databases.lock();
-                    {
-                        let env_impl = self.env_impl.lock();
-                        env_impl
-                            .rename_database(old_name, new_name)
-                            .map_err(map_rename_err(old_name, new_name))?;
+                // ENG-AUTODDL-1/-2 (S1/S2): run the auto-commit rename through
+                // JE's `createAutoTxn` path — ONE internal auto-txn that logs
+                // both NameLN changes transactionally and commits at the env
+                // default durability (COMMIT_SYNC), so the rename is atomic,
+                // durable at return, and a log error propagates. The former
+                // direct `env_impl.rename_database` path logged the new-name
+                // NameLN lazily (flush=false/fsync=false) and discarded errors
+                // (`let _ = log_name_ln(..)`), losing the whole db on a crash
+                // after Ok. A non-transactional env has no auto-txn: `op` gets
+                // `None` and takes the direct (durable) path below.
+                self.run_auto_commit_ddl(|auto| match auto {
+                    Some(t) => {
+                        self.rename_database(Some(t), old_name, new_name)
                     }
-                    if let Some(handle) = databases.remove(old_name) {
-                        databases.insert(new_name.to_string(), handle);
+                    None => {
+                        // R-LIVEDDL-711: hold the NameLN WRITE lock for BOTH
+                        // source and destination for the op (JE
+                        // `DbTree.doRenameDb` -> `lockNameLN` WRITE on source +
+                        // create WRITE on dest).
+                        self.with_rename_record_locks(
+                            old_name,
+                            new_name,
+                            || {
+                                let mut databases = self.databases.lock();
+                                {
+                                    let env_impl = self.env_impl.lock();
+                                    env_impl
+                                        .rename_database(old_name, new_name)
+                                        .map_err(map_rename_err(
+                                            old_name, new_name,
+                                        ))?;
+                                }
+                                if let Some(handle) = databases.remove(old_name)
+                                {
+                                    databases
+                                        .insert(new_name.to_string(), handle);
+                                }
+                                Ok(())
+                            },
+                        )
                     }
-                    Ok(())
                 })
             }
             Some(txn) => {
@@ -1823,6 +1900,79 @@ impl Environment {
                     env.clear_pending_ddl(&old_owned);
                 });
                 Ok(())
+            }
+        }
+    }
+
+    /// ENG-AUTODDL (S1/S2/S3): run an auto-commit (`txn = None`) catalog DDL
+    /// as JE's `DbNameOperation.run()` does — through a single internal
+    /// auto-txn committed at the environment's default durability.
+    ///
+    /// JE `Environment.renameDatabase` / `removeDatabase` / `truncateDatabase`
+    /// / `openDatabase(txn=null)` build a `DbNameOperation(txn=null)` and call
+    /// `run()` → `getWritableLocker(false)`
+    /// (`Environment.java:1176-1243`). For a TRANSACTIONAL environment
+    /// `LockerFactory.getWritableLocker` returns `Txn.createAutoTxn(envImpl,
+    /// defaultTxnConfig, ...)` (`LockerFactory.java:72-83`): ONE auto-txn that
+    /// holds every NameLN / MapLN change and commits at the env default
+    /// durability (`config.getDurability()`, COMMIT_SYNC by default —
+    /// `Txn.java:324-356,625`). `runOnce`'s `finally
+    /// locker.operationEnd(success)` commits on success and aborts on failure
+    /// (`Environment.java:1225`), so the op is atomic, durable at return, and
+    /// any log-write error propagates. For a NON-transactional environment
+    /// `getWritableLocker` returns a `ThreadLocker` and the NameLN write is
+    /// non-transactional; `op` runs directly (there is no txn to open — the
+    /// direct `env_impl` path writes the NameLN with flush+fsync and
+    /// propagates its error).
+    ///
+    /// `op` receives the auto-txn (`Some`) for a transactional env, or `None`
+    /// for a non-transactional env, and must perform the DDL through the
+    /// corresponding arm.
+    fn run_auto_commit_ddl<T>(
+        &self,
+        op: impl FnOnce(Option<&Transaction>) -> Result<T>,
+    ) -> Result<T> {
+        if !self.config.transactional {
+            // Non-transactional env: JE's ThreadLocker path. No auto-txn to
+            // open; the direct `env_impl` path logs the NameLN durably and
+            // surfaces its error.
+            return op(None);
+        }
+        // Transactional env: JE `Txn.createAutoTxn` + `operationEnd(success)`.
+        //
+        // JE `DbNameOperation.run()` first takes `getWritableLocker(false)` =
+        // `autoTxnIsReplicated=false` (Environment.java:1204), so the
+        // auto-commit DDL txn is created with `ReplicationContext.NO_REPLICATE`
+        // (LockerFactory.java:77-82) and does NOT drive replica acknowledgement
+        // by default. Match that by forcing `ReplicaAckPolicy::None` on the
+        // auto-txn's durability so the commit does NOT consult the replica-ack
+        // coordinator for a DDL (DDL replay is not shipped in 7.11.x; routing a
+        // DDL through the coordinator would change DPL/open replication
+        // semantics -- dpl_rep_probe). The env's local sync policy is preserved
+        // (COMMIT_SYNC's fsync keeps the op durable at return).
+        //
+        // NOT `local_write`: on a replicated env a `local_write` txn is
+        // forbidden from writing a REPLICATED database, which would break a
+        // DDL on a replicated db (gap_replay_3). `ReplicaAckPolicy::None` alone
+        // suffices to keep the coordinator out of the commit.
+        let local_dur = crate::durability::Durability::new(
+            self.config.durability.local_sync,
+            self.config.durability.replica_sync,
+            crate::durability::ReplicaAckPolicy::None,
+        );
+        let auto_cfg = TransactionConfig::default().with_durability(local_dur);
+        let auto = self.begin_transaction(Some(&auto_cfg))?;
+        match op(Some(&auto)) {
+            Ok(v) => {
+                // operationEnd(true): commit at the local-only durability.
+                auto.commit_with_durability(local_dur)?;
+                Ok(v)
+            }
+            Err(e) => {
+                // operationEnd(false): abort, then propagate the original
+                // error (a best-effort abort failure must not mask it).
+                let _ = auto.abort();
+                Err(e)
             }
         }
     }

@@ -44,6 +44,12 @@ fn count_entries_by_type(dir: &std::path::Path) -> HashMap<LogEntryType, u64> {
     counts
 }
 
+/// Opens a fresh transactional env and creates the test database. NOTE: the
+/// create itself is an auto-commit (`txn = None`, `allow_create`) DDL, which
+/// since ENG-AUTODDL runs through an internal auto-txn and therefore writes
+/// exactly ONE `TxnCommit` frame of its own (JE `openDatabase(txn=null)` ->
+/// `createAutoTxn` -> commit). The tests below account for that one setup frame
+/// explicitly so they still measure the per-explicit-op frame delta.
 fn wired() -> (TempDir, Environment, noxu_db::Database) {
     let dir = TempDir::new().unwrap();
     let env = Environment::open(
@@ -77,10 +83,11 @@ fn explicit_commit_writes_exactly_one_txn_commit_frame() {
     let counts = count_entries_by_type(dir.path());
     assert_eq!(
         counts.get(&LogEntryType::TxnCommit).copied().unwrap_or(0),
-        1,
-        "exactly one TxnCommit frame must be written per explicit commit \
-         (got {:?}); a second frame means the inner Txn's own commit path \
-         is no longer suppressed by SUPPRESS_OWN_END_FRAME",
+        2,
+        "exactly one TxnCommit frame for the auto-commit create (ENG-AUTODDL) \
+         plus one for the explicit commit = 2 (got {:?}); more than that means \
+         the inner Txn's own commit path is no longer suppressed by \
+         SUPPRESS_OWN_END_FRAME",
         counts.get(&LogEntryType::TxnCommit)
     );
 }
@@ -128,8 +135,9 @@ fn commit_no_sync_does_not_pick_up_the_inner_txns_own_hardcoded_sync_fsync() {
     let counts = count_entries_by_type(dir.path());
     assert_eq!(
         counts.get(&LogEntryType::TxnCommit).copied().unwrap_or(0),
-        1,
-        "exactly one TxnCommit frame even under COMMIT_NO_SYNC (got {:?})",
+        2,
+        "the auto-commit create's TxnCommit plus exactly one for the explicit \
+         commit = 2 even under COMMIT_NO_SYNC (got {:?})",
         counts.get(&LogEntryType::TxnCommit)
     );
 }

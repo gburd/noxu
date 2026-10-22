@@ -3101,10 +3101,19 @@ impl EnvironmentImpl {
                 // Persist the name → id mapping to the WAL (only for new
                 // creations and writable environments) so that subsequent
                 // reopens can reconstruct name_map.
+                //
+                // ENG-AUTODDL-3 (S3): this path is the NON-transactional create
+                // (a transactional auto-commit create now runs through an
+                // internal auto-txn in `Environment::open_database`, which logs
+                // a transactional NameLN under a SYNC commit). JE's
+                // non-transactional create uses a ThreadLocker and the NameLN
+                // write is the durability point, so flush+fsync it here and
+                // PROPAGATE any log error (ENG-AUTODDL-2) rather than dropping
+                // it with `let _ =` and reporting Ok after ENOSPC/EIO.
                 if recovered_db_id.is_none()
                     && let Some(lm) = &self.log_manager
                 {
-                    let _ = Self::log_name_ln(
+                    Self::log_name_ln(
                         lm,
                         name,
                         db_id.id() as u64,
@@ -3118,7 +3127,8 @@ impl EnvironmentImpl {
                             .map(|c| c.identity.as_str()),
                         // NEW-5: persist the DB's effective fanout.
                         Some(config.node_max_entries),
-                    );
+                    )?;
+                    lm.flush_sync().map_err(DbiError::from)?;
                 }
             }
             // else: the name was rebound/removed by a concurrent committed op
@@ -3823,8 +3833,15 @@ impl EnvironmentImpl {
         // already logged under the user txn (NameLNTxn, before commit), so
         // `log_tombstone` is false here and the commit's own SYNC made it
         // durable — no stopgap per-op fsync.
+        //
+        // ENG-AUTODDL-2 (S2): propagate a log-write error instead of dropping
+        // it (`let _ =`); a remove that fails to log its tombstone must NOT
+        // report Ok. `log_name_ln_delete` already flush+fsyncs the tombstone
+        // (the auto-commit durability point). This `log_tombstone` branch is
+        // reached only by the NON-transactional auto-commit path now (a
+        // transactional remove logs a NameLNTxn under the user txn).
         if log_tombstone && let Some(lm) = &self.log_manager {
-            let _ = Self::log_name_ln_delete(lm, name);
+            Self::log_name_ln_delete(lm, name)?;
         }
         self.name_map.write().remove(name);
         // NEW-REC-1: the name is no longer live, so the close/checkpoint
@@ -3941,16 +3958,28 @@ impl EnvironmentImpl {
         // were already logged under the user txn before commit
         // (`log_rename_name_ln_txn`), so `log_names` is false here and the
         // commit's own SYNC made them durable.
+        //
+        // ENG-AUTODDL-1/-2 (S1/S2): this `log_names` branch is now reached only
+        // by the NON-transactional auto-commit rename (a transactional env
+        // routes auto-commit DDL through an internal auto-txn). There is no
+        // transactional atomicity primitive in a non-transactional env, so
+        // write the new-name create NameLN FIRST (durable) and the old-name
+        // tombstone SECOND (durable): a crash between the two then leaves BOTH
+        // names resolving to the db (recoverable), never the whole db lost (as
+        // the old tombstone-first order did). Both writes flush+fsync and any
+        // error PROPAGATES (no `let _ =` — a rename that fails to log must not
+        // report Ok).
         if log_names && let Some(lm) = &self.log_manager {
-            let _ = Self::log_name_ln_delete(lm, old_name);
-            let _ = Self::log_name_ln(
+            Self::log_name_ln(
                 lm,
                 new_name,
                 db_id.id() as u64,
                 btree_id.as_deref(),
                 dup_id.as_deref(),
                 fanout,
-            );
+            )?;
+            lm.flush_sync().map_err(DbiError::from)?;
+            Self::log_name_ln_delete(lm, old_name)?;
         }
 
         self.name_map.write().remove(old_name);
@@ -4028,6 +4057,13 @@ impl EnvironmentImpl {
             // non-transactional deletes are replayed after the original
             // committed inserts, resulting in an empty tree.  Without
             // this WAL fence the truncation is invisible after reopen.
+            //
+            // ENG-AUTODDL-1/-2 (S1/S2): this path is the NON-transactional
+            // auto-commit truncate now (a transactional env routes auto-commit
+            // DDL through an internal auto-txn whose SYNC commit covers the
+            // transactional DeleteLNs). PROPAGATE a log-write error instead of
+            // dropping it (`let _ =`), and flush+fsync after the fence so the
+            // truncation is durable at return (JE auto-commit SYNC).
             if let Some(lm) = &self.log_manager
                 && let Some(tree) = db_guard.get_real_tree()
             {
@@ -4040,15 +4076,16 @@ impl EnvironmentImpl {
                             if let Some(full_key) = bin.get_full_key(idx)
                                 && !full_key.is_empty()
                             {
-                                let _ = Self::log_delete_ln(
+                                Self::log_delete_ln(
                                     lm,
                                     db_id.id() as u64,
                                     &full_key,
-                                );
+                                )?;
                             }
                         }
                     }
                 }
+                lm.flush_sync().map_err(DbiError::from)?;
             }
 
             // Replace the real tree with a fresh empty tree, preserving config.
@@ -5686,14 +5723,31 @@ fn relog_live_catalog_impl(
                     } else {
                         recovered_fanouts.read().get(name).copied()
                     };
-                let _ = EnvironmentImpl::log_name_ln(
+                // ENG-AUTODDL-2 audit: the catalog relog is a Noxu-specific
+                // durability BACKSTOP (REC-CAT), not a JE mechanism — JE
+                // recovers the catalog from the checkpointed mapping tree, it
+                // never re-logs a free-floating live NameLN. The authoritative
+                // NameLN for this live db is ALREADY durable from its original
+                // (transactional or auto-commit SYNC) write; this re-log only
+                // keeps the catalog recoverable after a forced cleaning. A
+                // failed re-log append (e.g. ENOSPC) is therefore non-fatal and
+                // must NOT abort the checkpoint or a user op (JE retries the
+                // checkpoint; it does not surface the error to the application).
+                // The relog callback is a `Fn()` with no error channel; log the
+                // failure for operability rather than dropping it silently.
+                if let Err(e) = EnvironmentImpl::log_name_ln(
                     lm,
                     name,
                     db_id.id() as u64,
                     btree_id.as_deref(),
                     dup_id.as_deref(),
                     fanout,
-                );
+                ) {
+                    log::warn!(
+                        "catalog relog: failed to re-log NameLN for {name:?} \
+                         (non-fatal; original NameLN is already durable): {e}"
+                    );
+                }
             }
             continue;
         }
@@ -5764,14 +5818,23 @@ fn relog_live_catalog_impl(
                 recovered_fanouts.read().get(name).copied()
             };
 
-            let _ = EnvironmentImpl::log_name_ln(
+            // ENG-AUTODDL-2 audit: Noxu-specific catalog relog BACKSTOP (see
+            // the sibling site above). The authoritative NameLN is already
+            // durable; a failed re-log is non-fatal and the `Fn()` callback has
+            // no error channel, so log it rather than drop it silently.
+            if let Err(e) = EnvironmentImpl::log_name_ln(
                 lm,
                 name,
                 db_id.id() as u64,
                 btree_id.as_deref(),
                 dup_id.as_deref(),
                 fanout,
-            );
+            ) {
+                log::warn!(
+                    "catalog relog: failed to re-log NameLN for {name:?} \
+                     (non-fatal; original NameLN is already durable): {e}"
+                );
+            }
         };
         relog_one();
         // Release the throwaway relog READ lock on this name (every exit path
