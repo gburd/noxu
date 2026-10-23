@@ -25,6 +25,28 @@ Stable-foundational crates (`cargo-semver-checks`: 9/9 "no semver update
 required"). Two **additive, patch-safe** inherent methods are added on
 `Environment` (see *Added*).
 
+### Fixed
+
+- **A committed `truncate_database` could resurrect deleted records after a
+  crash** (ENG-FSYNCDROP-RESURRECT-1, S1). When a database's records were
+  checkpointed *deleted* by an earlier **uncommitted** (later aborted or
+  crashed) delete of the same records, and the database was then truncated by a
+  committed transaction, a crash before the next checkpoint could leave recovery
+  replaying the committed truncate's per-record `DeleteLN` as a no-op over the
+  already-deleted slot without advancing its LSN. The subsequent undo of the
+  earlier uncommitted delete then matched the slot by its stale LSN and reverted
+  it to the committed before-image, resurrecting a record the committed truncate
+  had removed (the truncated database reappeared non-empty). The redo of a
+  committed delete over an already-deleted slot now advances the slot LSN,
+  mirroring JE `RecoveryManager.redo` → `IN.recoverRecord` for the
+  `lsnCmp > 0` case (`RecoveryManager.java:2545-2600`, `IN.java:3836`), so the
+  earlier undo no longer matches and the committed deletion stands. This is a
+  **recovery-only** fix: no on-disk format change, no public API change, no
+  change to any live (non-recovery) write path. Root cause is Noxu's documented
+  same-id truncate (deviation F1 vs JE's new-`DatabaseId` `DbTree.doTruncateDb`);
+  a crashed-but-never-reopened v7.11.0/.1 environment now recovers correctly
+  under v7.11.2. See the advisory below for the already-reopened case.
+
 ### Changed (behaviour — JE fidelity)
 
 - **Non-transactional databases no longer fsync on every write**
@@ -117,6 +139,52 @@ required"). Two **additive, patch-safe** inherent methods are added on
 > `Database::put`). Cursor writes on a non-transactional database are
 > unaffected.
 
+>
+> **Resurrected-truncate recovery defect (ENG-FSYNCDROP-RESURRECT-1, S1).** On
+> v7.11.0 / v7.11.1, a committed `truncate_database` whose pre-truncate records
+> were checkpointed deleted while an earlier **uncommitted** (later aborted or
+> crashed) delete of the same records was in flight could resurrect those
+> records after a crash — the truncated database reappears non-empty. The
+> exposure window is precise: **(a)** a committed delete (or delete of all keys)
+> of a set of records in a database that was NOT committed and whose
+> *known-deleted / pending-deleted* slots were frozen into a checkpoint; then
+> **(b)** that uncommitted delete aborts or its process crashes; then **(c)** a
+> **committed** `truncate_database` of the *same* database (Noxu truncate reuses
+> the database id and logs a per-record `DeleteLN` for each key); then **(d)** a
+> crash before the next checkpoint, with a transaction still active so recovery
+> runs its undo pass. The write-ahead log is NOT corrupted — this is a
+> recovery-time defect.
+>
+> Two cases, with different remedies:
+>
+> 1. **Crashed under 7.11.0 / 7.11.1 and NOT reopened since.** Upgrading to
+>    7.11.2 and recovering the environment recovers it **correctly** — the
+>    resurrected records do not appear. No dump/reload is required.
+>
+> 2. **Already reopened read-write (and checkpointed) under 7.11.0 / 7.11.1
+>    after such a crash.** The buggy recovery resurrected the records in memory,
+>    and the subsequent checkpoint **persisted** them: the committed truncate's
+>    `DeleteLN`s now lie *before* the new checkpoint boundary, so 7.11.2's
+>    recovery no longer replays them. **The resurrected records can be durable,
+>    and upgrading to 7.11.2 does NOT remove them.** `Environment::verify` does
+>    **not** detect this condition — the resurrected records are structurally
+>    valid B-tree entries, so a structural verify passes clean. **Remedy:**
+>    restore from a backup taken *before* the crash, or audit the affected
+>    (truncated) databases against the application's own record of what should
+>    be present and delete the resurrected keys. There is no in-place automatic
+>    repair in 7.11.2.
+>
+>    *Forensic signature (while the pre-truncate log files still exist).* A
+>    durable resurrection leaves a detectable invariant violation: a **live**
+>    slot for a key whose LSN is **older** than a **committed** `DeleteLN` for
+>    that same key in the same database id (the truncate's delete). Because
+>    Noxu's same-id truncate writes no durable truncate marker, this can only be
+>    detected by scanning the log for each database id's committed `DeleteLN`s
+>    and flagging any live slot whose LSN precedes a committed delete of its key;
+>    once the cleaner reclaims the pre-truncate log files the committed
+>    `DeleteLN`s are gone and the signature is lost. A detector along these lines
+>    is recommended as a follow-up for v8 / a future 7.11.3 (not shipped in
+>    7.11.2).
 
 ## [7.11.1] - 2026-10-20
 
