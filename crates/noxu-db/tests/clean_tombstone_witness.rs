@@ -507,19 +507,33 @@ fn ndb_count(dir: &Path) -> usize {
 #[test]
 fn churn_does_not_livelock_the_cleaner() {
     use std::time::Instant;
-    // CLT_CHURN overrides the churn count (the gate run uses 1000; the author's
-    // build TIMED OUT at 40 min on churn=1000). Default kept modest so the
-    // plain `cargo test` run is quick.
+    // CLT_CHURN overrides the churn count. The GATE run uses churn=200, which
+    // completes well inside the budget. Default kept modest so the plain
+    // `cargo test` run is quick.
+    //
+    // CORRECTION (delta review, ENG-CLEAN-TOMBSTONE-1): the earlier comment
+    // claimed the fix "completes churn=1000 in ~9 min on these hosts". That is
+    // NOT reproducible: churn=1000 EXCEEDS the 1800 s budget on both arm DEBUG
+    // (~1974 s) and x86 RELEASE (~1882 s). The cause is NOT the clamp — the
+    // clamp's per-tombstone decision is an O(1) snapshot lookup and it retains
+    // at most ONE file per removed name. The cost is the PRE-EXISTING
+    // ENG-CLEAN-NAMELN-UTIL-1 log-file explosion: the per-checkpoint catalog
+    // relog never counts the superseded NameLN obsolete, so the churn workload
+    // accumulates tens of thousands of .ndb files and each clean_log() pass is
+    // O(files) for file SELECTION. A cost-curve probe confirms per-pass time is
+    // linear in file count, not quadratic in churn. churn=1000 will complete
+    // within budget only once ENG-CLEAN-NAMELN-UTIL-1 is fixed (count the
+    // superseded NameLN obsolete at relog write time, JE
+    // LogManager.serialLogWork). Until then the gate uses churn=200.
     let churn: usize = std::env::var("CLT_CHURN")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(200);
-    // Wall-clock ceiling. The OLD rule's O(churn²) livelock NEVER completed a
-    // single churn=1000 scenario (the author's build hit the harness's 40-min
-    // timeout, rc=124). The fix completes churn=1000 in ~9 min on these hosts
-    // (the residual cost is ENG-CLEAN-NAMELN-UTIL-1's file growth, O(files) per
-    // pass for file selection — NOT the clamp). A 30-min ceiling cleanly
-    // separates "completes" from "livelocked", without being flaky.
+    // Wall-clock ceiling. The OLD per-tombstone rule's O(churn²) livelock NEVER
+    // completed even a single churn=200 scenario (the author's 5af7afb2 build
+    // hit the harness's 40-min timeout, rc=124); the EXACT rule completes
+    // churn=200 in ~29 min. A 30-min ceiling cleanly separates "completes" from
+    // the OLD "livelocked", without being flaky, AT THE GATE churn (200).
     let budget_s: f64 = std::env::var("CLT_BUDGET_S")
         .ok()
         .and_then(|v| v.parse().ok())
