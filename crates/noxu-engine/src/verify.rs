@@ -289,7 +289,20 @@ pub fn verify_tree(
     };
 
     let mut records: u64 = 0;
-    verify_node(&root, None, db_name, config, &mut result, &mut records);
+    // JE DatabaseImpl.getKeyComparator(): the ordering used for the
+    // intra-BIN key-order check (verifyOrderedKeys).  When a custom
+    // comparator is configured we cannot reproduce it from the verifier
+    // walk, so that unsigned-byte check is skipped to avoid false positives.
+    let has_comparator = tree.get_comparator().is_some();
+    verify_node(
+        &root,
+        None,
+        db_name,
+        config,
+        has_comparator,
+        &mut result,
+        &mut records,
+    );
     result.records_verified = records;
     result.databases_verified = 1;
     result
@@ -301,6 +314,7 @@ fn verify_node(
     parent_key: Option<&[u8]>,
     db_name: &str,
     config: &VerifyConfig,
+    has_comparator: bool,
     result: &mut VerifyResult,
     records: &mut u64,
 ) {
@@ -309,12 +323,24 @@ fn verify_node(
     match &*guard {
         TreeNode::Internal(in_node) => {
             verify_internal_node(
-                in_node, parent_key, db_name, config, result, records,
+                in_node,
+                parent_key,
+                db_name,
+                config,
+                has_comparator,
+                result,
+                records,
             );
         }
         TreeNode::Bottom(bin_stub) => {
             verify_bin_stub(
-                bin_stub, parent_key, db_name, config, result, records,
+                bin_stub,
+                parent_key,
+                db_name,
+                config,
+                has_comparator,
+                result,
+                records,
             );
         }
     }
@@ -329,6 +355,7 @@ fn verify_internal_node(
     _parent_key: Option<&[u8]>,
     db_name: &str,
     config: &VerifyConfig,
+    has_comparator: bool,
     result: &mut VerifyResult,
     records: &mut u64,
 ) {
@@ -369,6 +396,7 @@ fn verify_internal_node(
             expected_parent_key,
             db_name,
             config,
+            has_comparator,
             result,
             records,
         );
@@ -389,6 +417,7 @@ fn verify_bin_stub(
     parent_key: Option<&[u8]>,
     db_name: &str,
     config: &VerifyConfig,
+    has_comparator: bool,
     result: &mut VerifyResult,
     records: &mut u64,
 ) {
@@ -407,6 +436,45 @@ fn verify_bin_stub(
                             bin.node_id, first_key, pk
                         ),
                     });
+        }
+    }
+
+    // Intra-BIN key order (JE BtreeVerifier.verifyOrderedKeys /
+    // verifyOrderedKeysInternal, BtreeVerifier.java:485-505): for each slot
+    // i >= 1, the full key must be strictly greater than the previous slot's
+    // (keys are unique and ascending).  key[i] <= key[i-1] is a corruption
+    // (e.g. a double-prefixed key mangled by a learned-prefix + insert_raw,
+    // ENG-DISKFULL-AUTOPUT-1, which sorts out of order against its 4-byte
+    // neighbours).  A custom comparator cannot be reproduced from the walk,
+    // so the unsigned-byte check is skipped (has_comparator) to avoid false
+    // positives.
+    if !has_comparator && bin.entries.len() >= 2 {
+        for i in 1..bin.entries.len() {
+            let (Some(cur), Some(prev)) =
+                (bin.get_full_key(i), bin.get_full_key(i - 1))
+            else {
+                continue;
+            };
+            if cur.as_slice() <= prev.as_slice() {
+                let ident = bin.get_full_key(0).unwrap_or_default();
+                result.add_error(VerifyError::BtreeError {
+                    db_name: db_name.to_string(),
+                    description: format!(
+                        "BIN (id={}) keys are out of order at slot {} \
+                         (key[{}] <= key[{}]); identifier key {:?}",
+                        bin.node_id,
+                        i,
+                        i,
+                        i - 1,
+                        ident
+                    ),
+                });
+                if result.error_count() >= config.max_errors as usize {
+                    return;
+                }
+                // One report per BIN is enough (JE returns the first index).
+                break;
+            }
         }
     }
 
@@ -750,36 +818,14 @@ mod tests {
             vec![0x00, 0x00],
         )));
         let res = verify_tree(&mangled_tree, "delta", &cfg);
-        // DETECTABILITY ON 7.11.x: this base's verify_bin_stub has the
-        // parent-routing-key bound check but NOT the intra-BIN key-order check
-        // (JE BtreeVerifier.verifyOrderedKeys, BtreeVerifier.java:485-505) that
-        // integrate/v8 carries.  So a mangled key in a ROOT BIN (no parent) is
-        // NOT flagged by the structural walk here -- documented gap.  The root
-        // fix PREVENTS the mangle; closing the DETECTION gap on 7.11.x means
-        // backporting verifyOrderedKeys (tracked in autoput-fix.md advisory,
-        // separate from this fix).
+        // With verifyOrderedKeys backported to 7.11.x, the intra-BIN key-order
+        // check now flags the mangled key (JE BtreeVerifier.verifyOrderedKeys):
+        // 00 00 00 00 01 6c sorts before its 4-byte neighbours 00 00 01 XX.
         assert!(
-            res.is_passed(),
-            "7.11.x lacks verifyOrderedKeys, so a root-BIN mangle is not flagged \
-             by the structural walk (documents the detection gap)"
+            !res.is_passed(),
+            "verifier MUST flag the out-of-order mangled key (verifyOrderedKeys)"
         );
-
-        // But the check 7.11.x DOES have (parent-routing-key bound) WOULD catch
-        // a mangled key that is the FIRST slot of a NON-root BIN: a mangled key
-        // (00 00 00 00 01 6c) sorts strictly before the real neighbour keys
-        // (00 00 01 XX) that a parent routing entry would carry, so
-        // first_key < parent_key fires.  Pin that ordering fact directly.
-        let mangled_full = {
-            let mut v = vec![0x00u8, 0x00];
-            v.extend_from_slice(&[0x00, 0x00, 0x01, 0x6c]);
-            v
-        };
-        let real_neighbour = vec![0x00u8, 0x00, 0x01, 0x39];
-        assert!(
-            mangled_full.as_slice() < real_neighbour.as_slice(),
-            "mangled key must sort before the real routing key (parent-bound \
-             check would flag it in a non-root BIN)"
-        );
+        assert!(res.error_count() >= 1, "expected a BtreeError");
     }
 
     #[test]
