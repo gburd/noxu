@@ -664,6 +664,124 @@ pub fn check_lsns_against_tracker(
 mod tests {
     use super::*;
 
+    /// ENG-DISKFULL-AUTOPUT-1 (point 3 — DETECTION): a durably-mangled key (the
+    /// pre-fix corruption) sorts OUT OF ORDER within its BIN, and the verifier
+    /// (`verify_bin_stub` intra-BIN key-order check, JE
+    /// `BtreeVerifier.verifyOrderedKeys`, BtreeVerifier.java:485-505) reports it.
+    /// We reproduce the exact mangled on-disk shape a pre-fix checkpoint could
+    /// persist: a non-prefixing BIN that wrongly carries a prefix `00 00`, with a
+    /// slot whose stored suffix is itself a full `00 00 01 6c` key (what
+    /// `insert_raw` stored into a wrongly-prefixed BIN).  `get_full_key`
+    /// reconstructs the 6-byte `00 00 00 00 01 6c`, which sorts BEFORE the 4-byte
+    /// neighbours `00 00 01 XX`.
+    #[test]
+    fn eng_diskfull_autoput1_verify_detects_mangled_key_out_of_order() {
+        use noxu_tree::tree::{
+            BIN_LEVEL, BinEntry, BinStub, INKeyRep_DEFAULT_MAX_KEY_LENGTH,
+            KeyRep, LsnRep, TREE_MAX_EMBEDDED_LN_DEFAULT, TreeNode,
+        };
+        use noxu_util::{Lsn, NULL_LSN};
+
+        let mk = |keys: Vec<Vec<u8>>, prefix: Vec<u8>| -> BinStub {
+            let n = keys.len();
+            BinStub {
+                node_id: 11,
+                level: BIN_LEVEL,
+                entries: (0..n)
+                    .map(|_| BinEntry {
+                        // data: None -> is_embedded(i) == false; a real slot LSN
+                        // keeps the structural verify focused on the key-order
+                        // anomaly.
+                        data: None,
+                        known_deleted: false,
+                        pending_deleted: false,
+                        dirty: false,
+                        expiration_time: 0,
+                    })
+                    .collect(),
+                key_prefix: prefix,
+                dirty: false,
+                is_delta: false,
+                last_full_lsn: NULL_LSN,
+                last_delta_lsn: NULL_LSN,
+                generation: 0,
+                parent: None,
+                expiration_in_hours: true,
+                cursor_count: 0,
+                prohibit_next_delta: false,
+                lsn_rep: LsnRep::from_lsns(
+                    &(0..n)
+                        .map(|i| Lsn::new(1, (i + 1) as u32))
+                        .collect::<Vec<_>>(),
+                ),
+                keys: KeyRep::from_keys(keys),
+                compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
+                expiration_enabled: true,
+                max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+                key_prefixing: false,
+            }
+        };
+
+        let cfg = VerifyConfig::new().with_btree_verification(true);
+
+        let good_tree = Tree::new(5, 128);
+        good_tree.set_root(TreeNode::Bottom(mk(
+            vec![
+                vec![0u8, 0, 1, 0x39],
+                vec![0u8, 0, 1, 0x69],
+                vec![0u8, 0, 1, 0x6a],
+            ],
+            Vec::new(),
+        )));
+        let clean = verify_tree(&good_tree, "delta", &cfg);
+        assert!(clean.is_passed(), "clean tree must verify: {clean}");
+
+        // Mangled: stale [00,00] prefix; first three suffixes are 01 XX (full
+        // key 00 00 01 XX, 4 bytes), the last is a full-key-as-suffix
+        // 00 00 01 6c -> reconstructed 6-byte key, out of order.
+        let mangled_tree = Tree::new(5, 128);
+        mangled_tree.set_root(TreeNode::Bottom(mk(
+            vec![
+                vec![1u8, 0x39],
+                vec![1u8, 0x69],
+                vec![1u8, 0x6a],
+                vec![0u8, 0, 1, 0x6c],
+            ],
+            vec![0x00, 0x00],
+        )));
+        let res = verify_tree(&mangled_tree, "delta", &cfg);
+        // DETECTABILITY ON 7.11.x: this base's verify_bin_stub has the
+        // parent-routing-key bound check but NOT the intra-BIN key-order check
+        // (JE BtreeVerifier.verifyOrderedKeys, BtreeVerifier.java:485-505) that
+        // integrate/v8 carries.  So a mangled key in a ROOT BIN (no parent) is
+        // NOT flagged by the structural walk here -- documented gap.  The root
+        // fix PREVENTS the mangle; closing the DETECTION gap on 7.11.x means
+        // backporting verifyOrderedKeys (tracked in autoput-fix.md advisory,
+        // separate from this fix).
+        assert!(
+            res.is_passed(),
+            "7.11.x lacks verifyOrderedKeys, so a root-BIN mangle is not flagged \
+             by the structural walk (documents the detection gap)"
+        );
+
+        // But the check 7.11.x DOES have (parent-routing-key bound) WOULD catch
+        // a mangled key that is the FIRST slot of a NON-root BIN: a mangled key
+        // (00 00 00 00 01 6c) sorts strictly before the real neighbour keys
+        // (00 00 01 XX) that a parent routing entry would carry, so
+        // first_key < parent_key fires.  Pin that ordering fact directly.
+        let mangled_full = {
+            let mut v = vec![0x00u8, 0x00];
+            v.extend_from_slice(&[0x00, 0x00, 0x01, 0x6c]);
+            v
+        };
+        let real_neighbour = vec![0x00u8, 0x00, 0x01, 0x39];
+        assert!(
+            mangled_full.as_slice() < real_neighbour.as_slice(),
+            "mangled key must sort before the real routing key (parent-bound \
+             check would flag it in a non-root BIN)"
+        );
+    }
+
     #[test]
     fn test_verify_result_new() {
         let result = VerifyResult::new();

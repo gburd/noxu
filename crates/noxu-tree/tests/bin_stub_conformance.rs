@@ -161,6 +161,8 @@ fn empty_stub() -> BinStub {
             noxu_tree::tree::INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         expiration_enabled: true,
         max_embedded_ln: noxu_tree::TREE_MAX_EMBEDDED_LN_DEFAULT,
+        // Conformance fixture vs the prefix-computing BinOracle: prefixing db.
+        key_prefixing: true,
     }
 }
 

@@ -1348,6 +1348,21 @@ pub struct BinStub {
     /// A BIN built without a tree (e.g. `deserialize_full`) uses this default,
     /// which is only consulted when the BIN is (re-)serialised.
     pub max_embedded_ln: i32,
+
+    /// Whether key-prefix compression is enabled for this BIN (copied from the
+    /// owning `Tree`'s `key_prefixing` at construction / install, mirroring how
+    /// JE `IN` reaches `databaseImpl.getKeyPrefixing()`).  When `false`,
+    /// [`Self::compute_key_prefix`] returns an EMPTY prefix unconditionally --
+    /// JE `IN.computeKeyPrefix` returns `null` when
+    /// `!databaseImpl.getKeyPrefixing()` (IN.java:1625) -- so a non-prefixing
+    /// BIN never learns a prefix on ANY path (insert, split, merge, delta
+    /// reconstitution, fetch/refault, recovery redo).  The full-key insert
+    /// path (`insert_raw`) assumes an empty prefix; a learned prefix would
+    /// re-prefix later full-key inserts and silently mangle keys.  Default
+    /// `false` (JE `KEY_PREFIXING_DEFAULT`); a BIN deserialized without a tree
+    /// comes back non-prefixing and the installing boundary re-stamps it from
+    /// the real tree flag before any recompute.
+    pub key_prefixing: bool,
 }
 
 /// Entry in a BIN node.
@@ -1870,6 +1885,17 @@ impl BinStub {
     ///
     /// `IN.computeKeyPrefix(int excludeIdx)`.
     pub fn compute_key_prefix(&self, exclude_idx: Option<usize>) -> Vec<u8> {
+        // JE `IN.computeKeyPrefix` returns `null` (no prefix) when
+        // `!databaseImpl.getKeyPrefixing()` (IN.java:1625).  A non-prefixing
+        // BIN must NEVER learn a prefix: the full-key insert path
+        // (`insert_raw`) stores keys verbatim and assumes an empty prefix, so a
+        // learned prefix re-prefixes later inserts and mangles keys
+        // (ENG-DISKFULL-AUTOPUT-1).  Guard here at the single source so every
+        // caller (split, merge, compress, delta reconstitution, fetch/refault,
+        // recovery redo) is covered, not only the ones that remembered to gate.
+        if !self.key_prefixing {
+            return Vec::new();
+        }
         // Need at least 2 entries to find a common prefix.
         let n = self.keys.len();
         if n < 2 {
@@ -2784,6 +2810,7 @@ impl BinStub {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         };
         // Recompute key prefix from the full keys just loaded.
         // `IN.recalcKeyPrefix()` called after materializing from log.
@@ -4821,6 +4848,7 @@ impl Tree {
                     compact_max_key_length: self.compact_max_key_length,
                     expiration_enabled: self.expiration_enabled,
                     max_embedded_ln: self.max_embedded_ln,
+                    key_prefixing: self.key_prefixing,
                 })));
 
                 // Upper IN at level 2; slot 0 uses an empty key (virtual root key).
@@ -4977,6 +5005,7 @@ impl Tree {
                     compact_max_key_length: self.compact_max_key_length,
                     expiration_enabled: self.expiration_enabled,
                     max_embedded_ln: self.max_embedded_ln,
+                    key_prefixing: self.key_prefixing,
                 })));
 
                 let root_arc =
@@ -5315,6 +5344,14 @@ impl Tree {
             TreeNode::Bottom(b) => b.max_embedded_ln,
             TreeNode::Internal(_) => TREE_MAX_EMBEDDED_LN_DEFAULT,
         };
+        // Inherit the splitting BIN's key-prefixing policy so the right
+        // half never learns a prefix on a non-prefixing db (ENG-DISKFULL-
+        // AUTOPUT-1; JE IN carries databaseImpl, computeKeyPrefix gated on
+        // getKeyPrefixing()).
+        let bin_key_prefixing: bool = match &*child_guard {
+            TreeNode::Bottom(b) => b.key_prefixing,
+            TreeNode::Internal(_) => false,
+        };
         let (all_entries, bin_old_prefix) = match &*child_guard {
             TreeNode::Internal(n) => {
                 // T-4: capture the parallel resident-child array alongside the
@@ -5530,6 +5567,7 @@ impl Tree {
                     compact_max_key_length: bin_compact_max_key_length,
                     expiration_enabled: bin_expiration_enabled,
                     max_embedded_ln: bin_max_embedded_ln,
+                    key_prefixing: bin_key_prefixing,
                 };
                 // St-H6 debug guard: the sibling must carry the same flag as
                 // the splitting BIN so that in_hours-resolution entries are
@@ -9792,21 +9830,17 @@ impl Tree {
                     // cold-LN-fault read path.  The fetched-from LSN IS this
                     // BIN's durable full-BIN version, so stamp it here.
                     bin.last_full_lsn = log_lsn;
-                    // `deserialize_bin` always recomputes a key prefix from
-                    // the loaded keys.  When this tree has key-prefixing
-                    // DISABLED, the insert/redo paths use the full-key
-                    // (`insert_raw`) representation and assume an EMPTY prefix
-                    // (see `BinStub::insert_raw`); a fetched BIN carrying a
-                    // non-empty computed prefix would then corrupt any later
-                    // full-key insert (the stored full key would be treated as
-                    // a suffix and re-prefixed on read).  Re-expand to an
-                    // empty prefix here to keep the invariant that
-                    // key_prefixing=false BINs have no prefix.  (JE ties the
-                    // prefix to `DatabaseImpl.getKeyPrefixing()`; Noxu enforces
-                    // it at the fetch boundary.)
-                    if !self.key_prefixing && !bin.key_prefix.is_empty() {
-                        bin.apply_new_prefix(Vec::new());
-                    }
+                    // ENG-DISKFULL-AUTOPUT-1: JE `IN.postFetchInit(db, ...)`
+                    // gives the fetched node its databaseImpl, so
+                    // `computeKeyPrefix` thereafter reads `db.getKeyPrefixing()`
+                    // (IN.java:1625).  Noxu stores full keys and recomputes on
+                    // load, so stamp this tree's key-prefixing policy onto the
+                    // fetched BIN and recompute: a prefixing tree re-learns the
+                    // compressed prefix, a non-prefixing tree keeps the EMPTY
+                    // prefix the full-key insert path (`insert_raw`) requires.
+                    // `recompute_key_prefix` self-gates on `bin.key_prefixing`.
+                    bin.key_prefixing = self.key_prefixing;
+                    bin.recompute_key_prefix();
                     TreeNode::Bottom(bin)
                 })
             }
@@ -9911,6 +9945,12 @@ impl Tree {
                 if !bin.key_prefix.is_empty() {
                     bin.apply_new_prefix(Vec::new());
                 }
+                // ENG-DISKFULL-AUTOPUT-1: stamp this tree's key-prefixing
+                // policy before applying deltas so `insert_with_prefix` learns
+                // the compressed prefix on a prefixing tree and keeps the EMPTY
+                // prefix the full-key path requires on a non-prefixing one
+                // (`compute_key_prefix` self-gates on `bin.key_prefixing`).
+                bin.key_prefixing = self.key_prefixing;
                 for delta_bytes in deltas.iter().rev() {
                     let entries = Self::parse_delta_entries(delta_bytes)?;
                     for (
@@ -9956,11 +9996,9 @@ impl Tree {
                 // evictor's `detach_node_by_id` never-logged guard can later
                 // evict it (same leak fix as the full-BIN branch above).
                 bin.last_full_lsn = base_full_lsn;
-                if self.key_prefixing {
-                    bin.recompute_key_prefix();
-                } else if !bin.key_prefix.is_empty() {
-                    bin.apply_new_prefix(Vec::new());
-                }
+                // `recompute_key_prefix` self-gates: empty on a non-prefixing
+                // BIN, the common prefix on a prefixing one.
+                bin.recompute_key_prefix();
                 Some(TreeNode::Bottom(bin))
             }
             _ => {
@@ -12150,9 +12188,22 @@ impl Tree {
         node_data: &[u8],
     ) -> InRedoResult {
         if is_bin {
-            let Some(bin) = Self::deserialize_bin(node_data) else {
+            let Some(mut bin) = Self::deserialize_bin(node_data) else {
                 return InRedoResult::DeserializeFailed;
             };
+            // ENG-DISKFULL-AUTOPUT-1 (S1): a BIN deserialized without a tree
+            // comes back non-prefixing (JE default) with full keys.  Stamp
+            // this tree's key-prefixing policy and recompute, exactly as the
+            // lazy-fetch boundary does: a prefixing tree re-learns the
+            // compressed prefix, a non-prefixing tree keeps the EMPTY prefix
+            // the full-key redo path (`insert_raw`) requires -- otherwise a
+            // learned prefix stores the logged full key as a SUFFIX and
+            // `get_full_key` re-prefixes it into an unreachable key, silently
+            // losing an acked post-checkpoint record.  `recompute_key_prefix`
+            // self-gates on `bin.key_prefixing` (JE `IN.computeKeyPrefix`
+            // returns null when `!getKeyPrefixing()`, IN.java:1625).
+            bin.key_prefixing = self.key_prefixing;
+            bin.recompute_key_prefix();
             if is_root {
                 self.recover_root_bin(log_lsn, bin)
             } else {
@@ -12542,6 +12593,7 @@ mod tests {
                 compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
                 expiration_enabled: true,
                 max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+                key_prefixing: false,
             }
         }
         // Build a one-slot BIN with a KNOWN-deleted slot the new way.
@@ -13163,6 +13215,8 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            // Prefix-machinery fixture: models a key_prefixing=true db.
+            key_prefixing: true,
         }
     }
 
@@ -13455,6 +13509,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         });
         assert!(bin.is_bin());
         assert_eq!(bin.level(), BIN_LEVEL);
@@ -13508,6 +13563,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         });
 
         // Search for existing key
@@ -14022,6 +14078,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         });
         tree.set_root(bin);
         assert!(tree.get_root().is_some());
@@ -14298,6 +14355,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         }
     }
 
@@ -14536,6 +14594,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         });
         assert!(!bin_node.is_dirty());
         bin_node.set_dirty(true);
@@ -14581,6 +14640,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         });
         assert_eq!(bin_node.get_generation(), 0);
         bin_node.set_generation(42);
@@ -14639,6 +14699,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         });
         assert_eq!(bin_node.log_size(), bin_node.write_to_bytes().len());
 
@@ -14682,6 +14743,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         });
         let bytes = node.write_to_bytes();
         // First 8 bytes = node_id big-endian.
@@ -14713,6 +14775,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         });
         let with_entry = TreeNode::Bottom(BinStub {
             node_id: 2,
@@ -14739,6 +14802,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         });
         assert!(
             with_entry.log_size() > empty.log_size(),
@@ -14769,6 +14833,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -15600,6 +15665,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -15653,6 +15719,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         })));
 
         assert!(
@@ -15683,6 +15750,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         })));
         let bin_b = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
             node_id: generate_node_id(),
@@ -15703,6 +15771,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -15808,6 +15877,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         };
 
         let delta_entries = vec![
@@ -15886,6 +15956,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         };
         let n_before = base.entries.len();
         Tree::apply_delta_to_bin(&mut base, vec![]);
@@ -15938,6 +16009,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         };
 
         // The delta has a new entry "bb" and overwrites "aa".
@@ -15975,6 +16047,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         };
 
         Tree::mutate_to_full_bin(&mut delta, base);
@@ -16033,6 +16106,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         };
         assert!(!Tree::bin_is_delta(&bin));
         bin.is_delta = true;
@@ -16078,6 +16152,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         };
 
         Tree::mutate_to_full_bin_from_log(&mut bin, &lm);
@@ -16126,6 +16201,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         };
 
         Tree::mutate_to_full_bin_from_log(&mut delta, &lm);
@@ -16192,6 +16268,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         };
 
         let payload = full_bin.serialize_full();
@@ -16246,6 +16323,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         };
 
         Tree::mutate_to_full_bin_from_log(&mut delta, &lm);
@@ -16348,6 +16426,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: true,
         };
         source.recompute_key_prefix();
         // Verify the source has the expected prefix before serializing.
@@ -16355,22 +16434,32 @@ mod tests {
 
         let payload = source.serialize_full();
 
-        // Deserialize and verify prefix is re-established.
-        let loaded = BinStub::deserialize_full(&payload)
+        // ENG-DISKFULL-AUTOPUT-1: a BIN deserialized WITHOUT a tree comes
+        // back NON-prefixing (JE default); deserialize_full no longer
+        // auto-learns a prefix (JE computeKeyPrefix gated on getKeyPrefixing,
+        // IN.java:1625).  Full keys still reconstruct verbatim.
+        let mut loaded = BinStub::deserialize_full(&payload)
             .expect("deserialization must succeed");
-
-        assert_eq!(
-            loaded.key_prefix, b"pfx:",
-            "key prefix must be recomputed after deserialize_full"
+        assert!(
+            loaded.key_prefix.is_empty(),
+            "deserialize_full must NOT learn a prefix on a non-prefixing BIN"
         );
-
-        // All full keys must be reconstructable.
         for i in 0..loaded.entries.len() {
             let fk = loaded.get_full_key(i).unwrap();
-            assert!(
-                fk.starts_with(b"pfx:"),
-                "full key {i} must start with prefix"
-            );
+            assert!(fk.starts_with(b"pfx:"), "full key {i} reconstructs");
+        }
+
+        // After the installing boundary stamps the tree's key-prefixing
+        // policy and recomputes, the prefix is re-established.
+        loaded.key_prefixing = true;
+        loaded.recompute_key_prefix();
+        assert_eq!(
+            loaded.key_prefix, b"pfx:",
+            "prefix re-established after the boundary stamps key_prefixing"
+        );
+        for i in 0..loaded.entries.len() {
+            let fk = loaded.get_full_key(i).unwrap();
+            assert!(fk.starts_with(b"pfx:"), "full key {i} still reconstructs");
         }
     }
 
@@ -16404,6 +16493,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         };
 
         let payload = source.serialize_full();
@@ -16682,6 +16772,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: true,
         };
 
         bin.insert_with_prefix(b"record:aaa".to_vec(), Lsn::new(1, 1), None);
@@ -16717,6 +16808,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: true,
         };
 
         let keys = [
@@ -16764,6 +16856,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         };
 
         for k in
@@ -16850,6 +16943,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: true,
         };
 
         for k in [b"myapp:user:1".as_ref(), b"myapp:user:2".as_ref()] {
@@ -17248,6 +17342,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         })));
 
         // Wire a minimal parent IN so compress_bin can prune if needed.
@@ -17369,6 +17464,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         })));
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
             node_id: generate_node_id(),
@@ -17474,6 +17570,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         })));
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
             node_id: generate_node_id(),
@@ -17537,6 +17634,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         })));
 
         let tree = Tree::new(1, 128);
@@ -17578,6 +17676,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         })));
 
         let tree = Tree::new(1, 128);
@@ -17629,6 +17728,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -17694,6 +17794,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         })));
 
         let tree = Tree::new(1, 128);
@@ -17745,6 +17846,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         })));
 
         let tree = Tree::new(1, 128);
@@ -17851,6 +17953,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         })));
 
         // Parent IN with two children: the BIN above plus a placeholder sibling.
@@ -17879,6 +17982,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -18020,6 +18124,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         })));
 
         let tree = Tree::new(1, 128);
@@ -18084,6 +18189,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         })));
 
         let tree = Tree::new(1, 128);
@@ -18162,6 +18268,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         })));
 
         // Wire up a parent so compress_bin can run normally.
@@ -18343,6 +18450,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         })));
 
         let sibling_arc = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
@@ -18370,6 +18478,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -18492,6 +18601,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -18681,6 +18791,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         };
         bin.insert_with_prefix(b"key".to_vec(), lsn, Some(b"val".to_vec()));
         assert_eq!(bin.dirty_count(), 1, "new slot should be dirty");
@@ -18715,6 +18826,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         };
         bin.insert_with_prefix(
             b"key".to_vec(),
@@ -18761,6 +18873,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         };
         let bytes = bin.serialize_full();
         let node_id = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
@@ -18883,6 +18996,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         };
         let bytes = bin.serialize_delta();
         let node_id = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
@@ -18951,6 +19065,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         }
     }
 
@@ -19460,6 +19575,7 @@ mod tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         };
         // Three slots with embedded data + VALID logged LSNs (one dirty).
         // JE-faithful: a slot with a valid LSN is strippable regardless of the
@@ -19645,6 +19761,7 @@ fn test_split_child_sibling_inherits_expiration_in_hours() {
         compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         expiration_enabled: true,
         max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+        key_prefixing: false,
     })));
 
     let root = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -19777,6 +19894,7 @@ mod in_redo_tests {
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
             max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
         };
         for i in 0..n {
             // T-2/T-3: route through insert so entries/keys/lsn_rep stay
@@ -19843,6 +19961,372 @@ mod in_redo_tests {
         assert_eq!(result, InRedoResult::Skipped);
         // Tree still holds the newer 4-entry version.
         assert_eq!(tree.count_entries(), 4);
+    }
+
+    /// Build the serialized bytes of a full BIN whose slots carry the given
+    /// EXPLICIT full keys (each slot data = key).  Unlike `make_bin_bytes`
+    /// (single-byte keys) this lets a test give keys that share a multi-byte
+    /// common prefix, so `deserialize_full`'s `recompute_key_prefix` produces a
+    /// non-empty computed prefix.
+    #[cfg(test)]
+    fn make_bin_bytes_keys(node_id: u64, keys: &[&[u8]]) -> Vec<u8> {
+        let mut bin = BinStub {
+            node_id,
+            level: BIN_LEVEL,
+            entries: Vec::new(),
+            key_prefix: Vec::new(),
+            dirty: false,
+            is_delta: false,
+            last_full_lsn: noxu_util::NULL_LSN,
+            last_delta_lsn: noxu_util::NULL_LSN,
+            generation: 0,
+            parent: None,
+            expiration_in_hours: true,
+            cursor_count: 0,
+            prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::new(),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
+            expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            key_prefixing: false,
+        };
+        for (i, k) in keys.iter().enumerate() {
+            bin.insert_with_prefix(
+                k.to_vec(),
+                Lsn::new(1, (i + 1) as u32),
+                Some(k.to_vec()),
+            );
+        }
+        bin.serialize_full()
+    }
+
+    /// ENG-DISKFULL-AUTOPUT-1 (S1) direct witness: on a `key_prefixing=false`
+    /// tree, `recover_in_redo` must NOT install a BIN carrying a recomputed key
+    /// prefix, and a subsequent `redo_insert` of a post-checkpoint LN must land
+    /// under its logged full key (not a double-prefixed mangled key).
+    ///
+    /// Root cause: `deserialize_bin` always runs `recompute_key_prefix`, so a
+    /// checkpoint-flushed full BIN whose live keys share a common byte prefix
+    /// (e.g. the 2-byte `00 00` of keys `0000016c`, `00000169`, ...) comes back
+    /// with `key_prefix = [00,00]` and suffix-compressed slots.  On a
+    /// `key_prefixing=false` tree the redo LN path (`insert_raw`) assumes an
+    /// EMPTY prefix: it stores the full logged key as a SUFFIX, and
+    /// `get_full_key` then re-prepends `[00,00]` -> a 6-byte key `00000000016c`.
+    /// The acked record `delta#0-a3-14` (key `0000016c`) then VANISHES from its
+    /// real key.  The existing lazy-fetch boundary (`fetch_node_from_log`)
+    /// already strips the prefix for a non-prefixing tree; `recover_in_redo`
+    /// did not.
+    ///
+    /// JE: `IN.computeKeyPrefix` returns early when
+    /// `!databaseImpl.getKeyPrefixing()` (IN.java:1625), so a non-prefixing
+    /// BIN never carries a prefix on any path, including recovery.
+    #[test]
+    fn eng_diskfull_autoput1_recover_in_redo_no_prefix_on_nonprefixing_tree() {
+        // key_prefixing defaults to false (Tree::new): the seed db in the
+        // failing trace (crash_worker opens with DatabaseConfig::new()).
+        let tree = Tree::new(5, 128);
+        assert!(!tree.key_prefixing, "witness assumes key_prefixing=false");
+
+        // A checkpoint-flushed full BIN with live keys sharing the 2-byte
+        // prefix `00 00` (exactly the 121516 image shape).
+        let k_a: &[u8] = &[0x00, 0x00, 0x01, 0x39];
+        let k_b: &[u8] = &[0x00, 0x00, 0x01, 0x69];
+        let k_c: &[u8] = &[0x00, 0x00, 0x01, 0x6a];
+        let bytes = make_bin_bytes_keys(11, &[k_a, k_b, k_c]);
+        let seed_lsn = Lsn::new(0, 0x3f2c);
+        let r = tree.recover_in_redo(seed_lsn, true, true, &bytes);
+        assert_eq!(r, InRedoResult::Inserted, "seed BIN installed as root");
+
+        // Redo a post-checkpoint LN (newer LSN) with a 4-byte full key sharing
+        // the same `00 00` lead -> the acked `delta#0-a3-14`.
+        let lost_key: &[u8] = &[0x00, 0x00, 0x01, 0x6c];
+        let lost_val = b"delta#0-a3-14";
+        tree.redo_insert(lost_key, lost_val, Lsn::new(0, 0x4101))
+            .expect("redo_insert");
+
+        // The record MUST be findable under its LOGGED key, with its value.
+        let got = tree
+            .search_with_data(lost_key)
+            .filter(|s| s.found)
+            .unwrap_or_else(|| {
+                panic!(
+                    "acked record vanished: key {:02x?} not found after redo \
+                     (double-prefix key mangling)",
+                    lost_key
+                )
+            });
+        assert_eq!(
+            got.data.as_deref(),
+            Some(&lost_val[..]),
+            "wrong value under the logged key"
+        );
+        // And the pre-existing checkpoint keys stay findable under THEIR keys.
+        for k in [k_a, k_b, k_c] {
+            assert!(
+                tree.search_with_data(k).map(|s| s.found).unwrap_or(false),
+                "seed key {:02x?} lost",
+                k
+            );
+        }
+    }
+
+    /// ENG-DISKFULL-AUTOPUT-1 converse (prefixing tree): `recover_in_redo` of a
+    /// checkpoint BIN on a key_prefixing=TRUE tree re-learns the compressed
+    /// prefix, and a subsequent `redo_insert` lands under its logged full key.
+    /// Proves the root fix does not break prefix compression for prefixing dbs
+    /// (the fetch/redo boundary stamps key_prefixing=true, so `insert_with_prefix`
+    /// is used and the prefix is formed, not `insert_raw`).
+    #[test]
+    fn eng_diskfull_autoput1_recover_in_redo_prefix_preserved_on_prefixing_tree()
+     {
+        let mut tree = Tree::new(5, 128);
+        tree.set_key_prefixing(true);
+        assert!(tree.key_prefixing);
+
+        let k_a: &[u8] = &[0x00, 0x00, 0x01, 0x39];
+        let k_b: &[u8] = &[0x00, 0x00, 0x01, 0x69];
+        let k_c: &[u8] = &[0x00, 0x00, 0x01, 0x6a];
+        let bytes = make_bin_bytes_keys(11, &[k_a, k_b, k_c]);
+        let r = tree.recover_in_redo(Lsn::new(0, 0x3f2c), true, true, &bytes);
+        assert_eq!(r, InRedoResult::Inserted);
+
+        let lost_key: &[u8] = &[0x00, 0x00, 0x01, 0x6c];
+        let lost_val = b"delta#0-a3-14";
+        tree.redo_insert(lost_key, lost_val, Lsn::new(0, 0x4101))
+            .expect("redo_insert");
+
+        // All four keys (3 checkpoint + 1 redone) findable under their LOGGED
+        // full keys, with correct values — the prefix is transparent on read.
+        for (k, want) in [
+            (k_a, None),
+            (k_b, None),
+            (k_c, None),
+            (lost_key, Some(&lost_val[..])),
+        ] {
+            let s = tree
+                .search_with_data(k)
+                .filter(|s| s.found)
+                .unwrap_or_else(|| panic!("key {k:02x?} not found"));
+            if let Some(w) = want {
+                assert_eq!(
+                    s.data.as_deref(),
+                    Some(w),
+                    "value mismatch {k:02x?}"
+                );
+            }
+        }
+    }
+
+    /// ENG-DISKFULL-AUTOPUT-1 (point 1 audit — eviction/refault under NORMAL
+    /// operation, not recovery): on a key_prefixing=false tree, a BIN logged
+    /// full, evicted, then re-faulted from the log (`fetch_node_from_log`) must
+    /// come back with an EMPTY prefix, so a subsequent full-key insert lands
+    /// under its real key.  This proves the mangling cannot be persisted
+    /// outside recovery (the fetch boundary stamps key_prefixing=false and
+    /// recompute returns empty).  The bug would have surfaced here too had
+    /// `fetch_node_from_log` not already guarded — this pins it at the shared
+    /// `compute_key_prefix` source via the new field.
+    #[test]
+    fn eng_diskfull_autoput1_deserialize_full_bin_keeps_empty_prefix_nonprefixing()
+     {
+        // Direct check of the shared source + the deserialize path a refault
+        // uses.  deserialize_full defaults key_prefixing=false (no tree), so the
+        // loaded BIN must NOT learn a prefix even though its keys share 00 00.
+        let bytes = make_bin_bytes_keys(
+            11,
+            &[
+                &[0x00, 0x00, 0x01, 0x39],
+                &[0x00, 0x00, 0x01, 0x69],
+                &[0x00, 0x00, 0x01, 0x6a],
+            ],
+        );
+        let bin = Tree::deserialize_bin(&bytes).expect("deserialize");
+        assert!(
+            !bin.key_prefixing,
+            "a BIN deserialized without a tree is non-prefixing (JE default)"
+        );
+        assert!(
+            bin.key_prefix.is_empty(),
+            "non-prefixing deserialized BIN must keep an EMPTY prefix"
+        );
+        // Full keys reconstruct verbatim (no suffix compression).
+        for i in 0..bin.entries.len() {
+            let fk = bin.get_full_key(i).unwrap();
+            assert_eq!(fk.len(), 4, "full 4-byte key preserved, slot {i}");
+            assert_eq!(&fk[..2], &[0x00, 0x00], "no bytes dropped, slot {i}");
+        }
+    }
+
+    /// ENG-DISKFULL-AUTOPUT-1 (point 1 audit — the BIN COMPRESSOR / merge path,
+    /// `compress_node` ~8250, which runs under NORMAL operation, not recovery):
+    /// on a key_prefixing=false BIN, `recompute_key_prefix` (which the merge
+    /// calls after rebuilding the combined key list) must keep an EMPTY prefix,
+    /// and a subsequent full-key `insert_raw` must land under its real key.
+    /// Before the root fix, the ungated recompute learned a prefix here; a later
+    /// `insert_raw` stored a full-key-as-suffix and `serialize_full`
+    /// (`get_full_key`) would persist a mangled 6-byte key on the next
+    /// checkpoint — i.e. the corruption was reachable with NO crash.
+    #[test]
+    fn eng_diskfull_autoput1_compressor_merge_keeps_empty_prefix_nonprefixing()
+    {
+        // Build a non-prefixing BIN directly with common-prefixed full keys,
+        // exactly the post-merge state `compress_node` assembles.
+        let bytes = make_bin_bytes_keys(
+            21,
+            &[
+                &[0x00, 0x00, 0x01, 0x39],
+                &[0x00, 0x00, 0x01, 0x69],
+                &[0x00, 0x00, 0x01, 0x6a],
+            ],
+        );
+        let mut bin = Tree::deserialize_bin(&bytes).expect("deserialize");
+        assert!(!bin.key_prefixing && bin.key_prefix.is_empty());
+
+        // The merge path's final step (unconditional pre-fix).
+        bin.recompute_key_prefix();
+        assert!(
+            bin.key_prefix.is_empty(),
+            "compressor merge must NOT learn a prefix on a non-prefixing BIN"
+        );
+
+        // A later full-key insert on this merged BIN (the normal insert path's
+        // `insert_raw` arm) lands under its real key; nothing is re-prefixed.
+        let (_idx, is_new) = bin.insert_raw(
+            vec![0x00, 0x00, 0x01, 0x6c],
+            Lsn::new(0, 0x4101),
+            Some(vec![9]),
+        );
+        assert!(is_new);
+        // serialize_full writes get_full_key(); every key must round-trip to
+        // its 4-byte form (no durable 6-byte mangling at the next checkpoint).
+        for i in 0..bin.entries.len() {
+            let fk = bin.get_full_key(i).unwrap();
+            assert_eq!(fk.len(), 4, "slot {i} full key stays 4 bytes");
+        }
+        // The new key is findable in suffix-space == full-key-space (empty prefix).
+        let (_i, exact) = bin.find_entry_compressed(&[0x00, 0x00, 0x01, 0x6c]);
+        assert!(exact, "inserted key must be findable under its real key");
+    }
+
+    /// ENG-DISKFULL-AUTOPUT-1 (point 2 — NORMAL `put` path, no crash): a normal
+    /// `Tree::insert` on a key_prefixing=false, no-comparator db routes through
+    /// `insert_raw` (tree.rs insert routing: `!cmp && !key_prefixing`).  The
+    /// root fix guarantees such a BIN never carries a prefix, so many
+    /// common-prefixed puts all land under their real keys and reconstruct to
+    /// their exact logged bytes — the durable `serialize_full` image (what a
+    /// checkpoint writes) carries the real keys, not mangled ones.
+    #[test]
+    fn eng_diskfull_autoput1_normal_put_nonprefixing_never_mangles() {
+        let tree = Tree::new(5, 8);
+        assert!(!tree.key_prefixing);
+        // Many keys sharing a 2-byte common prefix (the hazardous shape).
+        let keys: Vec<Vec<u8>> =
+            (0u8..20).map(|i| vec![0x00, 0x00, 0x01, 0x60 + i]).collect();
+        for (i, k) in keys.iter().enumerate() {
+            tree.insert(
+                k.clone(),
+                vec![0xAA, i as u8],
+                Lsn::new(1, (i + 1) as u32),
+            )
+            .expect("put");
+        }
+        // Every key readable under its REAL key with its REAL value.
+        for (i, k) in keys.iter().enumerate() {
+            let s = tree
+                .search_with_data(k)
+                .filter(|s| s.found)
+                .unwrap_or_else(|| panic!("key {k:02x?} not found"));
+            assert_eq!(
+                s.data.as_deref(),
+                Some(&[0xAA, i as u8][..]),
+                "{k:02x?}"
+            );
+        }
+        // No resident BIN learned a prefix (so the durable checkpoint image,
+        // written via serialize_full/get_full_key, holds the real keys).
+        for node in tree.rebuild_in_list() {
+            if let TreeNode::Bottom(bin) = &*node.read() {
+                assert!(
+                    bin.key_prefix.is_empty(),
+                    "non-prefixing BIN must never learn a prefix under normal put"
+                );
+            }
+        }
+    }
+
+    /// ENG-DISKFULL-AUTOPUT-1 (point 4 analysis — REPAIR is NOT exact in
+    /// general): a mangled slot and a legitimate key can serialize to BYTE-
+    /// IDENTICAL on-disk images, so there is no local rule that recovers the
+    /// intended key without ambiguity (and it can even COLLIDE with a real
+    /// key).  This pins the honest advisory claim: repair is not automatic.
+    ///
+    /// Scenario (BE-integer keys, the common case): prefix p = 00 00.
+    /// A mangled slot (in-memory key_prefix=[00,00] with suffix 00 00 01 6c)
+    /// is written by serialize_full as get_full_key = 00 00 00 00 01 6c.  A
+    /// legit non-prefixing BIN holding the real key 00 00 00 00 01 6c (e.g.
+    /// u32 300 under a u16-zero-padded composite) serializes to the same bytes.
+    /// Both reopen as the identical 6-byte full key: indistinguishable.
+    #[test]
+    fn eng_diskfull_autoput1_repair_is_ambiguous_identical_on_disk() {
+        // Mangled BIN image.
+        let mut mangled = Tree::deserialize_bin(&make_bin_bytes_keys(
+            7,
+            &[&[0u8, 0, 1, 0x39], &[0u8, 0, 1, 0x69]],
+        ))
+        .unwrap();
+        // Impose the stale prefix (what the pre-fix merge did) and add the
+        // full-key-as-suffix slot (what insert_raw stored).
+        mangled.key_prefix = vec![0x00, 0x00];
+        mangled.insert_raw(
+            vec![0u8, 0, 1, 0x6c],
+            Lsn::new(1, 9),
+            Some(vec![1]),
+        );
+        let mangled_bytes = mangled.serialize_full();
+
+        // Legit BIN: a genuinely non-prefixing db whose real key IS the 6-byte
+        // 00 00 00 00 01 6c (plus two 6-byte neighbours so the BIN is ordered).
+        let legit = Tree::deserialize_bin(&make_bin_bytes_keys(
+            7,
+            &[
+                &[0u8, 0, 0, 0, 1, 0x39],
+                &[0u8, 0, 0, 0, 1, 0x69],
+                &[0u8, 0, 0, 0, 1, 0x6c],
+            ],
+        ))
+        .unwrap();
+        let legit_bytes = legit.serialize_full();
+
+        // The mangled slot's stored full key and the legit real key are the
+        // SAME bytes: 00 00 00 00 01 6c.  Deserialize both and compare the 6c
+        // slot's full key.
+        let m = Tree::deserialize_bin(&mangled_bytes).unwrap();
+        let l = Tree::deserialize_bin(&legit_bytes).unwrap();
+        let m_key = (0..m.entries.len())
+            .map(|i| m.get_full_key(i).unwrap())
+            .find(|k| k.ends_with(&[0x6c]))
+            .unwrap();
+        let l_key = (0..l.entries.len())
+            .map(|i| l.get_full_key(i).unwrap())
+            .find(|k| k.ends_with(&[0x6c]))
+            .unwrap();
+        assert_eq!(
+            m_key, l_key,
+            "mangled and legit keys are byte-identical on disk -> repair cannot \
+             locally decide whether to strip the prefix; not exact/automatic"
+        );
+        assert_eq!(m_key, vec![0u8, 0, 0, 0, 1, 0x6c]);
+
+        // EXACT-REPAIR SUBSET: repair is only unambiguous when there is
+        // ORDERING EVIDENCE and no collision -- i.e. the mangled key sits in a
+        // BIN that ALSO holds the shorter real keys it was supposed to join
+        // (4-byte 00 00 01 XX), so it is out of order AND stripping one prefix
+        // copy yields a key that (a) is in order and (b) does not already
+        // exist.  When the mangled key happens to sort in place, or when a
+        // legit long key with the same bytes exists, repair is ambiguous.
+        // (The fix PREVENTS the mangle; this test documents why post-hoc repair
+        // of pre-fix data is not automatic -- same stance as XDB-711.)
     }
 
     /// deserialize_bin round-trips through serialize_full.
