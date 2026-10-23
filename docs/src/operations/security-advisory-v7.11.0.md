@@ -1,22 +1,28 @@
 # Security / Data-Integrity Advisory — v7.11.0
 
-## Noxu DB v7.11.0 — silent data-loss, isolation, and availability defects fixed in v7.11.1
+## Noxu DB v7.11.0 / v7.11.1 — silent data-loss, isolation, and availability defects fixed in v7.11.1 and v7.11.2
 
-**Status:** Published with the v7.11.1 release. All defects below are **fixed in
-v7.11.1**, released **2026-10-20**.
-**Affected:** Noxu DB **v7.11.0** (tag `b17f8258`) and earlier v7.11.x
-pre-release build lineages.
-**Fixed in:** **v7.11.1** (released 2026-10-20).
-**Recommendation:** **Upgrade to v7.11.1.** Several defects below cause silent
-data loss — including whole-database loss — reachable with **default settings**
-and the background daemons alone, with no explicit maintenance call.
+**Status:** Originally published with the v7.11.1 release (2026-10-20);
+**updated for v7.11.2** (2026-10-23), which adds §14.11–§14.17 for a second set
+of defects (XDB-711 cross-database corruption, ENG-AUTODDL-1,
+ENG-FSYNCDROP-RESURRECT-1, ENG-KEYPREFIX-MANGLE-1, ENG-DISKFULL-ACK-1,
+FID-TXN-FIX3A, FID-LOCKTIMEOUT-711).
+**Affected:** Noxu DB **v7.11.0** (tag `b17f8258`) and **v7.11.1** — plus, for
+ENG-KEYPREFIX-MANGLE-1 only, the whole **v4.1.0 → v7.11.1** range (v4.0.0
+immune). See each section for the exact affected range.
+**Fixed in:** §1–§14.10 in **v7.11.1** (released 2026-10-20); §14.11–§14.17 in
+**v7.11.2** (released 2026-10-23).
+**Recommendation:** **Upgrade to v7.11.2.** Several defects below cause silent
+data loss — including whole-database loss and silent cross-database
+corruption — reachable with **default settings** and the background daemons
+alone, with no explicit maintenance call.
 
-Every defect listed here is a **confirmed v7.11.0 defect** (present at tag
-`b17f8258`). Defects that were introduced and fixed *within* the v7.11.1
+Every defect listed here is a **confirmed defect** present at the version(s)
+named in its section. Defects that were introduced and fixed *within* a single
 development cycle (never shipped) are deliberately excluded from this advisory
 and are recorded only in the CHANGELOG. Reproduced on x86-64 and aarch64; the
-two whole-DB / value-loss defects were also reproduced on **riscv64** (RVWMO
-weak memory). Architecture only changes the reproduction *rate*, not whether the
+whole-DB / value-loss defects were also reproduced on **riscv64** (RVWMO weak
+memory). Architecture only changes the reproduction *rate*, not whether the
 defect is present.
 
 ---
@@ -61,6 +67,13 @@ defect is present.
 | Checkpoint/Cleaner "already running" | Availability | Spurious error from the public API | Manual checkpoint/clean vs daemon |
 | BUG-FEEDER-SCAN-SKIP (R-FEEDER) | Data loss (replica) | Feeder ships a VLSN gap (lost committed txn) to the replica | Replication + cleaning |
 | **BUG-REP-USER-WRITES-NOT-REPLICATED (R-REPUSER)** | **Replication non-functional** | **No application write is ever replicated**; a replicated commit either silently succeeds locally (ack policy `None`) or times out (`InsufficientReplicas`). **v7.11.1 fails closed** (refuses the write with `NoxuError::ReplicationNotSupported`); full fix in v8.0.0 (see §0) | **Every replicated deployment** |
+| XDB-711 | Data integrity | **Silent cross-database corruption** — a database name binds to a stale/reused id; one db serves under another's name, the correct db's records lost (v7.11.2 refuses to open the detectable form; some forms undetectable) | Yes — concurrent catalog DDL + crash on v7.11.0/.1 |
+| ENG-AUTODDL-1 | Data loss / durability | **A whole database lost** — an auto-commit rename/create/remove/truncate not durable before `Ok`; records orphaned under a dead id | Yes — auto-commit DDL + crash on v7.11.0/.1 |
+| ENG-FSYNCDROP-RESURRECT-1 | Data loss | A committed `truncate_database` resurrects deleted records after a crash (can become **durable** if reopened+checkpointed) | Yes — uncommitted delete checkpointed deleted + committed truncate + crash |
+| ENG-KEYPREFIX-MANGLE-1 | Data loss | Recovery mangles a committed key into an unreachable form on the default `key_prefixing=false` (RARE — torn/mid-checkpoint crash) | Default config, v4.1.0→v7.11.1; rare trigger |
+| ENG-DISKFULL-ACK-1 | Durability | `commit()`/`abort()` on an already-invalidated env returns a misleading `Ok` (empty-txn fast path) | Yes — disk-full / I-O error then a commit that logged nothing |
+| FID-TXN-FIX3A | Isolation | Write locks released before the SYNC commit fsync (ELR hole) on a non-txn-db auto-commit or `open_cursor(None)` write; a read-then-fsync-failure can lose the value | Yes — SYNC non-txn-db / bare-cursor write + concurrent reader + fsync failure |
+| FID-LOCKTIMEOUT-711 | Availability / behaviour | A configured env lock/txn timeout is silently ignored (per-locker defaults used); configured bound not honoured | Yes — `with_lock_timeout`/`with_txn_timeout` set to a non-default value |
 
 ---
 
@@ -623,6 +636,249 @@ mitigation.
   `remove`/`rename` and keep the database's create file from being cleaned (open
   the database before cleaning, or avoid aggressive cleaning) until you upgrade.
 
+### 14.11 XDB-711 — concurrent catalog DDL plus a crash binds a database name to the wrong id (S1 silent cross-database corruption)
+
+- **Affected versions:** v7.11.0 and v7.11.1.
+- **Trigger:** a crash during concurrent database create / remove / rename /
+  truncate churn (two or more catalog operations in flight on overlapping or
+  reused names), where a later committed rename / remove / recreate had already
+  superseded a name→id binding that the per-checkpoint catalog relog then
+  re-logged from a stale snapshot. Environments that never ran concurrent
+  catalog DDL (or ran it only strictly serially under one transaction) are not
+  exposed.
+- **Impact:** recovery binds a current database name to a **stale or reused
+  database id**: one database's committed records surface under another
+  database's name, and the correct database's committed records are lost —
+  silently (recovery returns success, `verify` passes). The superseded relog
+  record, written at a higher log position, wins recovery's latest-record-wins
+  catalog replay.
+- **Fix version:** v7.11.2. **Writer side:** the catalog relog takes the
+  name-record lock and re-checks the committed binding before re-logging (it
+  never re-logs a superseded name→id binding), and a committed DDL's catalog
+  change is published while its name lock is still held (JE `DbTree.lockNameLN`
+  / `DbTree.getDb`; `RecoveryManager` latest-NameLN catalog redo). **Existing
+  damage is NOT repaired.** For logs already written by v7.11.0/.1, recovery
+  detects the detectable *stray-relog* signature and **refuses to open** the
+  environment with a `LogIntegrity` environment-failure error that names the
+  affected database(s), rather than silently serving the wrong binding; it does
+  **not** attempt an in-recovery repair (the log damage is persistent). A
+  refused open writes nothing (it is read-only up to the refusal). No on-disk
+  format change. Patch-safe (no public-API change; `cargo-semver-checks` 9/9).
+- **Detection is not complete.** The detector refuses the stray-relog form
+  whenever the evidence survives in the log. It does **not** catch three related
+  forms, because they cannot be distinguished from a legitimate history by the
+  catalog records alone: **(1)** a *defect-#2 double binding* — two
+  concurrently-committed DDL transactions both bound one name, so the catalog is
+  internally consistent but one database's records are orphaned under a live id;
+  **(2)** a *resurrected removed database* (ENG-CLEAN-TOMBSTONE-1) whose evidence
+  was already reclaimed by log cleaning before recovery ran; **(3)** an
+  *auto-commit rename that lost its new-name record* (ENG-AUTODDL-1) — the
+  database's records are orphaned. **If you ran concurrent catalog DDL or
+  database removes on v7.11.0/.1, do not assume a clean open means clean data:
+  verify the opened databases against your application's own records, or restore
+  from a backup taken before the exposure.**
+- **Mitigation / remedy.** If v7.11.2 refuses to open your environment with this
+  error, the catalog is damaged by this bug and cannot be trusted — **a
+  dump/reload is NOT a fix** (it would copy the wrong binding). Instead:
+  1. **Preserve the environment directory as-is** — copy the whole directory; do
+     **not** delete, reinitialise, or write to it. Because v7.11.2 refuses to
+     open it, nothing further is written, so the on-disk state is frozen at the
+     damaged point and remains fully salvageable.
+  2. **Restore from a backup** taken before the corrupting crash, if you have
+     one. This is the recommended recovery for the v7.11.x line.
+  3. **Or keep the preserved copy for offline salvage.** An offline log-salvage
+     tool (`noxu-admin scavenge`, a port of JE's `DbScavenger`) recovers each
+     database's committed records by scanning the raw log read-only; it ships in
+     **v8.0.0** (not part of the v7.11.x line). It recovers records by database
+     id and labels them by the name bindings it reconstructs, which inherit the
+     same ambiguity — reconcile the recovered dumps by content.
+
+### 14.12 ENG-AUTODDL-1 — an auto-commit DDL can lose a whole database on crash (S1 durability / data loss)
+
+- **Affected versions:** v7.11.0 and v7.11.1.
+- **Trigger:** a database create / remove / rename / truncate performed with an
+  auto-commit (`txn = None`) catalog operation, followed by a crash in the window
+  before a later fsync or checkpoint made it durable. A rename is the clearest
+  loss: the old name is tombstoned on disk and the new name never reaches disk.
+- **Impact:** the auto-commit DDL returned `Ok` without being durable (the
+  new-name NameLN was written lazily and any log-write error was dropped), so a
+  crash could **lose a database renamed with auto-commit**. The data is not
+  necessarily gone: the database's records remain in the log under an **orphaned
+  database id** (the data LNs were durably committed; only the new-name NameLN
+  was lost), so the records can be recovered with the v8.0.0 offline salvage
+  path. This is also one of the undetectable classes of XDB-711 (§14.11): the
+  catalog can look internally consistent with the database silently missing.
+- **Fix version:** v7.11.2 (every auto-commit DDL now runs through an internal
+  auto-txn that commits at the environment's default COMMIT_SYNC durability,
+  exactly as a transactional DDL does — JE `Environment.createAutoTxn` — so the
+  operation is atomic, durable at return, and surfaces disk-full / I/O errors
+  instead of reporting `Ok`). This fsyncs each auto-commit DDL; auto-commit
+  create latency rises from ≈ 2.9 µs to ~115 µs on a typical disk (see the
+  CHANGELOG *Changed* note). No on-disk format change; patch-safe.
+- **Mitigation on v7.11.0/.1:** wrap catalog DDL in an explicit transaction and
+  commit with SYNC durability (so it is durable at commit), or force a checkpoint
+  immediately after an auto-commit DDL and before relying on it. Records lost to
+  this defect are recoverable via the v8.0.0 offline salvage (preserve the
+  environment directory).
+
+### 14.13 ENG-FSYNCDROP-RESURRECT-1 — a committed truncate can resurrect deleted records after a crash (S1 data loss)
+
+- **Affected versions:** v7.11.0 and v7.11.1.
+- **Trigger:** (a) a committed delete (or delete of all keys) of records in a
+  database that was NOT committed and whose known-deleted / pending-deleted slots
+  were frozen into a checkpoint; then (b) that uncommitted delete aborts or its
+  process crashes; then (c) a **committed** `truncate_database` of the *same*
+  database (Noxu's same-id truncate logs a per-record `DeleteLN` for each key);
+  then (d) a crash before the next checkpoint, with a transaction still active so
+  recovery runs its undo pass. The write-ahead log is not corrupted — this is a
+  recovery-time defect.
+- **Impact:** recovery replays the committed truncate's `DeleteLN` as a no-op
+  over the already-deleted slot without advancing its LSN; the subsequent undo of
+  the earlier uncommitted delete matches the slot by its stale LSN and reverts it
+  to the committed before-image — resurrecting a record the committed truncate
+  had removed. The truncated database reappears non-empty.
+- **Fix version:** v7.11.2 (the redo of a committed delete over an
+  already-deleted slot now advances the slot LSN, mirroring JE
+  `RecoveryManager.redo` → `IN.recoverRecord` for the `lsnCmp > 0` case —
+  `RecoveryManager.java:2545-2600`, `IN.java:3836` — so the earlier undo no
+  longer matches and the committed deletion stands). Recovery-only fix; no
+  on-disk format change, no public-API change, no change to any live write path.
+  Root cause is Noxu's documented same-id truncate (deviation F1 vs JE's
+  new-`DatabaseId` `DbTree.doTruncateDb`; v8.0.0 ports the new-id truncate).
+- **Two cases, with different remedies:**
+  1. **Crashed under 7.11.0/.1 and NOT reopened since.** Upgrading to v7.11.2 and
+     recovering the environment recovers it **correctly** — the resurrected
+     records do not appear. No dump/reload is required.
+  2. **Already reopened read-write (and checkpointed) under 7.11.0/.1 after such
+     a crash.** The buggy recovery resurrected the records in memory and the
+     subsequent checkpoint **persisted** them, moving the committed truncate's
+     `DeleteLN`s *before* the new checkpoint boundary, so v7.11.2's recovery no
+     longer replays them. **The resurrected records can be durable, and upgrading
+     to v7.11.2 does NOT remove them.** `Environment::verify` does **not** detect
+     this — the resurrected records are structurally valid B-tree entries.
+     **Remedy:** restore from a backup taken *before* the crash, or audit the
+     affected (truncated) databases against your application's own record of what
+     should be present and delete the resurrected keys. There is no in-place
+     automatic repair in v7.11.2. (A log-scan detector — a live slot whose LSN
+     precedes a committed `DeleteLN` of the same key in the same database id — is
+     recommended for v8 / a future 7.11.3; not shipped in v7.11.2.)
+
+### 14.14 ENG-KEYPREFIX-MANGLE-1 — recovery can mangle a committed key on the default config (S1 data loss)
+
+- **Affected versions:** **v4.1.0 → v7.11.1** (introduced by the Part-2
+  key-prefixing commit `dc7c0667`; **v4.0.0 and earlier are immune** — they have
+  no `insert_raw` full-key path). The default `key_prefixing = false` is the
+  exposed configuration.
+- **Trigger:** a torn / mid-checkpoint crash (BINs flushed, a committed LN
+  appended, no `CkptEnd`) where, within ONE recovery pass, both: the IN-redo pass
+  reconstitutes a BIN with a *spurious* learned prefix on a `key_prefixing =
+  false` database (no comparator), **and** the LN-redo pass does an `insert_raw`
+  (full-key path) into that same just-reconstituted resident BIN before any
+  guarded re-fetch. **Real-world exposure is RARE** — measured **0 / 15**
+  realistic crash cases; normal operation, clean shutdown, and ordinary crashes
+  do not mangle (the LN-redo re-fetch guard strips the spurious prefix in the
+  ordinary evicted-BIN case).
+- **Impact:** `insert_raw` stores the full key as a suffix of the spurious
+  prefix; `get_full_key` re-prefixes it into a mangled, unreachable key, which the
+  end-of-recovery checkpoint persists — silently losing the committed record.
+- **Fix version:** v7.11.2 (key-prefix computation is gated on the
+  `key_prefixing` flag at the source, JE `IN.computeKeyPrefix`, so a non-prefixing
+  tree never learns a prefix on any path — deserialize, `recover_in_redo`, or
+  `compress_node` merge). No on-disk format change; patch-safe.
+- **Detection:** v7.11.2 backports JE `BtreeVerifier.verifyOrderedKeys`
+  (`BtreeVerifier.java:485-505`), so `Environment::verify` now reports an
+  out-of-order key within a BIN (including a root BIN). A mangle that lands **out
+  of order** relative to its neighbours is flagged (the common case for BE-integer
+  keys, where the prepended prefix sorts the key shorter); a mangle that happens
+  to sort **in place** is **not** flagged, and verify is skipped for
+  custom-comparator databases (matching JE). Verify is a good detector but not a
+  guarantee.
+- **Remedy:** repair is **not automatic** (a mangled key `p‖k` where `k` begins
+  with `p` is byte-identical on disk to a legitimate long key, and a strip rule
+  can collide with a real key). Run `Environment::verify` with the backported
+  order check to locate out-of-order BINs, then restore the affected database from
+  a backup or re-derive it — do **not** attempt an in-place key rewrite.
+
+### 14.15 ENG-DISKFULL-ACK-1 — commit/abort on an invalidated environment reports success (S2/S3 durability)
+
+- **Affected versions:** v7.11.0 and v7.11.1.
+- **Trigger:** a disk-full or fdatasync I/O error (or any other invalidation — a
+  daemon-fatal panic, a recovery checksum failure, a replication rollback) that
+  invalidates the environment while a transaction is in flight, followed by a
+  `commit()` on a transaction whose own write found the log already invalid and
+  so logged nothing.
+- **Impact:** that empty transaction took the empty-txn fast path and returned a
+  misleading `Ok` — an acknowledged-but-not-durable commit on a dead environment.
+  No acknowledged write of a transaction that *did* log was lost (such a write
+  returns `Err`); the defect is a commit reporting success on an already-dead
+  environment. (Re-rated S1 → S2/S3 on independent review: the original S1
+  framing was a test-harness artifact that recorded a failed put as a committed
+  effect.)
+- **Fix version:** v7.11.2 (`commit()` and `abort()` now call the environment
+  validity check first, mirroring JE `Transaction.checkEnv` →
+  `EnvironmentImpl.checkIfInvalid` — `Transaction.java:334,889`,
+  `Txn.java:730` — before the empty-txn fast path, and the check fails on ANY
+  invalidation source, not only a log I/O error). `abort()` still releases the
+  transaction's locks and prunes its registry entry so the environment can be
+  closed and reopened for recovery. See the CHANGELOG *Changed* note. Patch-safe;
+  no on-disk format change.
+- **Known gap (S5):** `Transaction::set_txn_timeout` / `set_lock_timeout` are
+  not guarded by `checkEnv` (JE guards them); harmless, since a timeout set on a
+  dead environment is never acted on.
+- **Mitigation on v7.11.0/.1:** on any `EnvironmentFailure`, treat every commit
+  after the first failure as untrustworthy — check `Environment::is_valid()`
+  after a commit that returned `Ok`, and close + reopen the environment (recovery
+  replays the durable prefix) before resuming writes.
+
+### 14.16 FID-TXN-FIX3A — write locks released before the commit durability barrier (S2 isolation)
+
+- **Affected versions:** v7.10.0 through v7.11.1 (pre-existing since the "Fix 3a"
+  early-release commit `3560de1b`).
+- **Trigger:** a SYNC commit on a path where the inner `Txn` or a bare cursor
+  locker owns the fsync — a **non-transactional-database auto-commit write**, or
+  a **`open_cursor(None)` write** — concurrent with a reader that observes the
+  committed value in the window between the lock release and the fsync, followed
+  by an fsync failure on that commit. Explicit `Transaction` commits,
+  transactional-db auto-commit on v7.11.1, and XA 2PC were already correctly
+  ordered by the outer layer; WRITE_NO_SYNC / NO_SYNC have no fsync to race.
+- **Impact:** the commit released write locks between the append phase and the
+  durable (fsync) phase, so a concurrent reader could read a committed value
+  before it was durable; an fsync failure could then lose a value another
+  transaction had already acted on — an Early-Lock-Release isolation hole on the
+  SYNC path.
+- **Fix version:** v7.11.2 (write locks are held until the committing
+  transaction's commit record is durable, matching JE `Txn.commit`, which
+  releases write locks only after the durable phase). The measured cost is
+  small-to-unmeasurable on these paths (the fsync dominates). Patch-safe; no
+  on-disk format change.
+- **Mitigation on v7.11.0/.1:** use WRITE_NO_SYNC / NO_SYNC only where crash loss
+  is acceptable; to avoid the ELR window on the SYNC path, route writes through
+  an explicit `Transaction` (already correctly ordered) rather than a
+  non-transactional-db auto-commit or a `open_cursor(None)` write.
+
+### 14.17 FID-LOCKTIMEOUT-711 — a configured environment lock / txn timeout is ignored (S3 availability / behaviour)
+
+- **Affected versions:** v7.11.0 and v7.11.1.
+- **Trigger:** setting `EnvironmentConfig::with_lock_timeout(ms)` or
+  `with_txn_timeout(ms)` to a non-default value and expecting it to apply to
+  transactions.
+- **Impact:** the configured env lock timeout and env txn timeout were recorded
+  but never propagated to the per-locker timeouts: every transaction used the
+  hard-coded defaults (`lock_timeout = 500 ms`, `txn_timeout = 0` / disabled). A
+  configured long lock timeout gave up at 500 ms (spurious lock-timeout errors /
+  retries under contention) and a configured env txn timeout never fired at all.
+  Not a data-safety defect — the transaction aborts cleanly — but a configured
+  bound was silently not honoured.
+- **Fix version:** v7.11.2 (a `Txn` inherits the env lock timeout and env txn
+  timeout at construction, JE `Locker.java:130,136`). **Behaviour change:**
+  applications that depended on the old silently-ignored behaviour now see the
+  timeout they configured — a transaction waiting on a lock times out at the
+  configured bound, and a configured env txn timeout aborts a transaction that
+  exceeds it. Patch-safe; no on-disk format change.
+- **Mitigation on v7.11.0/.1:** set the timeout per transaction
+  (`TransactionConfig::with_lock_timeout_ms`), which was honoured, instead of
+  relying on the env-level default.
+
 ---
 
 ## How to tell if you're affected
@@ -636,6 +892,13 @@ mitigation.
 | BUG-DUP-DELETEALL-SPAN | After `delete(k)` on a key with duplicates, a subsequent `get`/cursor scan still returns some duplicate values for `k`. |
 | A5 / BUG-DDL-DURABILITY-1 | After a crash: an aborted transaction's records present, or a committed record missing; a committed DB remove/rename not reflected (old name resurrected / new name lost). |
 | BUG-FEEDER-SCAN-SKIP | A replica missing a contiguous VLSN range that the master committed (a gap in the applied stream), with no feeder error. |
+| XDB-711 | v7.11.2 **refuses to open** with a `LogIntegrity` env-failure error naming the affected database(s). On v7.11.0/.1: a database's records appear under another database's name, or a database is silently missing after a crash during concurrent catalog DDL. Undetectable classes (double-binding / cleaned-evidence resurrection / lost auto-commit rename) leave a clean open with wrong data — verify against your own records. |
+| ENG-AUTODDL-1 | After a crash: a database you renamed/created with auto-commit is gone (old name tombstoned, new name absent); `database_names()` does not list it, though its records remain in the log under an orphaned id. |
+| ENG-FSYNCDROP-RESURRECT-1 | A database you `truncate_database`-d reappears non-empty after a crash. `Environment::verify` does NOT flag it (structurally valid). Forensic signature (while pre-truncate files survive): a live slot whose LSN precedes a committed `DeleteLN` of the same key in the same db id. |
+| ENG-KEYPREFIX-MANGLE-1 | `Environment::verify` reports an out-of-order key within a BIN (the backported `verifyOrderedKeys` check) — the common BE-integer case. A committed key reads back `NOTFOUND` though it was acknowledged; an in-order mangle is NOT flagged by verify. Default `key_prefixing=false` only. |
+| ENG-DISKFULL-ACK-1 | A `commit()` returned `Ok` but `Environment::is_valid()` is `false` and the record is absent after recovery; on v7.11.2 that commit instead returns an `EnvironmentFailure`. |
+| FID-TXN-FIX3A | A value committed via a non-transactional-db auto-commit or a `open_cursor(None)` write, read by another thread, then lost after an fsync failure on that commit. |
+| FID-LOCKTIMEOUT-711 | A transaction gives up on a lock at ~500 ms regardless of a larger `with_lock_timeout`, or a configured env `with_txn_timeout` never aborts a long transaction (on v7.11.0/.1); on v7.11.2 the configured bound applies. |
 | ENG-CLEAN-TOMBSTONE-1 | A database you removed (or a rename's old name) reappears on reopen after log cleaning, with its old records; in-memory it was absent before the clean close. No error; `verify` passes. Most likely when a removed name's create record shared a log file with another database's long-lived data while cleaning reclaimed the removal's (lower-utilization) file. |
 
 A clean single-file environment that has never had `cleaner.deletions > 0`, a
@@ -647,10 +910,16 @@ data-loss class.
 
 ## Recommendation
 
-**Upgrade to Noxu DB v7.11.1.** v7.11.1 is a patch release (bug fixes only; no
-on-disk format change — `LOG_VERSION` stays 3; no public API change in the
-Stable-tier crates), so it is a drop-in upgrade: no data migration, no code
-change required. There is no complete pre-upgrade mitigation for the whole-DB
+**Upgrade to Noxu DB v7.11.2.** v7.11.2 is a patch release (bug fixes plus
+JE-fidelity behaviour corrections; no on-disk format change — `LOG_VERSION`
+stays 3; no *breaking* public API change in the Stable-tier crates,
+`cargo-semver-checks` 9/9), so it is a drop-in upgrade: no data migration, no
+code change required. Note the deliberate **behaviour changes** in v7.11.2
+(non-transactional writes no longer fsync per operation; a no-transaction cursor
+on a transactional database is read-only; `Database::sync` on a non-deferred-write
+database errors; a configured env lock/txn timeout now fires; auto-commit DDL now
+fsyncs, so auto-commit create is slower) — see the CHANGELOG *Changed* section and
+the migration notes. There is no complete pre-upgrade mitigation for the whole-DB
 and value-loss defects other than disabling the cleaner (`run_cleaner = false`)
 and/or ensuring the cache holds the live set — neither is a real fix.
 
@@ -659,6 +928,18 @@ with an internal zero hole, or a reopen reporting the database absent) cannot be
 recovered by upgrading — the data in the unlinked file is gone. Restore from a
 backup taken before the damage, then upgrade before resuming writes.
 
+**v7.11.2 does not repair existing XDB-711 / ENG-AUTODDL-1 /
+ENG-FSYNCDROP-RESURRECT-1 / ENG-KEYPREFIX-MANGLE-1 damage.** It stops *new*
+damage and (for XDB-711) **refuses to open** a log carrying the detectable
+stray-relog signature rather than serving wrong data. If v7.11.2 refuses to open
+an environment, **preserve the directory as-is** (copy it; do not delete,
+reinitialise, or write to it) and restore from a pre-exposure backup, or keep the
+preserved copy for offline salvage with `noxu-admin scavenge` in v8.0.0. For the
+undetectable classes and for an already-reopened resurrected-truncate
+environment, verify the opened databases against your application's own records
+and restore from a backup if they disagree. See §14.11–§14.14 for the per-defect
+remedy.
+
 ---
 
-*Published 2026-10-20 with the v7.11.1 release.*
+*Published 2026-10-20 with the v7.11.1 release; updated 2026-10-23 with the v7.11.2 release (added §14.11–§14.17).*
