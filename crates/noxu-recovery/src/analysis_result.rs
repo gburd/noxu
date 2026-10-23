@@ -18,6 +18,7 @@
 //! After analysis, the recovery manager knows exactly which INs to redo and
 //! which LNs to undo.
 
+use crate::catalog_integrity::CatalogEvent;
 use crate::log_scanner::InRecord;
 use crate::recovery_info::RebuiltFileSummary;
 use hashbrown::{HashMap, HashSet};
@@ -271,6 +272,18 @@ pub struct AnalysisResult {
     /// transactional LN whose visibility follows its txn's commit/abort
     /// (`DbTree.doRemoveDb`, `Txn.deletedDatabases`).
     pub pending_name_deletes: hashbrown::HashMap<String, u64>,
+
+    /// XDB-711 detector: per database name, the ascending-LSN history of every
+    /// NameLN/NameLNTxn catalog event observed during the analysis scan.
+    ///
+    /// The latest-NameLN-wins forward scan keeps only the *final* binding per
+    /// name (`recovered_db_names`); the XDB-711 fail-closed detector
+    /// ([`crate::catalog_integrity::detect_xdb711_damage`]) needs the committed
+    /// transactional history to tell a stray non-transactional relog NameLN
+    /// (which rebinds a name to a superseded id) apart from a legitimate
+    /// history. Each list is bounded by the number of catalog operations, not
+    /// by data volume (a bounded per-NameLN check, no new full scan).
+    pub catalog_events: hashbrown::HashMap<String, Vec<CatalogEvent>>,
 }
 
 impl AnalysisResult {
@@ -299,6 +312,7 @@ impl AnalysisResult {
             txncommit_vlsns: Vec::new(),
             rebuilt_file_summaries: HashMap::new(),
             pending_name_deletes: hashbrown::HashMap::new(),
+            catalog_events: hashbrown::HashMap::new(),
         }
     }
 

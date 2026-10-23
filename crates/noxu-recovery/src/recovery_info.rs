@@ -2,6 +2,7 @@
 //!
 
 use crate::analysis_result::{PreparedLnReplay, PreparedTxnInfo};
+use crate::catalog_integrity::CatalogDamage;
 use crate::checkpoint_end::CheckpointEnd;
 use crate::log_scanner::NameLnRecord;
 use noxu_util::{Lsn, NULL_LSN};
@@ -160,6 +161,19 @@ pub struct RecoveryInfo {
     /// lazy BIN fetch instead of being replayed).  Zero when no database was
     /// seeded (full-redo fallback).
     pub lns_gated: u64,
+
+    /// XDB-711 fail-closed detector verdict.
+    ///
+    /// Non-empty iff the analysis pass found that the settled
+    /// latest-NameLN-wins catalog binds one or more database names to a
+    /// stale/reused id written by the 7.11.0/.1 catalog-relog bug (the stray
+    /// non-transactional NameLN superseding a committed transactional op).
+    /// The open path refuses to mount such an environment with
+    /// `EnvironmentFailureReason::LogIntegrity`. `#[doc(hidden)]`: an
+    /// additive, internal field; not part of the stable public surface
+    /// (release-backport-contract).
+    #[doc(hidden)]
+    pub xdb711_damage: Vec<CatalogDamage>,
 }
 
 /// CLN-4: a per-file utilization summary rebuilt during recovery.
@@ -219,6 +233,7 @@ impl RecoveryInfo {
             rebuilt_file_summaries: hashbrown::HashMap::new(),
             lns_redone: 0,
             lns_gated: 0,
+            xdb711_damage: Vec::new(),
         }
     }
 }

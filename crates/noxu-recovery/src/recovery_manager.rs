@@ -397,6 +397,33 @@ pub fn apply_redo_ln(tree: &mut noxu_tree::Tree, rec: &LnRecord, lsn: Lsn) {
     }
 }
 
+/// Whether the XDB-711 fail-closed detector is disabled for this recovery.
+///
+/// A **test-only** diagnosis seam: in a `cfg(test)` build (the recovery
+/// crate's own unit tests) or a `feature = "testing"` build (integration-test
+/// crates that depend on `noxu-recovery/testing`, enabled e.g. by
+/// `noxu-db/testing`), `NOXU_XDB711_DETECT_OFF=1` disables the detector so a
+/// teeth test can observe the would-be-mounted (silently wrong) catalog and
+/// prove the detector is load-bearing.
+///
+/// In a production build the function is a `const false` — the environment
+/// variable is **never read**, so a production process can NOT turn the
+/// fail-closed guard off and mount a catalog the engine knows is corrupt.
+/// This mirrors the REC-SEED-1 `FullScanOverride` fence (test-only seam,
+/// compiled out of every shipped build).
+#[cfg(any(test, feature = "testing"))]
+fn xdb711_detect_disabled() -> bool {
+    std::env::var_os("NOXU_XDB711_DETECT_OFF").is_some()
+}
+
+/// Production build: the XDB-711 detector can never be disabled (the off-switch
+/// is compiled out).  See the `cfg(any(test, feature = "testing"))` variant.
+#[cfg(not(any(test, feature = "testing")))]
+#[inline]
+fn xdb711_detect_disabled() -> bool {
+    false
+}
+
 impl RecoveryManager {
     /// Create a new recovery manager.
     pub fn new() -> Self {
@@ -848,6 +875,61 @@ impl RecoveryManager {
         // occur AFTER this pass so they see only committed catalog entries.
         // ------------------------------------------------------------------
         self.run_mapping_tree_undo_pass(&mut analysis);
+
+        // XDB-711 fail-closed detector (option A): before mounting the
+        // settled latest-NameLN-wins catalog, check it against the committed
+        // transactional history for the stray-relog signature of the
+        // 7.11.0/.1 writer bug.  A writer-side fix cannot repair a log already
+        // written; JE refuses such a catalog with LOG_INTEGRITY rather than
+        // serve wrong data silently (xdb-711-fix.md §9).  We only RECORD the
+        // verdict here; the open path (environment_impl, mirroring the L-14
+        // FOUND_COMMITTED_TXN refuse-to-mount pattern) raises the typed
+        // EnvironmentFailureReason::LogIntegrity so the recovery crate's
+        // public API is unchanged (patch-safe).
+        // TEETH / diagnosis seam (XDB-DETECT): NOXU_XDB711_DETECT_OFF=1
+        // disables the detector so a test can observe the would-be-mounted
+        // (silently wrong) catalog.  The env var is honoured ONLY in test /
+        // `testing`-feature builds (`xdb711_detect_disabled()`); a production
+        // build never reads it, so no process can mount a catalog the engine
+        // knows is wrong by setting an environment variable.  (Fence precedent:
+        // REC-SEED-1 `FullScanOverride` — test-only, unusable in production.)
+        let xdb711_damage = if xdb711_detect_disabled() {
+            Vec::new()
+        } else {
+            crate::catalog_integrity::detect_xdb711_damage(
+                &analysis.recovered_db_names,
+                &analysis.catalog_events,
+                &analysis.committed_txns,
+                &analysis.aborted_txns,
+            )
+        };
+        if !xdb711_damage.is_empty() {
+            let injectivity =
+                crate::catalog_integrity::mounted_injectivity_violations(
+                    &analysis.recovered_db_names,
+                );
+            for d in &xdb711_damage {
+                log::error!(
+                    "recovery[xdb-711]: catalog integrity violation ({:?}): \
+                     database '{}' mounted as id {}; superseded/orphaned \
+                     id {:?} (winning record at LSN {}, superseded authority \
+                     at LSN {})",
+                    d.kind,
+                    d.name,
+                    d.mounted_id,
+                    d.committed_id,
+                    d.stray_lsn,
+                    d.authority_lsn
+                );
+            }
+            for (id, names) in &injectivity {
+                log::error!(
+                    "recovery[xdb-711]: injectivity violation: id {id} is \
+                     mounted under names {names:?} (corroborating evidence)"
+                );
+            }
+        }
+        self.info.xdb711_damage = xdb711_damage;
 
         self.set_progress(RecoveryProgress::ReplayLNs);
         self.run_redo_all(scanner, &analysis, trees)?;
@@ -1859,8 +1941,63 @@ impl RecoveryManager {
         let mut fsln: HashMap<u32, (RebuiltFileSummary, Lsn)> = HashMap::new();
         let mut obsolete_after: Vec<(u32, Lsn)> = Vec::new();
 
+        // XDB-711 detector: track the catalog RELOG BURST positionally.  The
+        // checkpoint catalog relog (`relog_live_catalog_impl`) writes a
+        // contiguous run of live NameLNs — one per live database — immediately
+        // before the checkpoint's `CkptStart` (the checkpointer calls the
+        // relog callback at the top of `do_checkpoint`, then logs `CkptStart`).
+        // `relog_run_pending` accumulates the `(name, index-in-events-list)` of
+        // consecutive NameLN records; when a `CkptStart` closes the run we mark
+        // every pending event's `in_relog_run = true`; any other record type
+        // breaks the run (it was not a relog burst).  This is what lets the
+        // detector identify the stray relog record itself rather than treating
+        // any non-transactional NameLN as a stray (XDB-DETECT-FP-1).
+        let mut relog_run_pending: Vec<(String, usize)> = Vec::new();
+
         let mut process = |pe: PositionedEntry| {
             let entry_lsn = pe.lsn;
+            // Positional relog-burst bookkeeping (see `relog_run_pending`): a
+            // NameLN continues the current run, a CkptStart closes+marks it,
+            // anything else breaks it.
+            let entry_is_name_ln = matches!(pe.entry, LogEntry::NameLn(_));
+            let entry_is_ckpt_start =
+                matches!(pe.entry, LogEntry::CkptStart(_));
+            if entry_is_ckpt_start {
+                // The pending NameLN run ended at a CkptStart: it is this
+                // checkpoint's catalog relog burst.  The relog re-logs each
+                // LIVE database name EXACTLY ONCE, so within the run only the
+                // LAST occurrence of each name is a relog record.  A user
+                // auto-commit DDL NameLN that happens to be logged immediately
+                // before the burst (e.g. an auto rename-in right before a
+                // close checkpoint) lands in the same contiguous run but is an
+                // EARLIER occurrence of its name — it must NOT be mis-flagged
+                // as a relog record (that would hide the true authority and
+                // false-fire, XDB-DETECT-FP-1 / V4).  So keep only the
+                // highest-LSN event per name in the run.
+                let mut last_idx_by_name: hashbrown::HashMap<String, usize> =
+                    hashbrown::HashMap::new();
+                for (name, idx) in relog_run_pending.drain(..) {
+                    // relog_run_pending is in ascending scan order, so the
+                    // later entry overwrites — the final value is the last
+                    // (highest-LSN) occurrence of each name.
+                    last_idx_by_name.insert(name, idx);
+                }
+                for (name, idx) in last_idx_by_name {
+                    if let Some(list) = result_ref.catalog_events.get_mut(&name)
+                        && let Some(ev) = list.get_mut(idx)
+                        && !ev.is_deleted
+                    {
+                        // The relog only ever emits LIVE NameLNs (it skips
+                        // tombstones), so a deleted event in the run is a user
+                        // op, never a relog record.
+                        ev.in_relog_run = true;
+                    }
+                }
+            } else if !entry_is_name_ln {
+                // A non-NameLN, non-CkptStart record breaks the run — the
+                // preceding NameLNs were not a relog-then-CkptStart burst.
+                relog_run_pending.clear();
+            }
             match pe.entry {
                 // ----------------------------------------------------------
                 // IN/BIN entries → build dirty-IN map
@@ -2037,6 +2174,29 @@ impl RecoveryManager {
                 // NameLN: database name registration
                 // ----------------------------------------------------------
                 LogEntry::NameLn(rec) => {
+                    // XDB-711 detector: record EVERY NameLN/NameLNTxn event
+                    // (live or tombstone, txnal or not) in ascending-LSN order
+                    // per name, before the latest-wins mutation below discards
+                    // the superseded records.  Bounded per-NameLN work.
+                    //
+                    // `in_relog_run` starts false and is set true later if a
+                    // `CkptStart` closes this record's NameLN run (the relog
+                    // burst) — see `relog_run_pending` above.
+                    {
+                        let list = result_ref
+                            .catalog_events
+                            .entry(rec.name.clone())
+                            .or_default();
+                        list.push(crate::catalog_integrity::CatalogEvent {
+                            lsn: entry_lsn,
+                            id: rec.db_id,
+                            is_deleted: rec.is_deleted,
+                            txn_id: rec.txn_id,
+                            in_relog_run: false,
+                        });
+                        relog_run_pending
+                            .push((rec.name.clone(), list.len() - 1));
+                    }
                     if rec.is_deleted {
                         // BUG-DDL-DURABILITY-1: a TRANSACTIONAL delete
                         // (txn_id=Some) must only take effect if its txn

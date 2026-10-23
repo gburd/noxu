@@ -965,6 +965,26 @@ impl EnvironmentImpl {
                     }
                 };
 
+            // XDB-711 option A: refuse to mount a catalog damaged by the
+            // 7.11.0/.1 catalog-relog bug, rather than silently serve wrong
+            // data.  The analysis pass flagged any mounted database name whose
+            // latest-NameLN-wins binding was set by a stray non-transactional
+            // relog NameLN that superseded a later committed transactional
+            // rename/remove/recreate.  JE refuses such a catalog with
+            // LOG_INTEGRITY ("Log information is incorrect, problem is likely
+            // persistent", EnvironmentFailureReason.java:73-75; e.g.
+            // DbTree.java:803-808).  This mirrors the L-14 FOUND_COMMITTED_TXN
+            // refuse-to-mount pattern below.
+            if !recovery_info.xdb711_damage.is_empty() {
+                let msg = noxu_recovery::log_integrity_message(
+                    &recovery_info.xdb711_damage,
+                );
+                return Err(DbiError::LnFetchFailure {
+                    reason: EnvironmentFailureReason::LogIntegrity,
+                    msg,
+                });
+            }
+
             // L-14 [#18307]: if end-of-log discovery found a committed txn
             // AFTER a mid-file corruption point (and the
             // haltOnCommitAfterChecksumException param was enabled), REFUSE
@@ -1309,6 +1329,17 @@ impl EnvironmentImpl {
                 .map_err(|e| DbiError::RecoveryFailure {
                     reason: format!("read-only recovery failed: {e}"),
                 })?;
+            // XDB-711 option A: refuse a damaged catalog on the read-only
+            // reopen path too, so a `dump` of an affected environment cannot
+            // silently copy the wrong name->id binding.
+            if !info.xdb711_damage.is_empty() {
+                let msg =
+                    noxu_recovery::log_integrity_message(&info.xdb711_damage);
+                return Err(DbiError::LnFetchFailure {
+                    reason: EnvironmentFailureReason::LogIntegrity,
+                    msg,
+                });
+            }
             for (name, db_id) in info.recovered_db_names {
                 recovered_names.insert(name, DatabaseId::new(db_id as i64));
             }

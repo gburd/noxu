@@ -16,7 +16,7 @@ default = []
 # crate's own witnesses: the `optb_crash_hook` crash-injection points on the
 # single-locker auto-commit path.  COMPILED OUT of every production build
 # (never in `default`).  Mirror of `noxu-dbi/testing`.
-testing = []
+testing = ["noxu-recovery/testing"]
 observability = ["dep:noxu-observe", "dep:tracing", "dep:metrics", "noxu-observe/export"]
 # Experimental, non-default eviction policies (CLOCK/LIRS/ARC/CAR/CoolHot).
 # Off by default; passthrough to noxu-dbi (which propagates to noxu-evictor).

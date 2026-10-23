@@ -565,7 +565,20 @@ impl Environment {
                 .env_background_sleep_interval_us,
         };
         let env_impl = EnvironmentImpl::from_dbi_config(home.clone(), &dbi_cfg)
-            .map_err(|e| NoxuError::environment(e.to_string()))?;
+            .map_err(|e| match e {
+                // XDB-711 option A (and any future typed open-path reason):
+                // a `LnFetchFailure` carries a specific
+                // `EnvironmentFailureReason` (here LOG_INTEGRITY for a catalog
+                // damaged by the 7.11.0/.1 relog bug). Preserve it through the
+                // typed `From<DbiError>` conversion instead of flattening to
+                // UnexpectedState, so callers see the real reason
+                // (EnvironmentFailureReason::LogIntegrity) and the JE message.
+                noxu_dbi::DbiError::LnFetchFailure { .. } => NoxuError::from(e),
+                // Every other open failure keeps its historical shape
+                // (EnvironmentFailure/UnexpectedState with the stringified
+                // cause) — no behaviour change.
+                _ => NoxuError::environment(e.to_string()),
+            })?;
 
         // exception_listener (JE ExceptionListener): if the application
         // registered a listener, install a daemon exception sink that adapts
